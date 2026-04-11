@@ -519,8 +519,8 @@ def run_exp3b(
         # ---- baseline accuracy ----
         base_acc = eval_node(node, head, tasks[t]["test"], device)
 
-        # ---- snapshot ----
-        snapshot = {name: p.detach().clone()
+        # ---- snapshot — always store on CPU so drift calc is device-agnostic ----
+        snapshot = {name: p.detach().cpu().clone()
                     for name, p in node.named_parameters()}
 
         # ---- temporarily unfreeze ----
@@ -562,11 +562,11 @@ def run_exp3b(
         del opt, wrong_head
         _flush(device)
 
-        # ---- measure drift ----
+        # ---- measure drift — both sides on CPU ----
+        named = dict(node.named_parameters())
         drift = 0.0
-        for name, old_p in snapshot.items():
-            cur_p = dict(node.named_parameters())[name]
-            drift += (cur_p.detach().cpu() - old_p).pow(2).sum().item()
+        for name, old_p in snapshot.items():   # old_p is always CPU
+            drift += (named[name].detach().cpu() - old_p).pow(2).sum().item()
         drift = math.sqrt(drift)
 
         # ---- measure accuracy drop ----
@@ -577,10 +577,10 @@ def run_exp3b(
         post_acc = eval_node(node, head, tasks[t]["test"], device)
         acc_drop = base_acc - post_acc
 
-        # ---- restore ----
+        # ---- restore — copy CPU snapshot back onto the live (device) parameters ----
         with torch.no_grad():
-            for name, old_p in snapshot.items():
-                dict(node.named_parameters())[name].copy_(old_p.to(device))
+            for name, live_p in named.items():   # 'named' already built above
+                live_p.copy_(snapshot[name].to(device))
         node.freeze()
 
         results_3b.append({
