@@ -46,6 +46,8 @@ def main():
     parser.add_argument("--download", type=str,   default=None,
                         choices=["cifar10", "cifar100"],
                         help="Download a dataset (requires explicit permission)")
+    parser.add_argument("--batch_size",type=int,   default=128,
+                        help="Batch size for training (default: 128)")
     args = parser.parse_args()
 
     # Resolve device
@@ -77,6 +79,7 @@ def main():
             n_epochs=args.epochs,
             results_dir=f"{args.out_dir}/exp1",
             seed=args.seed,
+            batch_size=args.batch_size,
         )
         if args.exp == "1a":
             run_exp1a(cfg)
@@ -92,6 +95,7 @@ def main():
             child_epochs=args.epochs,
             results_dir=f"{args.out_dir}/exp2",
             seed=args.seed,
+            batch_size=args.batch_size,
         )
         run_exp2a(cfg)
 
@@ -104,6 +108,7 @@ def main():
             child_epochs= args.epochs,
             results_dir = f"{args.out_dir}/exp3",
             seed        = args.seed,
+            batch_size  = args.batch_size,
         )
         if args.exp == "3a":
             run_exp3a(cfg)
