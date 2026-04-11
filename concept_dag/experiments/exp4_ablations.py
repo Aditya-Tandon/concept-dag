@@ -187,14 +187,13 @@ class _ChildNodeWithAggregation(DAGNode):
 # No-freeze-aware training helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _collect_ancestors(node: DAGNode) -> List[DAGNode]:
+def _collect_ancestors(node: DAGNode) -> Tuple[List[DAGNode], List[DAGNode]]:
     """
-    BFS over the DAG through `parent_models` starting at `node`, returning
-    every non-root ancestor reachable from `node` (excluding `node` itself).
-    Root ancestors are excluded because their `forward` has no internal
-    `no_grad` block to patch.
+    BFS over the DAG through `parent_models` starting at `node`. Returns
+    (non_root_ancestors, root_ancestors).  Both exclude `node` itself.
     """
-    seen: List[DAGNode] = []
+    non_root: List[DAGNode] = []
+    roots:    List[DAGNode] = []
     seen_ids = set()
     frontier: List[DAGNode] = list(node.parent_models)
     while frontier:
@@ -203,23 +202,43 @@ def _collect_ancestors(node: DAGNode) -> List[DAGNode]:
         if pid in seen_ids:
             continue
         seen_ids.add(pid)
-        if not p.is_root:
-            seen.append(p)
-        # Walk up further regardless of whether p itself is a root
+        if p.is_root:
+            roots.append(p)
+        else:
+            non_root.append(p)
+        # Walk up further in both cases (roots have no parents, so this is a no-op)
         frontier.extend(p.parent_models)
-    return seen
+    return non_root, roots
 
 
-def _make_grad_transparent_forward(target: DAGNode):
+def _make_grad_transparent_child_forward(target: DAGNode):
     """
-    Return a replacement for `target.forward` that is identical to
-    `DAGNode.forward` for a non-root node, but removes the internal
-    `with torch.no_grad():` wrapper around the parent calls. This lets
-    gradients propagate through `target` into its own parents.
+    Replacement for a non-root DAGNode's forward that drops the internal
+    `with torch.no_grad():` wrapper around parent calls so gradients flow
+    through into parents' concept_module parameters.
     """
     def _fwd(x: torch.Tensor) -> torch.Tensor:
         parent_outs = [p(x) for p in target.parent_models]  # grad-tracked
         return target.concept_module(x, parent_outputs=parent_outs)
+    return _fwd
+
+
+def _make_frozen_cnn_root_forward(target: DAGNode):
+    """
+    Replacement for a root DAGNode's forward that keeps the CNN backbone
+    in a `no_grad` block (so we don't retain conv activations or train the
+    backbone), but still allows gradients into the root's concept_module.
+
+    Used for the no_freeze ablation: the scientific claim is about whether
+    *concept modules* can stay updateable, not whether the frozen feature
+    extractor should also be retrained. Training the CNN would blow up peak
+    memory by an order of magnitude (see WRITEUP_NOTES.md).
+    """
+    def _fwd(x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            feats = target.cnn(x)
+        # feats has requires_grad=False; concept_module params still carry grad
+        return target.concept_module(feats)
     return _fwd
 
 
@@ -234,15 +253,22 @@ def _train_node_with_freeze_mode(
 ) -> Dict:
     """
     Train a node.  If cfg.freeze_parents is False AND node has parents,
-    include ALL reachable ancestor parameters in the optimizer so gradients
-    flow back through the full ancestor chain.
+    include every reachable ancestor's **concept_module** parameters in the
+    optimizer so gradients flow back through the full ancestor chain.
+
+    Crucially, root-ancestor CNN backbones stay frozen even in no_freeze
+    mode:
+      - The ablation claim is about concept-module updatability, not CNN
+        retraining.
+      - Retaining conv activations for every CNN in the ancestor chain
+        multiplies peak memory by an order of magnitude and will OOM on
+        a single GPU past ~task 8. See WRITEUP_NOTES.md for detail.
 
     Because `DAGNode.forward` internally wraps its parent calls in
-    `torch.no_grad()`, we monkey-patch `forward` on every non-root ancestor
-    (not just the training node) so that gradients propagate through each
-    layer of the DAG. All patches are restored in a `finally` block.
-
-    Returns the training history dict.
+    `torch.no_grad()`, we monkey-patch `forward` on every ancestor (root
+    ancestors get a CNN-frozen forward; non-root ancestors get a fully
+    grad-transparent forward). All patches are restored in a `finally`
+    block.
     """
     device = cfg.device
 
@@ -252,42 +278,47 @@ def _train_node_with_freeze_mode(
     else:
         node.concept_module.to(device)
 
-    # Collect full ancestor chain (non-root only) and move + unfreeze for no_freeze
-    ancestors: List[DAGNode] = []
+    # Collect full ancestor chain split by root/non-root
+    non_root_ancestors: List[DAGNode] = []
+    root_ancestors:     List[DAGNode] = []
     if not cfg.freeze_parents and not node.is_root:
-        ancestors = _collect_ancestors(node)
-        # Also unfreeze direct parents that are roots — they need grad too,
-        # even though we don't need to patch their forward.
-        for p in node.parent_models:
-            p.unfreeze()
-            if p.is_root:
-                p.to(device)
-            else:
-                p.concept_module.to(device)
-        for a in ancestors:
+        non_root_ancestors, root_ancestors = _collect_ancestors(node)
+
+        # Non-root ancestors: fully unfreeze concept_module and move to device
+        for a in non_root_ancestors:
             a.unfreeze()
-            if a.is_root:
-                a.to(device)
-            else:
-                a.concept_module.to(device)
+            a.concept_module.to(device)
+
+        # Root ancestors: unfreeze ONLY the concept_module, keep CNN frozen.
+        # This is the memory-safety fix.
+        for r in root_ancestors:
+            # Ensure everything is on device (already should be)
+            r.to(device)
+            # Freeze the CNN explicitly, unfreeze just the concept_module
+            if r.cnn is not None:
+                for p in r.cnn.parameters():
+                    p.requires_grad_(False)
+                r.cnn.eval()
+            for p in r.concept_module.parameters():
+                p.requires_grad_(True)
+            r.concept_module._frozen = False
 
     head.to(device)
 
-    # Build parameter groups: current node + head + (if no_freeze) all ancestors + direct parents
+    # Build parameter groups: current node + head + (if no_freeze) every
+    # ancestor's concept_module params (NEVER root CNN params).
     trainable_params: List[nn.Parameter] = (
         node.trainable_parameters() + list(head.parameters())
     )
     if not cfg.freeze_parents and not node.is_root:
         seen_param_ids = {id(p) for p in trainable_params}
-        # Include direct parents (which may themselves be roots — they'd be missed
-        # by _collect_ancestors if they have no parents of their own)
-        for p in node.parent_models:
-            for pp in p.trainable_parameters():
-                if id(pp) not in seen_param_ids:
-                    trainable_params.append(pp)
-                    seen_param_ids.add(id(pp))
-        for a in ancestors:
-            for ap in a.trainable_parameters():
+        for a in non_root_ancestors:
+            for ap in a.concept_module.parameters():
+                if id(ap) not in seen_param_ids:
+                    trainable_params.append(ap)
+                    seen_param_ids.add(id(ap))
+        for r in root_ancestors:
+            for ap in r.concept_module.parameters():
                 if id(ap) not in seen_param_ids:
                     trainable_params.append(ap)
                     seen_param_ids.add(id(ap))
@@ -295,18 +326,21 @@ def _train_node_with_freeze_mode(
     opt   = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
 
-    # Monkey-patch forward on the training node AND every non-root ancestor
-    # so the entire gradient path from loss → node → parents → grandparents
-    # is free of `torch.no_grad()` barriers.
+    # Monkey-patch forward on the training node AND every ancestor.
+    # - Non-root ancestors: grad-transparent forward (removes no_grad around parents).
+    # - Root ancestors:     CNN stays inside a no_grad block (no conv activations retained),
+    #                       but concept_module gets gradient.
+    # - Training node:      grad-transparent forward (same as non-root ancestors).
     patches: List[Tuple[DAGNode, object]] = []  # (node, original_forward)
     if not cfg.freeze_parents and not node.is_root:
-        # Patch the training node first
         patches.append((node, node.forward))
-        node.forward = _make_grad_transparent_forward(node)  # type: ignore[assignment]
-        # Then every non-root ancestor
-        for a in ancestors:
+        node.forward = _make_grad_transparent_child_forward(node)  # type: ignore[assignment]
+        for a in non_root_ancestors:
             patches.append((a, a.forward))
-            a.forward = _make_grad_transparent_forward(a)    # type: ignore[assignment]
+            a.forward = _make_grad_transparent_child_forward(a)    # type: ignore[assignment]
+        for r in root_ancestors:
+            patches.append((r, r.forward))
+            r.forward = _make_frozen_cnn_root_forward(r)           # type: ignore[assignment]
 
     history = {"loss": [], "accuracy": []}
     try:
@@ -315,12 +349,14 @@ def _train_node_with_freeze_mode(
             if node.is_root and node.cnn is not None:
                 node.cnn.train()
             if not cfg.freeze_parents and not node.is_root:
-                for p in node.parent_models:
-                    p.concept_module.train()
-                    if p.is_root and p.cnn is not None:
-                        p.cnn.train()
-                for a in ancestors:
+                for a in non_root_ancestors:
                     a.concept_module.train()
+                for r in root_ancestors:
+                    r.concept_module.train()
+                    # CNN stays in eval mode — it's frozen and we don't want
+                    # batchnorm / dropout stats updating from other tasks' data.
+                    if r.cnn is not None:
+                        r.cnn.eval()
             head.train()
 
             ep_loss, ep_acc, n = 0.0, 0.0, 0
