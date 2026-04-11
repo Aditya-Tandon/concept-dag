@@ -32,7 +32,8 @@ import torch
 def main():
     parser = argparse.ArgumentParser(description="Concept DAG experiment runner")
     parser.add_argument("--exp",      type=str,   default="1a",
-                        choices=["1a", "1b", "2a", "2b", "3a", "3b"],
+                        choices=["1a", "1b", "2a", "2b", "3a", "3b",
+                                 "4", "4f", "5a", "5b", "5", "6", "plot"],
                         help="Which experiment to run")
     parser.add_argument("--device",   type=str,   default="auto",
                         help="Device: 'cpu', 'cuda', 'mps', or 'auto'")
@@ -48,6 +49,41 @@ def main():
                         help="Download a dataset (requires explicit permission)")
     parser.add_argument("--batch_size",type=int,   default=128,
                         help="Batch size for training (default: 128)")
+    parser.add_argument("--n_tasks",   type=int,   default=None,
+                        help="Override number of tasks (e.g. 10 for fast ablation)")
+    # Plot-mode arguments
+    parser.add_argument("--exp3a",     type=str,   default=None,
+                        help="Path to exp3a_results.json (plot mode)")
+    parser.add_argument("--exp3b",     type=str,   default=None,
+                        help="Path to exp3b_results.json (plot mode)")
+    parser.add_argument("--exp4",      type=str,   default=None,
+                        help="Path to exp4_all_results.json (plot mode)")
+    parser.add_argument("--exp4f",     type=str,   default=None,
+                        help="Path to forced_hub results JSON (plot mode)")
+    parser.add_argument("--exp5a",     type=str,   default=None,
+                        help="Path to exp5a_results.json (plot mode)")
+    parser.add_argument("--exp5b",     type=str,   default=None,
+                        help="Path to exp5b_results.json (plot mode)")
+    parser.add_argument("--auto_discover", action="store_true",
+                        help="Auto-discover result JSONs under --out_dir")
+    # Exp 5 sweep overrides
+    parser.add_argument("--n_parents_sweep", type=int, nargs="+", default=None,
+                        help="n_parents values to sweep in exp5a (e.g. 1 2 3 4 5)")
+    parser.add_argument("--subspace_k_sweep", type=int, nargs="+", default=None,
+                        help="subspace_k values to sweep in exp5b (e.g. 2 4 8 16 32)")
+    # Exp 6 confirmation-run arguments
+    parser.add_argument("--best_n_parents",      type=int, default=None,
+                        help="Explicit best n_parents for exp6 (otherwise loaded from --exp5a)")
+    parser.add_argument("--best_subspace_k",     type=int, default=None,
+                        help="Explicit best subspace_k for exp6 (otherwise loaded from --exp5b)")
+    parser.add_argument("--confirm_concept_dim", type=int, default=256,
+                        help="concept_dim to use in the exp6 confirmation run (default 256)")
+    parser.add_argument("--baseline_concept_dim",type=int, default=128,
+                        help="Baseline concept_dim that k was tuned at (default 128)")
+    parser.add_argument("--exp3a_baseline",      type=str, default=None,
+                        help="Path to exp3a_results.json baseline for AA comparison in exp6")
+    parser.add_argument("--no_perturbation",     action="store_true",
+                        help="Skip the exp3b-style perturbation test inside exp6")
     args = parser.parse_args()
 
     # Resolve device
@@ -110,6 +146,8 @@ def main():
             seed        = args.seed,
             batch_size  = args.batch_size,
         )
+        if args.n_tasks is not None:
+            cfg.n_tasks = args.n_tasks
         if args.exp == "3a":
             run_exp3a(cfg)
         else:
@@ -117,6 +155,105 @@ def main():
             print("Running 3a first to build the DAG, then running 3b...")
             results_3a, nodes, heads, parent_map, tasks = run_exp3a(cfg)
             run_exp3b(cfg, nodes, heads, parent_map, tasks)
+
+    elif args.exp in ("4", "4f"):
+        from concept_dag.experiments.exp4_ablations import (
+            Exp4Config, run_all_ablations, run_forced_hub_causal,
+        )
+        from concept_dag.data.loaders import make_split_cifar100
+
+        n_tasks = args.n_tasks if args.n_tasks is not None else 20
+        epochs  = args.epochs  # use --epochs to override (default 30 in parser but
+                                # Exp4Config defaults to 25 — explicit wins)
+        cfg = Exp4Config(
+            data_root    = args.data_root,
+            device       = device,
+            root_epochs  = epochs,
+            child_epochs = epochs,
+            results_dir  = f"{args.out_dir}/exp4",
+            seed         = args.seed,
+            batch_size   = args.batch_size,
+            n_tasks      = n_tasks,
+        )
+
+        if args.exp == "4":
+            run_all_ablations(cfg)
+        else:
+            # exp 4f — causal forced-hub ablation
+            print(f"\nLoading data for forced-hub causal ablation ({n_tasks} tasks)...")
+            tasks = make_split_cifar100(
+                data_root  = cfg.data_root,
+                n_tasks    = cfg.n_tasks,
+                batch_size = cfg.batch_size,
+                seed       = cfg.seed,
+            )
+            import json, os
+            result = run_forced_hub_causal(cfg, tasks)
+            os.makedirs(cfg.results_dir, exist_ok=True)
+            out_path = os.path.join(cfg.results_dir, "exp4f_forced_hub_results.json")
+            with open(out_path, "w") as f:
+                json.dump(result, f, indent=2)
+            print(f"\nForced-hub results saved to {out_path}")
+
+    elif args.exp in ("5a", "5b", "5"):
+        from concept_dag.experiments.exp5_sensitivity import Exp5Config, run_exp5a, run_exp5b
+        from dataclasses import field as _field
+
+        n_tasks = args.n_tasks if args.n_tasks is not None else 20
+        cfg5 = Exp5Config(
+            data_root    = args.data_root,
+            device       = device,
+            root_epochs  = args.epochs,
+            child_epochs = args.epochs,
+            results_dir  = f"{args.out_dir}/exp5",
+            seed         = args.seed,
+            batch_size   = args.batch_size,
+            n_tasks      = n_tasks,
+        )
+        if args.n_parents_sweep is not None:
+            cfg5.n_parents_sweep = args.n_parents_sweep
+        if args.subspace_k_sweep is not None:
+            cfg5.subspace_k_sweep = args.subspace_k_sweep
+
+        if args.exp in ("5a", "5"):
+            run_exp5a(cfg5)
+        if args.exp in ("5b", "5"):
+            run_exp5b(cfg5)
+
+    elif args.exp == "6":
+        from concept_dag.experiments.exp6_confirmation import run_exp6
+        n_tasks = args.n_tasks if args.n_tasks is not None else 20
+        run_exp6(
+            data_root           = args.data_root,
+            device              = device,
+            epochs              = args.epochs,
+            batch_size          = args.batch_size,
+            seed                = args.seed,
+            out_dir             = f"{args.out_dir}/exp6",
+            best_n_parents      = args.best_n_parents,
+            best_subspace_k     = args.best_subspace_k,
+            exp5a_path          = args.exp5a,
+            exp5b_path          = args.exp5b,
+            exp3a_baseline_path = args.exp3a_baseline,
+            confirm_concept_dim = args.confirm_concept_dim,
+            baseline_concept_dim= args.baseline_concept_dim,
+            n_tasks             = n_tasks,
+            run_perturbation    = not args.no_perturbation,
+        )
+
+    elif args.exp == "plot":
+        from concept_dag.experiments.plot_results import run_plots
+        run_plots(
+            exp3a_path    = args.exp3a,
+            exp3b_path    = args.exp3b,
+            exp4_path     = args.exp4,
+            exp4f_path    = args.exp4f,
+            exp5a_path    = args.exp5a,
+            exp5b_path    = args.exp5b,
+            out_dir       = f"{args.out_dir}/figures",
+            auto_discover = args.auto_discover,
+            results_root  = args.out_dir,
+        )
 
     else:
         print(f"Unknown experiment: {args.exp}")
