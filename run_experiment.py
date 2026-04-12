@@ -71,6 +71,10 @@ def main():
                         help="n_parents values to sweep in exp5a (e.g. 1 2 3 4 5)")
     parser.add_argument("--subspace_k_sweep", type=int, nargs="+", default=None,
                         help="subspace_k values to sweep in exp5b (e.g. 2 4 8 16 32)")
+    # Exp 4 variant filter
+    parser.add_argument("--variants", type=str, nargs="+", default=None,
+                        help="Subset of exp4 variants to run (e.g. --variants no_freeze sequential). "
+                             "If omitted, all 5 variants run.")
     # Exp 6 confirmation-run arguments
     parser.add_argument("--best_n_parents",      type=int, default=None,
                         help="Explicit best n_parents for exp6 (otherwise loaded from --exp5a)")
@@ -177,7 +181,43 @@ def main():
         )
 
         if args.exp == "4":
-            run_all_ablations(cfg)
+            if args.variants:
+                from concept_dag.experiments.exp4_ablations import (
+                    VARIANTS, run_ablation_variant, _save_variant, Exp4Config,
+                )
+                from concept_dag.data.loaders import make_split_cifar100
+                requested = set(args.variants)
+                known     = {v[0] for v in VARIANTS}
+                unknown   = requested - known
+                if unknown:
+                    raise ValueError(
+                        f"Unknown variants {unknown}. Valid: {sorted(known)}"
+                    )
+                print(f"\n[variants filter] running only: {sorted(requested)}")
+                os.makedirs(cfg.results_dir, exist_ok=True)
+                tasks = make_split_cifar100(
+                    data_root  = cfg.data_root,
+                    n_tasks    = cfg.n_tasks,
+                    batch_size = cfg.batch_size,
+                    seed       = cfg.seed,
+                )
+                for (vname, routing, agg, freeze, seq) in VARIANTS:
+                    if vname not in requested:
+                        continue
+                    vcfg = Exp4Config(
+                        **{k: v for k, v in vars(cfg).items()
+                           if k not in ("routing_mode","aggregation","freeze_parents",
+                                        "is_sequential","variant_name")},
+                        routing_mode   = routing,
+                        aggregation    = agg,
+                        freeze_parents = freeze,
+                        is_sequential  = seq,
+                        variant_name   = vname,
+                    )
+                    result = run_ablation_variant(vcfg, tasks)
+                    _save_variant(result, cfg.results_dir, vname)
+            else:
+                run_all_ablations(cfg)
         else:
             # exp 4f — causal forced-hub ablation
             print(f"\nLoading data for forced-hub causal ablation ({n_tasks} tasks)...")
