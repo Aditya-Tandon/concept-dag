@@ -163,6 +163,39 @@ class DAGNode(nn.Module):
 
     # -----------------------------------------------------------------------
 
+    # -----------------------------------------------------------------------
+    # Single-node "local" forward steps — consumed by the memoized evaluator
+    # below. `DAGNode.forward` does recursive expansion, which re-evaluates
+    # shared ancestors once per incoming edge (exponential in diamond DAGs).
+    # These helpers do exactly one node's work, assuming the caller has
+    # already evaluated its parents and passes their outputs in explicitly.
+    # -----------------------------------------------------------------------
+
+    def _local_forward_root(
+        self, x: torch.Tensor, cnn_no_grad: bool = False
+    ) -> torch.Tensor:
+        """
+        Root node's one-shot forward: cnn(x) → concept_module.
+        If cnn_no_grad=True (used in Exp 4's `no_freeze`), the CNN backbone
+        is evaluated under `torch.no_grad()` so its conv activations aren't
+        retained for backprop; gradients still flow through concept_module.
+        """
+        if cnn_no_grad:
+            with torch.no_grad():
+                feats = self.cnn(x)
+        else:
+            feats = self.cnn(x)
+        return self.concept_module(feats)
+
+    def _local_forward_child(
+        self, x: torch.Tensor, parent_outs: List[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Child node's one-shot forward. Assumes `parent_outs[i]` is already
+        the output of `self.parent_models[i]` for this batch.
+        """
+        return self.concept_module(x, parent_outputs=parent_outs)
+
     def compute_concept_subspace(
         self, loader, device: str, top_k: int = 8, max_batches: int = 0
     ) -> torch.Tensor:
@@ -178,6 +211,77 @@ class DAGNode(nn.Module):
                 self(x.to(device))
         cm._collecting_subspace = False
         return cm.compute_concept_subspace(top_k=top_k)
+
+
+# ---------------------------------------------------------------------------
+# Memoized DAG forward
+# ---------------------------------------------------------------------------
+
+
+def forward_dag_memoized(
+    target:      DAGNode,
+    x:           torch.Tensor,
+    cnn_no_grad: bool = False,
+) -> torch.Tensor:
+    """
+    Evaluate the DAG rooted at `target` with each node computed **exactly
+    once** per batch. Drop-in replacement for `target.forward(x)` that
+    eliminates the exponential recomputation of shared ancestors in
+    diamond-heavy DAGs.
+
+    Why this matters:
+      The naive `DAGNode.forward` expands the ancestor subgraph recursively
+      on every call — in a DAG where task 19's ancestors share task 0/1/2
+      along many paths, task 0's CNN can be called ~9× per batch and task 2's
+      concept_module ~4×. Under `torch.no_grad()` that's wasted compute; in
+      the Exp 4 `no_freeze` variant it's catastrophic because every redundant
+      call builds a separate autograd subgraph.
+
+    Algorithm:
+      1. BFS over `parent_models` to collect every ancestor reachable from
+         `target` (plus `target` itself).
+      2. Sort by `task_id`. The DAG growth protocol guarantees that a child's
+         parents all have strictly smaller task_ids, so `task_id` order is a
+         valid topological order.
+      3. Walk the sorted list; for each node, look up its parents' cached
+         outputs and invoke its local forward step. Cache the result keyed
+         by `id(node)`.
+      4. Return `cache[id(target)]`.
+
+    Result: one `concept_module` call per ancestor per batch, one `cnn` call
+    per root ancestor per batch. Linear in |DAG| instead of exponential.
+
+    `cnn_no_grad=True` keeps root-ancestor CNN backbones out of the gradient
+    graph — needed for the `no_freeze` ablation so conv activations aren't
+    retained (see WRITEUP_NOTES.md for rationale).
+    """
+    # 1. Collect all reachable nodes via BFS
+    all_nodes: List[DAGNode] = []
+    seen_ids: set = set()
+    frontier: List[DAGNode] = [target]
+    while frontier:
+        n = frontier.pop(0)
+        nid = id(n)
+        if nid in seen_ids:
+            continue
+        seen_ids.add(nid)
+        all_nodes.append(n)
+        frontier.extend(n.parent_models)
+
+    # 2. Topological order = ascending task_id (guaranteed by the growth protocol:
+    #    every parent task was created before its children).
+    all_nodes.sort(key=lambda n: n.task_id)
+
+    # 3. Evaluate each node exactly once, caching its output tensor by id(node).
+    cache: Dict[int, torch.Tensor] = {}
+    for n in all_nodes:
+        if n.is_root:
+            cache[id(n)] = n._local_forward_root(x, cnn_no_grad=cnn_no_grad)
+        else:
+            parent_outs = [cache[id(p)] for p in n.parent_models]
+            cache[id(n)] = n._local_forward_child(x, parent_outs=parent_outs)
+
+    return cache[id(target)]
 
 
 # ---------------------------------------------------------------------------

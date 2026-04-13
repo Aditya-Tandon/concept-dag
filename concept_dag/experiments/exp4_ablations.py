@@ -43,7 +43,7 @@ from ..utils.metrics import accuracy, evaluate
 from ..data.loaders import make_split_cifar100
 from .exp3_growing_dag import (
     Exp3Config, DAGNode, eval_node,
-    route_for_task, _flush,
+    route_for_task, _flush, forward_dag_memoized,
 )
 
 
@@ -211,34 +211,22 @@ def _collect_ancestors(node: DAGNode) -> Tuple[List[DAGNode], List[DAGNode]]:
     return non_root, roots
 
 
-def _make_grad_transparent_child_forward(target: DAGNode):
+def _make_memoized_no_freeze_forward(target: DAGNode):
     """
-    Replacement for a non-root DAGNode's forward that drops the internal
-    `with torch.no_grad():` wrapper around parent calls so gradients flow
-    through into parents' concept_module parameters.
+    Replacement for `target.forward` used in the Exp 4 `no_freeze` ablation.
+
+    Delegates to `forward_dag_memoized`, which evaluates every ancestor
+    exactly once per batch via topological order and returns the target's
+    output. This eliminates the exponential recomputation of shared
+    ancestors that otherwise makes `no_freeze` runtime-pathological in
+    diamond-heavy DAGs (see WRITEUP_NOTES.md).
+
+    `cnn_no_grad=True` keeps root-ancestor CNN backbones frozen — concept
+    modules still receive gradients from the target's loss, but the CNN
+    isn't retrained and its conv activations aren't retained for backprop.
     """
     def _fwd(x: torch.Tensor) -> torch.Tensor:
-        parent_outs = [p(x) for p in target.parent_models]  # grad-tracked
-        return target.concept_module(x, parent_outputs=parent_outs)
-    return _fwd
-
-
-def _make_frozen_cnn_root_forward(target: DAGNode):
-    """
-    Replacement for a root DAGNode's forward that keeps the CNN backbone
-    in a `no_grad` block (so we don't retain conv activations or train the
-    backbone), but still allows gradients into the root's concept_module.
-
-    Used for the no_freeze ablation: the scientific claim is about whether
-    *concept modules* can stay updateable, not whether the frozen feature
-    extractor should also be retrained. Training the CNN would blow up peak
-    memory by an order of magnitude (see WRITEUP_NOTES.md).
-    """
-    def _fwd(x: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            feats = target.cnn(x)
-        # feats has requires_grad=False; concept_module params still carry grad
-        return target.concept_module(feats)
+        return forward_dag_memoized(target, x, cnn_no_grad=True)
     return _fwd
 
 
@@ -265,10 +253,15 @@ def _train_node_with_freeze_mode(
         a single GPU past ~task 8. See WRITEUP_NOTES.md for detail.
 
     Because `DAGNode.forward` internally wraps its parent calls in
-    `torch.no_grad()`, we monkey-patch `forward` on every ancestor (root
-    ancestors get a CNN-frozen forward; non-root ancestors get a fully
-    grad-transparent forward). All patches are restored in a `finally`
-    block.
+    `torch.no_grad()`, we replace the *training node's* forward with a
+    memoized evaluator that walks the full ancestor DAG in topological
+    order, evaluating every reachable ancestor exactly once per batch.
+    Only the training node's forward is patched — the memoized evaluator
+    calls each ancestor's local modules directly, so ancestor `forward`
+    methods (and their no_grad wrappers) are bypassed entirely. This also
+    fixes the exponential recomputation that otherwise occurs in
+    diamond-shaped DAGs (see WRITEUP_NOTES.md §3). The patch is restored
+    in a `finally` block.
     """
     device = cfg.device
 
@@ -326,21 +319,17 @@ def _train_node_with_freeze_mode(
     opt   = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
 
-    # Monkey-patch forward on the training node AND every ancestor.
-    # - Non-root ancestors: grad-transparent forward (removes no_grad around parents).
-    # - Root ancestors:     CNN stays inside a no_grad block (no conv activations retained),
-    #                       but concept_module gets gradient.
-    # - Training node:      grad-transparent forward (same as non-root ancestors).
+    # Monkey-patch forward on the training node only. The memoized evaluator
+    # walks the full ancestor DAG internally (topologically by task_id),
+    # evaluates each ancestor's local modules exactly once per batch, and
+    # caches results. Ancestor `forward` methods — and their inner no_grad
+    # wrappers — are bypassed entirely, so gradients flow back through every
+    # ancestor concept_module that was added to the optimizer. Root CNN
+    # backbones still run under no_grad (cnn_no_grad=True inside the evaluator).
     patches: List[Tuple[DAGNode, object]] = []  # (node, original_forward)
     if not cfg.freeze_parents and not node.is_root:
         patches.append((node, node.forward))
-        node.forward = _make_grad_transparent_child_forward(node)  # type: ignore[assignment]
-        for a in non_root_ancestors:
-            patches.append((a, a.forward))
-            a.forward = _make_grad_transparent_child_forward(a)    # type: ignore[assignment]
-        for r in root_ancestors:
-            patches.append((r, r.forward))
-            r.forward = _make_frozen_cnn_root_forward(r)           # type: ignore[assignment]
+        node.forward = _make_memoized_no_freeze_forward(node)  # type: ignore[assignment]
 
     history = {"loss": [], "accuracy": []}
     try:
