@@ -75,6 +75,11 @@ def main():
     parser.add_argument("--variants", type=str, nargs="+", default=None,
                         help="Subset of exp4 variants to run (e.g. --variants no_freeze sequential). "
                              "If omitted, all 5 variants run.")
+    # Exp 4f aggregation override (force-include-task-0 across aggregators)
+    parser.add_argument("--aggregation", type=str, default=None,
+                        choices=["concat", "mean", "attention", "svd", "soft_pca", "cross_attention"],
+                        help="Override aggregation for exp 4f (forced-hub). Default soft_pca. "
+                             "Use 'cross_attention' to test the task-0 backbone confound.")
     # Exp 6 confirmation-run arguments
     parser.add_argument("--best_n_parents",      type=int, default=None,
                         help="Explicit best n_parents for exp6 (otherwise loaded from --exp5a)")
@@ -220,6 +225,9 @@ def main():
                 run_all_ablations(cfg)
         else:
             # exp 4f — causal forced-hub ablation
+            if args.aggregation is not None:
+                cfg.aggregation = args.aggregation
+                print(f"[exp 4f] aggregation override: {cfg.aggregation}")
             print(f"\nLoading data for forced-hub causal ablation ({n_tasks} tasks)...")
             tasks = make_split_cifar100(
                 data_root  = cfg.data_root,
@@ -230,7 +238,8 @@ def main():
             import json, os
             result = run_forced_hub_causal(cfg, tasks)
             os.makedirs(cfg.results_dir, exist_ok=True)
-            out_path = os.path.join(cfg.results_dir, "exp4f_forced_hub_results.json")
+            agg_tag = f"_{cfg.aggregation}" if args.aggregation is not None else ""
+            out_path = os.path.join(cfg.results_dir, f"exp4f_forced_hub{agg_tag}_results.json")
             with open(out_path, "w") as f:
                 json.dump(result, f, indent=2)
             print(f"\nForced-hub results saved to {out_path}")
