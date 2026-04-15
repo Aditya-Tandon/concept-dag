@@ -199,6 +199,7 @@ def main():
                         f"Unknown variants {unknown}. Valid: {sorted(known)}"
                     )
                 print(f"\n[variants filter] running only: {sorted(requested)}")
+                import os
                 os.makedirs(cfg.results_dir, exist_ok=True)
                 tasks = make_split_cifar100(
                     data_root  = cfg.data_root,
