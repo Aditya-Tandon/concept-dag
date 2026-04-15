@@ -280,15 +280,159 @@ class SoftPCAAggregator(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Cross-attention aggregator (input-conditioned routing over parents)
+# ---------------------------------------------------------------------------
+
+class CrossAttentionAggregator(nn.Module):
+    """
+    Cross-attention aggregator. Unlike AttentionAggregator (which uses a learned
+    fixed query shared across all inputs), this module derives the query from
+    the child's own input `x`, giving per-sample routing over parents.
+
+    Forward signature accepts an optional `query_input` tensor:
+      - If provided (B, parent_dim): used directly (after projection) as the query.
+      - If None: falls back to the mean of parent outputs (content-only query).
+
+    Orthogonality regularisation on the key and query projection matrices is
+    included so the crystallization-geometry story carries over from SoftPCA.
+    Enable the orth loss by calling .orth_loss() and adding orth_weight * loss
+    to the task objective (same convention as SoftPCAAggregator).
+
+    Entropy regularisation on the attention distribution is optional
+    (entropy_weight > 0): penalises near-one-hot attention to preserve
+    multi-parent composition.
+    """
+
+    uses_query: bool = True  # flag read by ConceptModule to route `x` through
+
+    def __init__(
+        self,
+        parent_dim: int,
+        n_parents: int,
+        out_dim: int,
+        n_heads: int = 4,
+        orth_weight: float = 0.01,
+        entropy_weight: float = 0.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        assert parent_dim % n_heads == 0, (
+            f"parent_dim ({parent_dim}) must be divisible by n_heads ({n_heads})"
+        )
+        self.parent_dim = parent_dim
+        self.n_parents = n_parents
+        self.out_dim = out_dim
+        self.n_heads = n_heads
+        self.orth_weight = orth_weight
+        self.entropy_weight = entropy_weight
+
+        # Separate Q / K / V projections
+        self.q_proj = nn.Linear(parent_dim, parent_dim, bias=False)
+        self.k_proj = nn.Linear(parent_dim, parent_dim, bias=False)
+        self.v_proj = nn.Linear(parent_dim, parent_dim, bias=False)
+        nn.init.orthogonal_(self.q_proj.weight)
+        nn.init.orthogonal_(self.k_proj.weight)
+        nn.init.orthogonal_(self.v_proj.weight)
+
+        self.out_proj = nn.Linear(parent_dim, out_dim, bias=True)
+        self.norm = nn.LayerNorm(out_dim)
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # Cached losses + last attention for logging / interpretability
+        self._last_orth_loss: Optional[torch.Tensor] = None
+        self._last_entropy_loss: Optional[torch.Tensor] = None
+        self._last_attention: Optional[torch.Tensor] = None  # (B, n_heads, n_parents)
+
+    def orth_loss(self) -> torch.Tensor:
+        if self._last_orth_loss is None:
+            return torch.tensor(0.0)
+        return self._last_orth_loss
+
+    def entropy_loss(self) -> torch.Tensor:
+        if self._last_entropy_loss is None:
+            return torch.tensor(0.0)
+        return self._last_entropy_loss
+
+    def get_last_attention(self) -> Optional[torch.Tensor]:
+        """Return most recent attention weights (B, n_heads, n_parents), useful
+        for per-sample provenance analysis."""
+        return self._last_attention
+
+    def _compute_orth_loss(self) -> torch.Tensor:
+        loss = 0.0
+        for W in (self.q_proj.weight, self.k_proj.weight):
+            WWT = W @ W.t()
+            I = torch.eye(W.size(0), device=W.device, dtype=W.dtype)
+            loss = loss + (WWT - I).pow(2).sum()
+        return loss
+
+    def forward(
+        self,
+        parent_outputs: List[torch.Tensor],
+        query_input: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Stack parents: (B, n_parents, D)
+        V_in = torch.stack(parent_outputs, dim=1)
+        B, P, D = V_in.shape
+
+        # Query source
+        if query_input is None:
+            q_src = V_in.mean(dim=1)  # (B, D)
+        else:
+            q_src = query_input       # (B, D)
+
+        # Project Q / K / V and split heads
+        H = self.n_heads
+        Dh = D // H
+        q = self.q_proj(q_src).view(B, 1, H, Dh).transpose(1, 2)   # (B, H, 1, Dh)
+        k = self.k_proj(V_in).view(B, P, H, Dh).transpose(1, 2)    # (B, H, P, Dh)
+        v = self.v_proj(V_in).view(B, P, H, Dh).transpose(1, 2)    # (B, H, P, Dh)
+
+        # Scaled dot-product attention
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(Dh)  # (B, H, 1, P)
+        attn = F.softmax(scores, dim=-1)                                # (B, H, 1, P)
+
+        # Cache attention for interpretability (detach + squeeze query dim)
+        self._last_attention = attn.squeeze(2).detach()  # (B, H, P)
+
+        # Weighted sum over parents, then concatenate heads.
+        # attn: (B, H, 1, P)  v: (B, H, P, Dh)  →  (B, H, 1, Dh)
+        out = torch.matmul(attn, v)                      # (B, H, 1, Dh)
+        # Concat heads: (B, H, 1, Dh) → (B, 1, H, Dh) → (B, 1, H*Dh) → (B, D)
+        out = out.transpose(1, 2).contiguous().view(B, 1, D).squeeze(1)
+
+        # Cache orthogonality loss
+        self._last_orth_loss = self._compute_orth_loss()
+
+        # Cache entropy loss (encourages non-peaky attention when weight > 0)
+        if self.entropy_weight > 0:
+            # Entropy: -sum p log p, averaged over batch + heads
+            eps = 1e-8
+            H_attn = -(attn * (attn + eps).log()).sum(dim=-1)  # (B, H, 1)
+            # We want to MAXIMISE entropy, so loss = -entropy (minimising loss maximises entropy)
+            self._last_entropy_loss = -H_attn.mean()
+        else:
+            self._last_entropy_loss = torch.tensor(0.0, device=out.device)
+
+        out = self.drop(out)
+        out = self.out_proj(out)     # (B, out_dim)
+        return self.norm(out)
+
+    def aggregation_name(self) -> str:
+        return "cross_attention"
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 AGGREGATORS = {
-    "concat":    ConcatAggregator,
-    "mean":      MeanAggregator,
-    "attention": AttentionAggregator,
-    "svd":       SVDAggregator,
-    "soft_pca":  SoftPCAAggregator,
+    "concat":          ConcatAggregator,
+    "mean":            MeanAggregator,
+    "attention":       AttentionAggregator,
+    "svd":             SVDAggregator,
+    "soft_pca":        SoftPCAAggregator,
+    "cross_attention": CrossAttentionAggregator,
 }
 
 
@@ -307,3 +451,8 @@ def build_aggregator(name: str, parent_dim: int, n_parents: int, out_dim: int, *
     if name == "mean":
         return cls(parent_dim=parent_dim, out_dim=out_dim, **kwargs)
     return cls(parent_dim=parent_dim, n_parents=n_parents, out_dim=out_dim, **kwargs)
+
+
+def aggregator_uses_query(agg: nn.Module) -> bool:
+    """Return True if the aggregator expects a query_input argument (e.g. CrossAttentionAggregator)."""
+    return getattr(agg, "uses_query", False)

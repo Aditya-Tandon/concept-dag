@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple
 import math
 
-from .aggregation import build_aggregator
+from .aggregation import build_aggregator, aggregator_uses_query
 
 
 class ConceptModule(nn.Module):
@@ -114,7 +114,17 @@ class ConceptModule(nn.Module):
             (B, out_dim) concept embedding.
         """
         if self.aggregator is not None and parent_outputs is not None:
-            h = self.aggregator(parent_outputs)  # (B, in_dim)
+            # Cross-attention aggregators consume `x` as the per-sample query.
+            # Guard: only pass x when its shape matches (B, in_dim). For child
+            # DAGNodes `x` is the raw image (4-D); in that case we pass None and
+            # the aggregator falls back to mean-of-parents as the query source.
+            # Non-query aggregators (concat, mean, svd, soft_pca, attention) ignore x.
+            if aggregator_uses_query(self.aggregator):
+                q_ok = (x is not None) and (x.ndim == 2) and (x.shape[-1] == self.in_dim)
+                q_input = x if q_ok else None
+                h = self.aggregator(parent_outputs, query_input=q_input)  # (B, in_dim)
+            else:
+                h = self.aggregator(parent_outputs)  # (B, in_dim)
         else:
             h = x  # root node
 

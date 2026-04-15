@@ -81,7 +81,7 @@ class Exp4Config:
     perturb_lr:      float = 5e-4
     # Ablation switches
     routing_mode:    str   = "principal_angle"  # "principal_angle" | "random"
-    aggregation:     str   = "soft_pca"         # "soft_pca" | "concat" | "mean"
+    aggregation:     str   = "soft_pca"         # "soft_pca" | "concat" | "mean" | "cross_attention"
     freeze_parents:  bool  = True               # freeze parent nodes after training?
     is_sequential:   bool  = False              # no parents at all (baseline)
     # Misc
@@ -166,10 +166,13 @@ class _ChildNodeWithAggregation(DAGNode):
         self.parent_models: List[DAGNode] = list(parent_models)
 
         n_par = len(parent_models)
-        agg = cfg.aggregation  # "soft_pca" | "concat" | "mean"
+        agg = cfg.aggregation  # "soft_pca" | "concat" | "mean" | "cross_attention"
         agg_kwargs: dict = {}
         if agg == "soft_pca":
             agg_kwargs = {"top_k": min(cfg.soft_pca_k, cfg.concept_dim)}
+        elif agg == "cross_attention":
+            # 4 heads is a reasonable default; requires concept_dim divisible by n_heads
+            agg_kwargs = {"n_heads": 4, "orth_weight": cfg.orth_weight, "entropy_weight": 0.0}
 
         self.concept_module = ConceptModule(
             module_id   = f"node_{task_id}",
@@ -750,12 +753,16 @@ def run_forced_hub_causal(
 # ──────────────────────────────────────────────────────────────────────────────
 
 VARIANTS = [
-    # (variant_name, routing_mode,      aggregation, freeze_parents, is_sequential)
-    ("full",         "principal_angle", "soft_pca",  True,           False),
-    ("no_routing",   "random",          "soft_pca",  True,           False),
-    ("no_crystal",   "principal_angle", "concat",    True,           False),
-    ("no_freeze",    "principal_angle", "soft_pca",  False,          False),
-    ("sequential",   "principal_angle", "soft_pca",  True,           True),
+    # (variant_name,       routing_mode,      aggregation,       freeze_parents, is_sequential)
+    ("full",                "principal_angle", "soft_pca",        True,           False),
+    ("no_routing",          "random",          "soft_pca",        True,           False),
+    ("no_crystal",          "principal_angle", "concat",          True,           False),
+    ("no_freeze",           "principal_angle", "soft_pca",        False,          False),
+    ("sequential",          "principal_angle", "soft_pca",        True,           True),
+    # Post-Exp-5 extension: cross-attention aggregator replaces SoftPCA.
+    # Tests whether input-conditioned routing over parents beats the
+    # subspace-bottlenecked linear aggregation.
+    ("cross_attention",     "principal_angle", "cross_attention", True,           False),
 ]
 
 
