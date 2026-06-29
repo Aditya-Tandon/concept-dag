@@ -84,6 +84,10 @@ class Exp4Config:
     aggregation:     str   = "soft_pca"         # "soft_pca" | "concat" | "mean" | "cross_attention"
     freeze_parents:  bool  = True               # freeze parent nodes after training?
     is_sequential:   bool  = False              # no parents at all (baseline)
+    # Backbone ("smallcnn" | "dinov2_vits14" | "clip_vitb16" | "resnet50")
+    backbone:        str   = "smallcnn"
+    feature_dim:     int   = None               # auto-set from encoder if backbone != smallcnn
+    cache_dir:       str   = None               # where to store cached features
     # Misc
     seed:            int   = 42
     device:          str   = "cpu"
@@ -131,9 +135,13 @@ def _build_node(
     Build a DAGNode that respects the ablation flags.
     For no_crystal: override aggregation to 'concat'.
     For sequential / no-parent cases: always root.
+    Respects cfg.backbone / cfg.feature_dim for SSL encoder mode.
     """
+    use_cnn     = (cfg.backbone == "smallcnn")
+    feature_dim = cfg.feature_dim  # None for smallcnn (unused), set for SSL encoders
+
     if cfg.is_sequential or not parent_models:
-        # Root node: SmallCNN + ConceptModule, no parents
+        # Root node
         node = DAGNode(
             task_id      = task_id,
             concept_dim  = cfg.concept_dim,
@@ -141,6 +149,8 @@ def _build_node(
             n_mlp_layers = cfg.n_mlp_layers,
             parent_models= None,
             soft_pca_k   = cfg.soft_pca_k,
+            use_cnn      = use_cnn,
+            feature_dim  = feature_dim,
         )
     else:
         # Child node: build manually to override aggregation
@@ -160,9 +170,10 @@ class _ChildNodeWithAggregation(DAGNode):
     def __init__(self, task_id: int, cfg: Exp4Config, parent_models: List[DAGNode]):
         # Call nn.Module.__init__ directly — we'll build our own internals
         nn.Module.__init__(self)
-        self.task_id = task_id
+        self.task_id  = task_id
         self._is_root = False
-        self.cnn = None
+        self.use_cnn  = False    # children never have a CNN
+        self.cnn      = None
         self.parent_models: List[DAGNode] = list(parent_models)
 
         n_par = len(parent_models)
@@ -766,25 +777,34 @@ VARIANTS = [
 ]
 
 
-def run_all_ablations(cfg: Exp4Config) -> Dict:
+def run_all_ablations(cfg: Exp4Config, tasks=None) -> Dict:
     """
     Load the data once, then run all five variants sequentially.
     Saves per-variant JSON and a combined summary JSON.
+
+    Args:
+        tasks: Pre-loaded task list (e.g. with cached SSL features). If None,
+               loads raw Split-CIFAR-100 images as before.
     """
     print("\n" + "=" * 70)
     print("Experiment 4: Ablation Studies")
+    if cfg.backbone != "smallcnn":
+        print(f"  Backbone: {cfg.backbone}  feature_dim={cfg.feature_dim}")
     print("=" * 70)
     print(f"  {len(VARIANTS)} variants × {cfg.n_tasks} tasks × up to {cfg.child_epochs} epochs")
 
     os.makedirs(cfg.results_dir, exist_ok=True)
 
-    print("\n[Step 0] Loading Split-CIFAR-100...")
-    tasks = make_split_cifar100(
-        data_root  = cfg.data_root,
-        n_tasks    = cfg.n_tasks,
-        batch_size = cfg.batch_size,
-        seed       = cfg.seed,
-    )
+    if tasks is None:
+        print("\n[Step 0] Loading Split-CIFAR-100...")
+        tasks = make_split_cifar100(
+            data_root  = cfg.data_root,
+            n_tasks    = cfg.n_tasks,
+            batch_size = cfg.batch_size,
+            seed       = cfg.seed,
+        )
+    else:
+        print(f"\n[Step 0] Using pre-loaded tasks ({len(tasks)} tasks).")
     print(f"  {cfg.n_tasks} tasks, 5 classes each.")
 
     all_results = {}

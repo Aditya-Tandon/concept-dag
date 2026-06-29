@@ -80,6 +80,14 @@ def main():
                         choices=["concat", "mean", "attention", "svd", "soft_pca", "cross_attention"],
                         help="Override aggregation for exp 4f (forced-hub). Default soft_pca. "
                              "Use 'cross_attention' to test the task-0 backbone confound.")
+    # SSL backbone arguments (DINO swap)
+    parser.add_argument("--backbone", type=str, default="smallcnn",
+                        choices=["smallcnn", "dinov2_vits14", "clip_vitb16", "resnet50"],
+                        help="Feature extractor backbone. 'smallcnn' = original task-trained CNN. "
+                             "Other options use a frozen SSL encoder + feature caching.")
+    parser.add_argument("--cache_dir", type=str, default=None,
+                        help="Directory for cached SSL features (default: <data_root>/features_<backbone>). "
+                             "Only used when --backbone != smallcnn.")
     # Exp 6 confirmation-run arguments
     parser.add_argument("--best_n_parents",      type=int, default=None,
                         help="Explicit best n_parents for exp6 (otherwise loaded from --exp5a)")
@@ -106,6 +114,29 @@ def main():
     else:
         device = args.device
     print(f"Using device: {device}")
+
+    # ── Backbone / feature-cache setup ──────────────────────────────────────
+    def _prepare_tasks_with_backbone(raw_tasks, backbone: str, cache_dir, data_root):
+        """
+        If backbone != 'smallcnn', build the frozen encoder, cache features,
+        and return feature-tensor tasks + feature_dim.
+        If backbone == 'smallcnn', return raw_tasks unchanged + feature_dim=None.
+        """
+        if backbone == "smallcnn":
+            return raw_tasks, None
+        from concept_dag.models.root_encoder import build_encoder
+        from concept_dag.data.feature_cache import cache_features
+        if cache_dir is None:
+            cache_dir = os.path.join(data_root, f"features_{backbone}")
+        print(f"\n[backbone] Building encoder: {backbone}")
+        encoder = build_encoder(backbone, device=device)
+        print(f"[backbone] Feature dim: {encoder.feature_dim}  |  Cache: {cache_dir}")
+        tasks = cache_features(encoder, raw_tasks, cache_dir=cache_dir, device=device)
+        del encoder  # free GPU memory before training starts
+        import gc; gc.collect()
+        if device in ("cuda", "mps"):
+            torch.cuda.empty_cache() if device == "cuda" else None
+        return tasks, tasks[0]["feature_dim"]
 
     # Download mode
     if args.download:
@@ -146,6 +177,8 @@ def main():
 
     elif args.exp in ("3a", "3b"):
         from concept_dag.experiments.exp3_growing_dag import Exp3Config, run_exp3a, run_exp3b
+        from concept_dag.data.loaders import make_split_cifar100
+        n_tasks = args.n_tasks if args.n_tasks is not None else 20
         cfg = Exp3Config(
             data_root   = args.data_root,
             device      = device,
@@ -154,15 +187,23 @@ def main():
             results_dir = f"{args.out_dir}/exp3",
             seed        = args.seed,
             batch_size  = args.batch_size,
+            n_tasks     = n_tasks,
+            backbone    = args.backbone,
+            cache_dir   = args.cache_dir,
         )
-        if args.n_tasks is not None:
-            cfg.n_tasks = args.n_tasks
+        raw_tasks = make_split_cifar100(
+            data_root=args.data_root, n_tasks=n_tasks,
+            batch_size=args.batch_size, seed=args.seed,
+        )
+        tasks, feature_dim = _prepare_tasks_with_backbone(
+            raw_tasks, args.backbone, args.cache_dir, args.data_root)
+        if feature_dim is not None:
+            cfg.feature_dim = feature_dim
         if args.exp == "3a":
-            run_exp3a(cfg)
+            run_exp3a(cfg, tasks=tasks)
         else:
-            # 3b builds on top of 3a — run 3a first then immediately do 3b
             print("Running 3a first to build the DAG, then running 3b...")
-            results_3a, nodes, heads, parent_map, tasks = run_exp3a(cfg)
+            results_3a, nodes, heads, parent_map, _ = run_exp3a(cfg, tasks=tasks)
             run_exp3b(cfg, nodes, heads, parent_map, tasks)
 
     elif args.exp in ("4", "4f"):
@@ -183,14 +224,24 @@ def main():
             seed         = args.seed,
             batch_size   = args.batch_size,
             n_tasks      = n_tasks,
+            backbone     = args.backbone,
+            cache_dir    = args.cache_dir,
         )
+        # Load raw data once, then optionally swap to cached SSL features
+        raw_tasks = make_split_cifar100(
+            data_root=args.data_root, n_tasks=n_tasks,
+            batch_size=args.batch_size, seed=args.seed,
+        )
+        tasks, feature_dim = _prepare_tasks_with_backbone(
+            raw_tasks, args.backbone, args.cache_dir, args.data_root)
+        if feature_dim is not None:
+            cfg.feature_dim = feature_dim
 
         if args.exp == "4":
             if args.variants:
                 from concept_dag.experiments.exp4_ablations import (
                     VARIANTS, run_ablation_variant, _save_variant, Exp4Config,
                 )
-                from concept_dag.data.loaders import make_split_cifar100
                 requested = set(args.variants)
                 known     = {v[0] for v in VARIANTS}
                 unknown   = requested - known
@@ -199,14 +250,7 @@ def main():
                         f"Unknown variants {unknown}. Valid: {sorted(known)}"
                     )
                 print(f"\n[variants filter] running only: {sorted(requested)}")
-                import os
                 os.makedirs(cfg.results_dir, exist_ok=True)
-                tasks = make_split_cifar100(
-                    data_root  = cfg.data_root,
-                    n_tasks    = cfg.n_tasks,
-                    batch_size = cfg.batch_size,
-                    seed       = cfg.seed,
-                )
                 for (vname, routing, agg, freeze, seq) in VARIANTS:
                     if vname not in requested:
                         continue
@@ -223,19 +267,12 @@ def main():
                     result = run_ablation_variant(vcfg, tasks)
                     _save_variant(result, cfg.results_dir, vname)
             else:
-                run_all_ablations(cfg)
+                run_all_ablations(cfg, tasks=tasks)
         else:
             # exp 4f — causal forced-hub ablation
             if args.aggregation is not None:
                 cfg.aggregation = args.aggregation
                 print(f"[exp 4f] aggregation override: {cfg.aggregation}")
-            print(f"\nLoading data for forced-hub causal ablation ({n_tasks} tasks)...")
-            tasks = make_split_cifar100(
-                data_root  = cfg.data_root,
-                n_tasks    = cfg.n_tasks,
-                batch_size = cfg.batch_size,
-                seed       = cfg.seed,
-            )
             import json, os
             result = run_forced_hub_causal(cfg, tasks)
             os.makedirs(cfg.results_dir, exist_ok=True)
