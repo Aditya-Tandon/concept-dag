@@ -131,11 +131,14 @@ def main():
         print(f"\n[backbone] Building encoder: {backbone}")
         encoder = build_encoder(backbone, device=device)
         print(f"[backbone] Feature dim: {encoder.feature_dim}  |  Cache: {cache_dir}")
-        tasks = cache_features(encoder, raw_tasks, cache_dir=cache_dir, device=device)
+        tasks = cache_features(encoder, raw_tasks, cache_dir=cache_dir, device=device,
+                               seed=args.seed)
         del encoder  # free GPU memory before training starts
         import gc; gc.collect()
-        if device in ("cuda", "mps"):
-            torch.cuda.empty_cache() if device == "cuda" else None
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        elif device == "mps":
+            torch.mps.empty_cache()
         return tasks, tasks[0]["feature_dim"]
 
     # Download mode

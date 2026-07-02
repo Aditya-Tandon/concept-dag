@@ -188,12 +188,3 @@ def build_encoder(name: str, device: str = "cpu") -> RootEncoder:
     enc = enc.to(device)
     enc.freeze()
     return enc
-
-
-def encoder_feature_dim(name: str) -> int:
-    """Return the output feature dim for an encoder name without instantiating it."""
-    if name == "smallcnn":
-        return None  # determined by cnn_out_dim config field
-    if name not in _ENCODERS:
-        raise ValueError(f"Unknown encoder '{name}'.")
-    return _ENCODERS[name].feature_dim

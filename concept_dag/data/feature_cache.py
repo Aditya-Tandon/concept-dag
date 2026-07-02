@@ -71,6 +71,7 @@ def cache_features(
     device:      str  = "cpu",
     batch_size:  int  = 256,
     force_redo:  bool = False,
+    seed:        Optional[int] = None,
 ) -> List[Dict]:
     """
     Extract and cache encoder features for all tasks.
@@ -95,16 +96,21 @@ def cache_features(
     encoder_name = getattr(encoder, "__class__", type(encoder)).__name__
     feature_dim  = encoder.feature_dim
 
-    # Write / verify meta
+    # Write / verify meta. `seed` is included because it determines the task
+    # class splits: reusing a cache built under a different seed would silently
+    # serve stale features for the wrong classes.
     if not force_redo and os.path.exists(meta_path):
         with open(meta_path) as f:
             meta = json.load(f)
-        if meta.get("encoder_name") != encoder_name or meta.get("n_tasks") != len(raw_tasks):
-            print(f"[feature_cache] Cache meta mismatch — recomputing.")
+        if (meta.get("encoder_name") != encoder_name
+                or meta.get("n_tasks") != len(raw_tasks)
+                or meta.get("seed") != seed):
+            print(f"[feature_cache] Cache meta mismatch "
+                  f"(encoder/n_tasks/seed) — recomputing.")
             force_redo = True
     else:
         meta = {"encoder_name": encoder_name, "feature_dim": feature_dim,
-                "n_tasks": len(raw_tasks)}
+                "n_tasks": len(raw_tasks), "seed": seed}
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
@@ -161,25 +167,3 @@ def _make_fast_loader(dataset, batch_size: int) -> DataLoader:
     """Temporary loader at higher batch_size for feature extraction."""
     return DataLoader(dataset, batch_size=batch_size, shuffle=False,
                       num_workers=0, pin_memory=False)
-
-
-# ---------------------------------------------------------------------------
-# Normalisation helper (DINO doesn't renormalise; CIFAR loaders use CIFAR stats)
-# ---------------------------------------------------------------------------
-
-def get_imagenet_transform():
-    """
-    Returns a torchvision transform that converts CIFAR-normalised tensors
-    to ImageNet-normalised tensors suitable for DINOv2 / CLIP / ResNet-50.
-
-    Not needed if using feature caching (encoder handles the normalisation
-    internally via the raw images). Provided here for completeness.
-    """
-    try:
-        import torchvision.transforms as T
-    except ImportError:
-        raise ImportError("torchvision required.")
-    return T.Normalize(
-        mean=(0.485, 0.456, 0.406),
-        std=(0.229, 0.224, 0.225),
-    )
