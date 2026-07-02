@@ -96,23 +96,25 @@ def cache_features(
     encoder_name = getattr(encoder, "__class__", type(encoder)).__name__
     feature_dim  = encoder.feature_dim
 
-    # Write / verify meta. `seed` is included because it determines the task
+    # Verify / (re)write meta. `seed` is included because it determines the task
     # class splits: reusing a cache built under a different seed would silently
     # serve stale features for the wrong classes.
+    current_meta = {"encoder_name": encoder_name, "feature_dim": feature_dim,
+                    "n_tasks": len(raw_tasks), "seed": seed}
     if not force_redo and os.path.exists(meta_path):
         with open(meta_path) as f:
-            meta = json.load(f)
-        if (meta.get("encoder_name") != encoder_name
-                or meta.get("n_tasks") != len(raw_tasks)
-                or meta.get("seed") != seed):
+            existing = json.load(f)
+        if (existing.get("encoder_name") != encoder_name
+                or existing.get("n_tasks") != len(raw_tasks)
+                or existing.get("seed") != seed):
             print(f"[feature_cache] Cache meta mismatch "
                   f"(encoder/n_tasks/seed) — recomputing.")
             force_redo = True
-    else:
-        meta = {"encoder_name": encoder_name, "feature_dim": feature_dim,
-                "n_tasks": len(raw_tasks), "seed": seed}
-        with open(meta_path, "w") as f:
-            json.dump(meta, f, indent=2)
+    # Always (re)write meta so a mismatch-triggered recompute updates the on-disk
+    # key. Otherwise the stale meta would keep mismatching and every subsequent
+    # run would recompute from scratch, defeating the cache.
+    with open(meta_path, "w") as f:
+        json.dump(current_meta, f, indent=2)
 
     encoder = encoder.to(device).eval()
     new_tasks = []

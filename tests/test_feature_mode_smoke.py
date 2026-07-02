@@ -184,8 +184,54 @@ def test_cross_attention_input_query_mode():
     print("[cross_attn] input-query mode: dim-safe, input-driven, raises on misuse ✓")
 
 
+def test_feature_cache_seed_meta_rewrite():
+    """A seed change must invalidate the cache AND update the on-disk meta, so a
+    second run at the new seed does not re-detect a mismatch and recompute forever."""
+    import json
+    import os
+    import torch.nn as nn
+    from concept_dag.data.feature_cache import cache_features
+
+    class DummyEncoder(nn.Module):
+        feature_dim = 8
+
+        def forward(self, x):
+            return x.flatten(1)[:, : self.feature_dim]  # (B, 8)
+
+    def _raw_tasks():
+        tasks = []
+        for t in range(2):
+            imgs = torch.randn(12, 3, 4, 4)
+            lbls = torch.randint(0, 5, (12,))
+            def _dl(shuffle):
+                return DataLoader(TensorDataset(imgs, lbls), batch_size=6, shuffle=shuffle)
+            tasks.append({
+                "task_id": t, "train": _dl(True), "val": _dl(False), "test": _dl(False),
+                "n_classes": 5, "class_ids": list(range(t * 5, t * 5 + 5)), "name": f"t{t}",
+            })
+        return tasks
+
+    enc = DummyEncoder()
+    with tempfile.TemporaryDirectory() as tmp:
+        meta_path = os.path.join(tmp, "meta.json")
+
+        cache_features(enc, _raw_tasks(), cache_dir=tmp, device="cpu", seed=0)
+        assert json.load(open(meta_path))["seed"] == 0
+
+        # Re-run at the same seed: meta stays 0, cache is reused (no crash).
+        cache_features(enc, _raw_tasks(), cache_dir=tmp, device="cpu", seed=0)
+        assert json.load(open(meta_path))["seed"] == 0
+
+        # Seed change: meta MUST update to 1 (the bug left it stale at 0).
+        cache_features(enc, _raw_tasks(), cache_dir=tmp, device="cpu", seed=1)
+        assert json.load(open(meta_path))["seed"] == 1, "meta not rewritten after seed change"
+
+    print("[feature_cache] seed change invalidates cache and rewrites meta ✓")
+
+
 if __name__ == "__main__":
     test_feature_mode_smoke()
     test_cross_attention_no_silent_flip()
     test_cross_attention_input_query_mode()
+    test_feature_cache_seed_meta_rewrite()
     print("PASS")
