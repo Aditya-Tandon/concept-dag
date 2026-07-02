@@ -112,6 +112,80 @@ def test_feature_mode_smoke():
     return aa
 
 
+def test_cross_attention_no_silent_flip():
+    """Regression test for the H2 confound (see [[cross-attention-backbone-effect]]).
+
+    With the default query_from_input=False, a cross-attention child's output must
+    NOT depend on its input `x` at all — in particular it must be identical whether
+    feature_dim == concept_dim or feature_dim != concept_dim. Previously the query
+    source silently flipped to the raw input exactly when those dims coincided
+    (e.g. DINOv2-384 with concept_dim=384), contaminating the ablation.
+    """
+    from concept_dag.modules.concept_module import ConceptModule
+
+    concept_dim = 16
+    cm = ConceptModule(
+        module_id="child", in_dim=concept_dim, hidden_dim=concept_dim,
+        out_dim=concept_dim, n_layers=2, n_parents=2,
+        aggregation="cross_attention", agg_kwargs={"n_heads": 4},  # query_from_input defaults False
+    )
+    cm.eval()  # disable dropout for determinism
+
+    torch.manual_seed(0)
+    parents = [torch.randn(4, concept_dim), torch.randn(4, concept_dim)]
+    x_eq = torch.randn(4, concept_dim)        # feature_dim == concept_dim (the old flip trigger)
+    x_neq = torch.randn(4, concept_dim + 8)   # feature_dim != concept_dim
+
+    with torch.no_grad():
+        o_eq = cm(x_eq, parent_outputs=parents)
+        o_neq = cm(x_neq, parent_outputs=parents)
+        o_none = cm(None, parent_outputs=parents)
+
+    assert o_eq.shape == (4, concept_dim)
+    assert torch.allclose(o_eq, o_neq, atol=1e-6), "output changed with feature_dim — silent flip present"
+    assert torch.allclose(o_eq, o_none, atol=1e-6), "output depends on input when query_from_input=False"
+    print("[cross_attn] no-silent-flip: output is input-independent when query_from_input=False ✓")
+
+
+def test_cross_attention_input_query_mode():
+    """The opt-in input-query mode must work at ANY feature_dim (dim-safe projection),
+    actually use the input (output depends on it), and raise on a missing 2-D input."""
+    from concept_dag.modules.concept_module import ConceptModule
+
+    concept_dim, feature_dim = 16, 24  # deliberately unequal
+    cm = ConceptModule(
+        module_id="child", in_dim=concept_dim, hidden_dim=concept_dim,
+        out_dim=concept_dim, n_layers=2, n_parents=2,
+        aggregation="cross_attention",
+        agg_kwargs={"n_heads": 4, "query_from_input": True, "query_input_dim": feature_dim},
+    )
+    cm.eval()
+
+    torch.manual_seed(0)
+    parents = [torch.randn(4, concept_dim), torch.randn(4, concept_dim)]
+    x1 = torch.randn(4, feature_dim)
+    x2 = torch.randn(4, feature_dim)
+
+    with torch.no_grad():
+        o1 = cm(x1, parent_outputs=parents)
+        o2 = cm(x2, parent_outputs=parents)
+
+    assert o1.shape == (4, concept_dim), "projection feature_dim->concept_dim failed"
+    assert not torch.allclose(o1, o2), "input-query mode ignored the input"
+
+    # Missing 2-D input (e.g. smallcnn mode where x is a 4-D image) must fail loudly.
+    raised = False
+    try:
+        with torch.no_grad():
+            cm(None, parent_outputs=parents)
+    except ValueError:
+        raised = True
+    assert raised, "input-query mode must raise when no 2-D query input is available"
+    print("[cross_attn] input-query mode: dim-safe, input-driven, raises on misuse ✓")
+
+
 if __name__ == "__main__":
     test_feature_mode_smoke()
+    test_cross_attention_no_silent_flip()
+    test_cross_attention_input_query_mode()
     print("PASS")
