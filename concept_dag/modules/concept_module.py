@@ -114,14 +114,17 @@ class ConceptModule(nn.Module):
             (B, out_dim) concept embedding.
         """
         if self.aggregator is not None and parent_outputs is not None:
-            # Cross-attention aggregators consume `x` as the per-sample query.
-            # Guard: only pass x when its shape matches (B, in_dim). For child
-            # DAGNodes `x` is the raw image (4-D); in that case we pass None and
-            # the aggregator falls back to mean-of-parents as the query source.
+            # Cross-attention aggregators can consume `x` as the per-sample query.
+            # Pass `x` through whenever it is a per-sample feature vector (2-D),
+            # regardless of whether its dim equals in_dim; the aggregator itself
+            # decides via its explicit `query_from_input` flag whether to use it
+            # (and projects it dim-safely). For child DAGNodes in smallcnn mode `x`
+            # is a 4-D image, so we pass None. We deliberately no longer gate on
+            # `x.shape[-1] == self.in_dim`, which silently flipped the query source
+            # when feature_dim == concept_dim.
             # Non-query aggregators (concat, mean, svd, soft_pca, attention) ignore x.
             if aggregator_uses_query(self.aggregator):
-                q_ok = (x is not None) and (x.ndim == 2) and (x.shape[-1] == self.in_dim)
-                q_input = x if q_ok else None
+                q_input = x if (x is not None and x.ndim == 2) else None
                 h = self.aggregator(parent_outputs, query_input=q_input)  # (B, in_dim)
             else:
                 h = self.aggregator(parent_outputs)  # (B, in_dim)

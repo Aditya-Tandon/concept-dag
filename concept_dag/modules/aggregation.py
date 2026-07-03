@@ -286,12 +286,21 @@ class SoftPCAAggregator(nn.Module):
 class CrossAttentionAggregator(nn.Module):
     """
     Cross-attention aggregator. Unlike AttentionAggregator (which uses a learned
-    fixed query shared across all inputs), this module derives the query from
+    fixed query shared across all inputs), this module can derive the query from
     the child's own input `x`, giving per-sample routing over parents.
 
-    Forward signature accepts an optional `query_input` tensor:
-      - If provided (B, parent_dim): used directly (after projection) as the query.
-      - If None: falls back to the mean of parent outputs (content-only query).
+    The query source is set EXPLICITLY at construction via `query_from_input`:
+      - query_from_input=False (default): query = mean of parent outputs
+        (content-only). `query_input` is ignored. This is the behaviour every
+        pre-2026-07 result used (in smallcnn mode the child input is a 4-D image
+        and was never usable as a query).
+      - query_from_input=True: query = q_input_proj(query_input), a learned
+        projection of the child's (B, query_input_dim) feature to (B, parent_dim).
+        Works at ANY feature_dim. Requires a 2-D `query_input`; raises otherwise.
+
+    The behaviour NO LONGER depends on whether query_input's dim coincidentally
+    equals parent_dim — that silent flip (triggered when feature_dim==concept_dim)
+    was a confound for the DINO ablation. See [[cross-attention-backbone-effect]].
 
     Orthogonality regularisation on the key and query projection matrices is
     included so the crystallization-geometry story carries over from SoftPCA.
@@ -314,6 +323,8 @@ class CrossAttentionAggregator(nn.Module):
         orth_weight: float = 0.01,
         entropy_weight: float = 0.0,
         dropout: float = 0.0,
+        query_from_input: bool = False,
+        query_input_dim: Optional[int] = None,
     ):
         super().__init__()
         assert parent_dim % n_heads == 0, (
@@ -325,6 +336,27 @@ class CrossAttentionAggregator(nn.Module):
         self.n_heads = n_heads
         self.orth_weight = orth_weight
         self.entropy_weight = entropy_weight
+
+        # Query source is governed by this EXPLICIT flag, never by whether the
+        # child input's dim happens to equal parent_dim. (That coincidence — hit
+        # exactly when feature_dim == concept_dim, e.g. DINOv2-384 with
+        # concept_dim=384 — used to silently flip the query between the child
+        # input and the mean of parents. See [[cross-attention-backbone-effect]].)
+        self.query_from_input = query_from_input
+        if query_from_input:
+            if query_input_dim is None:
+                raise ValueError(
+                    "CrossAttentionAggregator(query_from_input=True) requires "
+                    "query_input_dim (the child input feature dim, e.g. the "
+                    "encoder feature_dim)."
+                )
+            # Dim-safe projection: child input (B, query_input_dim) -> (B, parent_dim),
+            # so input-derived queries work at ANY feature_dim, not only when it
+            # coincidentally equals parent_dim.
+            self.q_input_proj = nn.Linear(query_input_dim, parent_dim, bias=False)
+            nn.init.orthogonal_(self.q_input_proj.weight)
+        else:
+            self.q_input_proj = None
 
         # Separate Q / K / V projections
         self.q_proj = nn.Linear(parent_dim, parent_dim, bias=False)
@@ -375,11 +407,21 @@ class CrossAttentionAggregator(nn.Module):
         V_in = torch.stack(parent_outputs, dim=1)
         B, P, D = V_in.shape
 
-        # Query source
-        if query_input is None:
-            q_src = V_in.mean(dim=1)  # (B, D)
+        # Query source — governed by the explicit query_from_input flag, NOT by
+        # whether query_input's dim matches parent_dim (that silent coincidence
+        # is the confound this fix removes).
+        if self.query_from_input:
+            if query_input is None:
+                raise ValueError(
+                    "CrossAttentionAggregator(query_from_input=True) requires a "
+                    "2-D query_input (B, query_input_dim). Got None — this occurs "
+                    "in smallcnn mode where the child input is a 4-D image; "
+                    "input-derived queries are only valid with a feature-mode "
+                    "(SSL) backbone."
+                )
+            q_src = self.q_input_proj(query_input)  # (B, parent_dim)
         else:
-            q_src = query_input       # (B, D)
+            q_src = V_in.mean(dim=1)  # (B, D) — content-only (mean-of-parents) query
 
         # Project Q / K / V and split heads
         H = self.n_heads

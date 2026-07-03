@@ -53,6 +53,10 @@ class Exp3Config:
     concept_dim:     int   = 128
     n_mlp_layers:   int   = 2
     soft_pca_k:      int   = 8
+    # Backbone ("smallcnn" | "dinov2_vits14" | "clip_vitb16" | "resnet50")
+    backbone:        str   = "smallcnn"
+    feature_dim:     Optional[int] = None    # auto-set from encoder if backbone != smallcnn
+    cache_dir:       Optional[str] = None    # where to store cached features
     # DAG growth
     n_tasks:         int   = 20
     n_parents:       int   = 2
@@ -82,12 +86,22 @@ class DAGNode(nn.Module):
     """
     Single node in the growing Concept DAG.
 
-    Root nodes (no parents) own a SmallCNN backbone that processes raw images.
-    Child nodes receive parent concept embeddings, aggregate them via SoftPCA,
-    and map to a concept embedding through a small MLP.
+    Root nodes (no parents) own a SmallCNN backbone that processes raw images,
+    OR — when use_cnn=False — receive pre-extracted feature vectors directly
+    from a frozen external encoder (e.g. DINOv2) via feature caching.
+
+    Child nodes receive parent concept embeddings, aggregate them, and map
+    to a concept embedding through a small MLP.
 
     Parent models are stored as a plain Python list — NOT an nn.ModuleList —
     so that MPS/CUDA can free child memory without holding references to parents.
+
+    Args:
+        use_cnn:      If True (default), root nodes build a SmallCNN.
+                      If False, root nodes expect pre-extracted features of
+                      size `feature_dim` — use with feature_cache.py.
+        feature_dim:  Input feature dimension when use_cnn=False.
+                      Ignored when use_cnn=True (cnn_out_dim is used instead).
     """
 
     def __init__(
@@ -98,16 +112,25 @@ class DAGNode(nn.Module):
         n_mlp_layers:  int   = 2,
         parent_models: Optional[List["DAGNode"]] = None,
         soft_pca_k:    int   = 8,
+        use_cnn:       bool  = True,
+        feature_dim:   Optional[int] = None,
     ):
         super().__init__()
         self.task_id     = task_id
         self._is_root    = not parent_models
+        self.use_cnn     = use_cnn
+
+        # Resolve input dimension for this node
+        if self._is_root:
+            in_dim = cnn_out_dim if use_cnn else (feature_dim or cnn_out_dim)
+        else:
+            in_dim = concept_dim
 
         if self._is_root:
-            self.cnn = SmallCNN(in_channels=3, out_dim=cnn_out_dim)
+            self.cnn = SmallCNN(in_channels=3, out_dim=cnn_out_dim) if use_cnn else None
             self.concept_module = ConceptModule(
                 module_id  = f"node_{task_id}",
-                in_dim     = cnn_out_dim,
+                in_dim     = in_dim,
                 hidden_dim = concept_dim,
                 out_dim    = concept_dim,
                 n_layers   = n_mlp_layers,
@@ -120,7 +143,7 @@ class DAGNode(nn.Module):
             self.parent_models = list(parent_models)   # plain list
             self.concept_module = ConceptModule(
                 module_id   = f"node_{task_id}",
-                in_dim      = concept_dim,
+                in_dim      = in_dim,
                 hidden_dim  = concept_dim,
                 out_dim     = concept_dim,
                 n_layers    = n_mlp_layers,
@@ -137,7 +160,8 @@ class DAGNode(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.is_root:
-            return self.concept_module(self.cnn(x))
+            feats = self.cnn(x) if self.use_cnn else x
+            return self.concept_module(feats)
         # Child: collect frozen parent embeddings, then aggregate
         with torch.no_grad():
             parent_outs = [p(x) for p in self.parent_models]
@@ -148,7 +172,7 @@ class DAGNode(nn.Module):
     def trainable_parameters(self) -> List[nn.Parameter]:
         """Only own parameters — never parents'."""
         if self.is_root:
-            return list(self.parameters())        # cnn + concept_module
+            return list(self.parameters())        # cnn (if present) + concept_module
         return list(self.concept_module.parameters())
 
     def freeze(self):
@@ -162,8 +186,6 @@ class DAGNode(nn.Module):
         self.concept_module._frozen = False
 
     # -----------------------------------------------------------------------
-
-    # -----------------------------------------------------------------------
     # Single-node "local" forward steps — consumed by the memoized evaluator
     # below. `DAGNode.forward` does recursive expansion, which re-evaluates
     # shared ancestors once per incoming edge (exponential in diamond DAGs).
@@ -175,11 +197,14 @@ class DAGNode(nn.Module):
         self, x: torch.Tensor, cnn_no_grad: bool = False
     ) -> torch.Tensor:
         """
-        Root node's one-shot forward: cnn(x) → concept_module.
-        If cnn_no_grad=True (used in Exp 4's `no_freeze`), the CNN backbone
-        is evaluated under `torch.no_grad()` so its conv activations aren't
-        retained for backprop; gradients still flow through concept_module.
+        Root node's one-shot forward.
+        - SmallCNN mode: cnn(x) → concept_module. cnn_no_grad prevents
+          conv activations from being retained for backprop (Exp 4 no_freeze).
+        - Feature mode (use_cnn=False): x is already (B, feature_dim);
+          pass directly to concept_module. cnn_no_grad is ignored.
         """
+        if not self.use_cnn:
+            return self.concept_module(x)
         if cnn_no_grad:
             with torch.no_grad():
                 feats = self.cnn(x)
@@ -193,6 +218,7 @@ class DAGNode(nn.Module):
         """
         Child node's one-shot forward. Assumes `parent_outs[i]` is already
         the output of `self.parent_models[i]` for this batch.
+        x is passed through for cross-attention query (ignored by linear aggs).
         """
         return self.concept_module(x, parent_outputs=parent_outs)
 
@@ -434,9 +460,17 @@ def route_for_task(
 # ---------------------------------------------------------------------------
 
 
-def run_exp3a(cfg: Exp3Config) -> Dict:
+def run_exp3a(cfg: Exp3Config, tasks: Optional[List[Dict]] = None) -> Dict:
+    """
+    Args:
+        cfg:   Experiment config.
+        tasks: Pre-loaded task list (e.g. with cached SSL features). If None,
+               loads raw Split-CIFAR-100 images as before.
+    """
     print("\n" + "=" * 70)
     print("Experiment 3a: Growing Concept DAG on Split-CIFAR-100 (20 tasks)")
+    if cfg.backbone != "smallcnn":
+        print(f"  Backbone: {cfg.backbone}  feature_dim={cfg.feature_dim}")
     print("=" * 70)
 
     torch.manual_seed(cfg.seed)
@@ -446,16 +480,17 @@ def run_exp3a(cfg: Exp3Config) -> Dict:
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------
-    print("\n[Step 0] Loading Split-CIFAR-100 (20 × 5-class tasks)...")
-    tasks = make_split_cifar100(
-        data_root  = cfg.data_root,
-        n_tasks    = cfg.n_tasks,
-        batch_size = cfg.batch_size,
-        seed       = cfg.seed,
-    )
+    if tasks is None:
+        print("\n[Step 0] Loading Split-CIFAR-100 (20 × 5-class tasks)...")
+        tasks = make_split_cifar100(
+            data_root  = cfg.data_root,
+            n_tasks    = cfg.n_tasks,
+            batch_size = cfg.batch_size,
+            seed       = cfg.seed,
+        )
+    else:
+        print(f"\n[Step 0] Using pre-loaded tasks ({len(tasks)} tasks).")
     print(f"  {cfg.n_tasks} tasks, {tasks[0]['n_classes']} classes each.")
-    print(f"  Classes 0-{tasks[0]['class_ids'][-1]} → Task 0, "
-          f"classes {tasks[-1]['class_ids'][0]}-{tasks[-1]['class_ids'][-1]} → Task {cfg.n_tasks-1}")
 
     # ------------------------------------------------------------------
     # Grow the DAG
@@ -501,6 +536,8 @@ def run_exp3a(cfg: Exp3Config) -> Dict:
             n_mlp_layers  = cfg.n_mlp_layers,
             parent_models = selected_parents if selected_parents else None,
             soft_pca_k    = cfg.soft_pca_k,
+            use_cnn       = (cfg.backbone == "smallcnn"),
+            feature_dim   = cfg.feature_dim,
         )
         head = LinearHead(cfg.concept_dim, task["n_classes"])
 

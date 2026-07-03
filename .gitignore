@@ -1,3 +1,14 @@
 /data
 __pycache__/
 *.pyc
+*.png.vault
+.claude/skills/research-loop
+.claude/skills/autoresearch
+.claude/commands/autoresearch
+.claude/
+.DS_Store
+.vault
+*.tar.gz
+temp.ipynb
+Anthropic_Fellows_Application_Draft.md
+*.docx
