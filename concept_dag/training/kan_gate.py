@@ -138,24 +138,23 @@ def regression_task(dim: int = 1, name: str = "regression") -> TaskSpec:
 
 class ReuseComposer(nn.Module):
     """
-    The "search / recombination" model: aggregate the (frozen) parent concept embeddings and read
-    out with the task head. It is allowed to *route over* existing concepts but may **not** mint a
-    new concept representation — that is the whole point of the reuse-vs-grow contrast. Parameter
-    count is deliberately small (a linear mixture + the head), so beating it requires genuinely new
-    structure, not just more capacity.
+    The "search / recombination" model: a **linear recombination** of the (frozen) parent concept
+    embeddings, read out with the task head. It may freely mix and re-weight every dimension of every
+    existing concept (a full linear map over the concatenated parents) but has **no non-linearity and
+    no hidden layer** — it cannot mint a *new* concept representation. That is the precise reuse-vs-grow
+    contrast: if a linear readout of existing concepts already solves the task, there is no
+    obstruction; only a task needing genuinely new (non-linear) structure justifies growing a concept.
     """
 
     def __init__(self, parent_dim: int, n_parents: int, head: nn.Module):
         super().__init__()
-        # A learned convex-ish mixture over parents (linear recombination) + head. No hidden MLP.
-        self.mix = nn.Parameter(torch.ones(n_parents) / max(n_parents, 1))
+        # Linear recombination of all parent features → a concept-width readout → head. No non-linearity.
+        self.proj = nn.Linear(max(n_parents, 1) * parent_dim, parent_dim)
         self.head = head
 
     def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
-        # parent_stack: (B, n_parents, D)
-        w = torch.softmax(self.mix, dim=0)
-        h = torch.einsum("bpd,p->bd", parent_stack, w)  # (B, D)
-        return self.head(h)
+        # parent_stack: (B, n_parents, D) → concat → linear → (B, D)
+        return self.head(self.proj(parent_stack.flatten(1)))
 
 
 # ---------------------------------------------------------------------------
@@ -309,18 +308,64 @@ def reuse_vs_grow(
             reason="no parents to recompose — growth forced (root concept).",
         )
 
-    # --- Cache frozen parent embeddings, split into train/val. ---
+    # --- Cache frozen parent embeddings; compute the geometric signal; delegate to the core. ---
     X, y = _cache_parent_embeddings(dag, parent_ids, loader, device, input_encoder)
+    best_sim: Optional[float] = None
+    if query_subspace is not None:
+        sims = [
+            dag.principal_angle_similarity(query_subspace, mid)
+            for mid in dag.all_module_ids()
+            if dag.get_module(mid).get_concept_subspace() is not None
+        ]
+        if sims:
+            best_sim = max(sims)
+    return decide_reuse_vs_grow(
+        X, y, new_module_factory, spec,
+        concept_dim=concept_dim, n_parents=len(parent_ids), device=device,
+        n_epochs=n_epochs, lr=lr, val_fraction=val_fraction, eps_rel=eps_rel,
+        best_subspace_similarity=best_sim, sim_threshold=sim_threshold,
+        require_geometric=require_geometric, require_mdl=require_mdl,
+        bits_per_param_fn=bits_per_param_fn,
+    )
+
+
+def decide_reuse_vs_grow(
+    parent_stack: torch.Tensor,
+    targets: torch.Tensor,
+    new_module_factory: Callable[[], ConceptModule],
+    spec: TaskSpec,
+    *,
+    concept_dim: int,
+    n_parents: int,
+    device: str = "cpu",
+    n_epochs: int = 15,
+    lr: float = 1e-3,
+    val_fraction: float = 0.3,
+    eps_rel: float = 0.05,
+    best_subspace_similarity: Optional[float] = None,
+    sim_threshold: Optional[float] = None,
+    require_geometric: bool = False,
+    require_mdl: bool = False,
+    bits_per_param_fn: Optional[Callable[[int, int], float]] = None,
+) -> KanGateRecord:
+    """
+    Backbone-agnostic reuse-vs-grow decision on a precomputed parent stack.
+
+    ``parent_stack`` is (N, n_parents, concept_dim) — the frozen parent concept embeddings — and
+    ``targets`` is (N, ...). This is the shared core used by both the ConceptDAG path
+    (:func:`reuse_vs_grow`) and the DAGNode experiment path, so the decision logic lives in exactly
+    one place. ``best_subspace_similarity`` is the (loss-free) geometric signal, if available.
+    """
+    X, y = parent_stack, targets
     n = X.shape[0]
     n_val = max(1, int(round(val_fraction * n)))
     perm = torch.randperm(n)
     val_idx, tr_idx = perm[:n_val], perm[n_val:]
     Xtr, ytr, Xval, yval = X[tr_idx], y[tr_idx], X[val_idx], y[val_idx]
-    P = len(parent_ids)
 
     # --- Reuse-only model: linear recombination of frozen parents + task head. ---
-    reuse_head = spec.make_head(concept_dim)
-    reuse_model = ReuseComposer(parent_dim=concept_dim, n_parents=P, head=reuse_head)
+    reuse_model = ReuseComposer(parent_dim=concept_dim, n_parents=n_parents,
+                                head=spec.make_head(concept_dim))
     L_reuse = _held_out_codelength(
         reuse_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
         n_epochs=n_epochs, lr=lr, device=device,
@@ -338,8 +383,7 @@ def reuse_vs_grow(
 
         def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
             outs = [parent_stack[:, i, :] for i in range(parent_stack.shape[1])]
-            emb = self.module(x=None, parent_outputs=outs)  # (B, out_dim)
-            return self.head(emb)
+            return self.head(self.module(x=None, parent_outputs=outs))
 
     grow_model = _GrowModel(new_module, grow_head)
     L_grow = _held_out_codelength(
@@ -347,45 +391,46 @@ def reuse_vs_grow(
         n_epochs=n_epochs, lr=lr, device=device,
     )
 
+    # --- Null (marginal) code length: best input-independent predictor. Sets the "reducible" scale. ---
+    class _NullModel(nn.Module):
+        def __init__(self, head: nn.Module):
+            super().__init__()
+            self.head = head
+
+        def forward(self, xb: torch.Tensor) -> torch.Tensor:
+            return self.head(torch.zeros(xb.shape[0], concept_dim, device=xb.device))
+
+    L_null = _held_out_codelength(
+        _NullModel(spec.make_head(concept_dim)), lambda m, xb: m(xb), spec,
+        Xtr, ytr, Xval, yval, n_epochs=max(n_epochs // 2, 10), lr=lr, device=device,
+    )
+
     # --- Description cost of the EXTRA parameters growth introduces (grow − reuse). ---
-    k_reuse = sum(p.numel() for p in reuse_model.parameters())
-    k_grow = sum(p.numel() for p in grow_model.parameters())
-    k_extra = max(k_grow - k_reuse, 0)
+    k_extra = max(sum(p.numel() for p in grow_model.parameters())
+                  - sum(p.numel() for p in reuse_model.parameters()), 0)
     if bits_per_param_fn is not None:
         model_bits = bits_per_param_fn(k_extra, n)
     else:
-        # BIC-style two-part code cost: ~½·k·log2(N) bits to describe the extra parameters.
-        model_bits = 0.5 * k_extra * math.log2(max(n, 2))
+        model_bits = 0.5 * k_extra * math.log2(max(n, 2))  # BIC-style two-part code cost
 
     delta = L_reuse - L_grow                         # bits/sample the new concept saves
     net = delta * n - model_bits                     # net code length change (bits)
-    rel = delta / L_reuse if L_reuse not in (0.0, float("inf")) else float("inf")
 
-    # Primary decision: the SCALE-FREE relative code-length improvement. This is the term that
-    # transfers across arbitrary tasks unchanged (a fraction of the task's own code length), and it
-    # does not depend on any per-parameter description-cost convention.
-    #
-    # Optional MDL veto (`require_mdl`): additionally demand the absolute net code length fall. This
-    # is theoretically cleaner but sensitive to `model_bits` — the description cost of a neural
-    # module's parameters is unreliable (effective DOF ≪ raw count), and on small tasks the BIC term
-    # over-penalises growth. Off by default; enable only with a calibrated `bits_per_param_fn`.
+    # Primary decision: the fraction of *reducible* information (relative to the marginal L_null) that
+    # ONLY a new concept captures — grow's extra reduction over reuse, normalised by how much is
+    # reducible at all. This is scale-free (a fraction, transfers across arbitrary tasks) AND robust
+    # when reuse already nearly solves the task: there delta→0, so the fraction →0 and we reuse —
+    # unlike delta/L_reuse, which explodes as L_reuse→0. `rel` (the record field) now holds this
+    # residual fraction.
+    reducible = max(L_null - L_grow, 1e-6)
+    rel = delta / reducible
     obstruction_code = rel > eps_rel
     if require_mdl:
         obstruction_code = obstruction_code and (net > 0.0)
 
-    # --- Optional geometric obstruction: no existing concept aligns with the task probe subspace. ---
-    best_sim: Optional[float] = None
     obstruction_geom: Optional[bool] = None
-    if query_subspace is not None:
-        sims = [
-            dag.principal_angle_similarity(query_subspace, mid)
-            for mid in dag.all_module_ids()
-            if dag.get_module(mid).get_concept_subspace() is not None
-        ]
-        if sims:
-            best_sim = max(sims)
-            if sim_threshold is not None:
-                obstruction_geom = best_sim < sim_threshold
+    if best_subspace_similarity is not None and sim_threshold is not None:
+        obstruction_geom = best_subspace_similarity < sim_threshold
 
     if require_geometric and obstruction_geom is not None:
         grow = obstruction_code and obstruction_geom
@@ -393,16 +438,16 @@ def reuse_vs_grow(
         grow = obstruction_code
 
     reason = (
-        f"ΔL={delta:.4f} bits/sample, net={net:.1f} bits (model_bits={model_bits:.1f}), "
-        f"rel={rel:.3f} vs eps_rel={eps_rel}"
-        + (f", best_sim={best_sim:.3f}" if best_sim is not None else "")
+        f"ΔL={delta:.4f} bits/sample (L_null={L_null:.3f} L_reuse={L_reuse:.3f} L_grow={L_grow:.3f}), "
+        f"residual_frac={rel:.3f} vs eps_rel={eps_rel}"
+        + (f", best_sim={best_subspace_similarity:.3f}" if best_subspace_similarity is not None else "")
     )
     return KanGateRecord(
         task_name=spec.name, decision=("grow" if grow else "reuse"),
         L_reuse_bits=L_reuse, L_grow_bits=L_grow,
         delta_bits_per_sample=delta, model_bits=model_bits, n_samples=n,
         net_codelength_delta=net, rel_improvement=rel,
-        best_subspace_similarity=best_sim, obstruction_geometric=obstruction_geom,
+        best_subspace_similarity=best_subspace_similarity, obstruction_geometric=obstruction_geom,
         obstruction_codelength=obstruction_code, reason=reason,
     )
 
