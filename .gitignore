@@ -12,3 +12,6 @@ __pycache__/
 temp.ipynb
 Anthropic_Fellows_Application_Draft.md
 *.docx
+
+# Kan run artifacts
+results_kan/*.log
