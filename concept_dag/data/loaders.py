@@ -17,6 +17,16 @@ from torch.utils.data import Dataset, DataLoader, Subset, random_split
 from typing import List, Optional, Tuple, Dict
 import numpy as np
 
+# Env-compat shim: torchvision 0.13.x expects torch._six (removed in torch 2.0). Restore the one
+# symbol it needs so datasets.CIFAR100 works on this torch/torchvision combo.
+if not hasattr(torch, "_six"):
+    import sys as _sys
+    import types as _types
+    _six = _types.ModuleType("torch._six")
+    _six.string_classes = (str, bytes)
+    torch._six = _six
+    _sys.modules["torch._six"] = _six
+
 
 # ---------------------------------------------------------------------------
 # Custom exception for explicit download gating
@@ -317,12 +327,14 @@ def make_split_cifar10(
 
         tasks.append({
             "task_id": t,
+            # num_workers=0: many loaders × persistent workers deadlock on macOS with this
+            # torch/torchvision; main-process loading is reliable and fast enough here.
             "train": DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                num_workers=2, persistent_workers=True, pin_memory=False),
+                                num_workers=0, pin_memory=False),
             "val":   DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                                num_workers=2, persistent_workers=True, pin_memory=False),
+                                num_workers=0, pin_memory=False),
             "test":  DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
-                                num_workers=2, persistent_workers=True, pin_memory=False),
+                                num_workers=0, pin_memory=False),
             "n_classes": classes_per_task,
             "class_ids": task_classes,
             "name": f"CIFAR10_task{t}_{task_classes}",
@@ -457,12 +469,14 @@ def make_split_cifar100(
 
         tasks.append({
             "task_id":   t,
+            # num_workers=0: many loaders × persistent workers deadlock on macOS with this
+            # torch/torchvision; main-process loading is reliable and fast enough here.
             "train": DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                num_workers=2, persistent_workers=True, pin_memory=False),
+                                num_workers=0, pin_memory=False),
             "val":   DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                                num_workers=2, persistent_workers=True, pin_memory=False),
+                                num_workers=0, pin_memory=False),
             "test":  DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
-                                num_workers=2, persistent_workers=True, pin_memory=False),
+                                num_workers=0, pin_memory=False),
             "n_classes": classes_per_task,
             "class_ids": task_classes,
         })
