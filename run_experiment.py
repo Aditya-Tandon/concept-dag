@@ -32,9 +32,15 @@ import torch
 def main():
     parser = argparse.ArgumentParser(description="Concept DAG experiment runner")
     parser.add_argument("--exp",      type=str,   default="1a",
-                        choices=["1a", "1b", "2a", "2b", "3a", "3b",
+                        choices=["1a", "1b", "2a", "2b", "3a", "3a-kan", "3b",
                                  "4", "4f", "5a", "5b", "5", "6", "plot"],
-                        help="Which experiment to run")
+                        help="Which experiment to run ('3a-kan' = Kan-gated growth + consolidation)")
+    parser.add_argument("--eps_rel", type=float, default=0.05,
+                        help="[3a-kan] reuse-vs-grow threshold: min fraction of reducible info a new "
+                             "concept must capture beyond reuse to justify growing")
+    parser.add_argument("--consolidate_every", type=int, default=0,
+                        help="[3a-kan] run the consolidation (reduction) pass every K tasks (0 = only "
+                             "at the end)")
     parser.add_argument("--device",   type=str,   default="auto",
                         help="Device: 'cpu', 'cuda', 'mps', or 'auto'")
     parser.add_argument("--epochs",   type=int,   default=30,
@@ -177,6 +183,34 @@ def main():
             batch_size=args.batch_size,
         )
         run_exp2a(cfg)
+
+    elif args.exp == "3a-kan":
+        from concept_dag.experiments.kan_exp import KanExpConfig, run_exp3a_kan
+        from concept_dag.data.loaders import make_split_cifar100
+        n_tasks = args.n_tasks if args.n_tasks is not None else 20
+        cfg = KanExpConfig(
+            data_root   = args.data_root,
+            device      = device,
+            root_epochs = args.epochs,
+            child_epochs= args.epochs,
+            results_dir = f"{args.out_dir}/exp3_kan",
+            seed        = args.seed,
+            batch_size  = args.batch_size,
+            n_tasks     = n_tasks,
+            backbone    = args.backbone,
+            cache_dir   = args.cache_dir,
+            eps_rel     = getattr(args, "eps_rel", 0.05),
+            consolidate_every = getattr(args, "consolidate_every", 0),
+        )
+        raw_tasks = make_split_cifar100(
+            data_root=args.data_root, n_tasks=n_tasks,
+            batch_size=args.batch_size, seed=args.seed,
+        )
+        tasks, feature_dim = _prepare_tasks_with_backbone(
+            raw_tasks, args.backbone, args.cache_dir, args.data_root)
+        if feature_dim is not None:
+            cfg.feature_dim = feature_dim
+        run_exp3a_kan(cfg, tasks=tasks)
 
     elif args.exp in ("3a", "3b"):
         from concept_dag.experiments.exp3_growing_dag import Exp3Config, run_exp3a, run_exp3b
