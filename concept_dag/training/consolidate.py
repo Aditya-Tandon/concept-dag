@@ -63,8 +63,9 @@ def low_rank_factorize_final_layer(
     if not isinstance(final, nn.Linear):
         return {"applied": False, "reason": "final layer is not nn.Linear"}
     out_dim, hidden = final.weight.shape  # (out, hidden)
-    W = final.weight.detach()
-    b = final.bias.detach() if final.bias is not None else None
+    dev = final.weight.device
+    W = final.weight.detach().cpu()  # SVD on CPU: MPS lacks a reliable linalg.svd
+    b = final.bias.detach().cpu() if final.bias is not None else None
 
     U, S, Vh = torch.linalg.svd(W, full_matrices=False)  # W = U diag(S) Vh
     r = rank if rank is not None else effective_rank(S, energy)
@@ -93,7 +94,8 @@ def low_rank_factorize_final_layer(
         if b is not None:
             lin2.bias.copy_(b)
 
-    # Splice back in place of the old final layer; re-freeze (module was frozen).
+    # Splice back in place of the old final layer (on the module's device); re-freeze.
+    lin1, lin2 = lin1.to(dev), lin2.to(dev)
     new_layers = list(mlp[:-1]) + [lin1, lin2]
     module.mlp = nn.Sequential(*new_layers)
     if module.is_frozen:
