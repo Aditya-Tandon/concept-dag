@@ -57,6 +57,7 @@ from torch.utils.data import DataLoader
 
 from ..modules.dag import ConceptDAG
 from ..modules.concept_module import ConceptModule
+from ..utils.metrics import safe_cross_entropy
 
 _LOG2 = math.log(2.0)
 
@@ -94,7 +95,7 @@ def classification_task(n_classes: int, name: str = "classification") -> TaskSpe
 
     def nll_bits(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         # cross_entropy returns nats; convert to bits. Keep per-sample (reduction='none').
-        return F.cross_entropy(logits, y, reduction="none") / _LOG2
+        return safe_cross_entropy(logits, y, reduction="none") / _LOG2
 
     return TaskSpec(name=name, make_head=make_head, nll_bits=nll_bits)
 

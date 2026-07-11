@@ -1,0 +1,51 @@
+{
+  "average_accuracy": 0.1309090909090909,
+  "test_accs": [
+    0.15,
+    0.11333333333333333,
+    0.1293939393939394
+  ],
+  "n_grow": 1,
+  "n_reuse": 2,
+  "reuse_rate": 0.6666666666666666,
+  "param_curve": [
+    49664,
+    49664,
+    49664
+  ],
+  "params_final_pre_consolidation": 49664,
+  "consolidation": {
+    "params_before": 49664,
+    "params_after": 49664,
+    "params_saved": 0,
+    "n_ops": 0,
+    "ops": []
+  },
+  "decisions": [
+    {
+      "task": 0,
+      "decision": "grow",
+      "reason": "root"
+    },
+    {
+      "task": 1,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.05869706880822198,
+      "L_reuse_bits": 4.641276836395264,
+      "L_grow_bits": 4.663825988769531
+    },
+    {
+      "task": 2,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.03572801128856784,
+      "L_reuse_bits": 4.526487827301025,
+      "L_grow_bits": 4.544308185577393
+    }
+  ]
+}

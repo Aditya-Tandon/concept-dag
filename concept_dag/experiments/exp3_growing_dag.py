@@ -35,7 +35,7 @@ from typing import Dict, List, Optional, Tuple
 
 from ..modules.concept_module import ConceptModule
 from ..models.baselines import SmallCNN, LinearHead
-from ..utils.metrics import accuracy, evaluate
+from ..utils.metrics import accuracy, evaluate, safe_cross_entropy
 from ..data.loaders import make_split_cifar100
 
 
@@ -373,7 +373,7 @@ def train_node(
             x, y = x.to(device), y.to(device)
             emb    = node(x)
             logits = head(emb)
-            loss   = nn.functional.cross_entropy(logits, y)
+            loss   = safe_cross_entropy(logits, y)
             loss   = loss + orth_weight * node.concept_module.orth_loss()
             opt.zero_grad()
             loss.backward()
@@ -706,7 +706,7 @@ def run_exp3b(
                 x, y = next(data_iter)
             x, y   = x.to(device), y.to(device)
             logits = wrong_head(node(x))
-            loss   = nn.functional.cross_entropy(logits, y)
+            loss   = safe_cross_entropy(logits, y)
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(node.trainable_parameters(), 1.0)
