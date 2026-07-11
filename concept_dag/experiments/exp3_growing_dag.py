@@ -165,7 +165,19 @@ class DAGNode(nn.Module):
         # Child: collect frozen parent embeddings, then aggregate
         with torch.no_grad():
             parent_outs = [p(x) for p in self.parent_models]
+        parent_outs = self._apply_parent_adapters(parent_outs)
         return self.concept_module(x, parent_outputs=parent_outs)
+
+    def _apply_parent_adapters(self, parent_outs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Apply per-edge recovery adapters (installed by a consolidation merge). Each adapter is the
+        left-Kan transport map that lets this child read a merged parent as if it were the concept it
+        was originally trained against. None (the default) = identity edge.
+        """
+        adapters = getattr(self, "parent_adapters", None)
+        if not adapters:
+            return parent_outs
+        return [po if ad is None else ad(po) for po, ad in zip(parent_outs, adapters)]
 
     # -----------------------------------------------------------------------
 
@@ -220,6 +232,7 @@ class DAGNode(nn.Module):
         the output of `self.parent_models[i]` for this batch.
         x is passed through for cross-attention query (ignored by linear aggs).
         """
+        parent_outs = self._apply_parent_adapters(parent_outs)
         return self.concept_module(x, parent_outputs=parent_outs)
 
     def compute_concept_subspace(

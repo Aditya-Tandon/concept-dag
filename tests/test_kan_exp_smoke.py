@@ -9,7 +9,10 @@ the real 20-task run measures) — only that the machinery runs and returns a co
 
 import torch
 
-from concept_dag.experiments.kan_exp import KanExpConfig, run_exp3a_kan
+from concept_dag.experiments.kan_exp import (
+    KanExpConfig, run_exp3a_kan, distill_merge, _merge_nodes,
+)
+from concept_dag.experiments.exp3_growing_dag import DAGNode
 
 
 def _make_synth_tasks(n_tasks=4, feature_dim=32, n_per_class=120, seed=0):
@@ -61,7 +64,50 @@ def test_run_exp3a_kan_end_to_end(tmp_path):
     assert len(res["decisions"]) == 4
 
 
+def test_distill_merge_recovery_adapter_preserves_child():
+    """
+    Two redundant concepts (identical weights) + a child on one of them. After a distilled merge with
+    recovery adapters, the child is re-pointed to the surviving concept and its FUNCTION is preserved
+    — the recovery adapter transports the merged parent back to what the child was trained on.
+    """
+    torch.manual_seed(1)
+    D = 16
+    A = DAGNode(task_id=0, concept_dim=D, cnn_out_dim=D, n_mlp_layers=2,
+                parent_models=None, use_cnn=False, feature_dim=D)
+    B = DAGNode(task_id=1, concept_dim=D, cnn_out_dim=D, n_mlp_layers=2,
+                parent_models=None, use_cnn=False, feature_dim=D)
+    B.concept_module.load_state_dict(A.concept_module.state_dict())  # make them redundant
+    A.eval(); A.freeze(); B.eval(); B.freeze()
+    child = DAGNode(task_id=2, concept_dim=D, cnn_out_dim=D, n_mlp_layers=2,
+                    parent_models=[B], use_cnn=False, feature_dim=D)
+    child.eval(); child.freeze()
+    nodes = [A, B, child]
+
+    x = torch.randn(64, D)
+    with torch.no_grad():
+        before = child(x)
+
+    loader = _loader_xy(torch.randn(300, D))
+    W = distill_merge(A, B, loader, device="cpu", epochs=60, lr=1e-3)
+    _merge_nodes(nodes, predictors=[], keep=A, drop=B, W_keep=W["keep"], W_drop=W["drop"])
+
+    assert B not in nodes and A in nodes
+    assert child.parent_models == [A]                     # re-pointed
+    assert child.parent_adapters is not None              # recovery adapter installed
+    with torch.no_grad():
+        after = child(x)
+    rel = (after - before).norm() / (before.norm() + 1e-9)
+    print(f"distilled-merge child function rel-error = {rel:.4f}")
+    assert rel < 0.25                                     # function transported through the adapter
+
+
+def _loader_xy(x):
+    y = torch.zeros(x.shape[0], dtype=torch.long)
+    return torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x, y), batch_size=64, shuffle=True)
+
+
 if __name__ == "__main__":
     import tempfile, pathlib
     test_run_exp3a_kan_end_to_end(pathlib.Path(tempfile.mkdtemp()))
+    test_distill_merge_recovery_adapter_preserves_child()
     print("\nKan-exp end-to-end smoke test passed.")

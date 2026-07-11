@@ -53,12 +53,21 @@ class TaskPredictor:
                  composer: Optional[ReuseComposer] = None):
         assert kind in ("grow", "reuse")
         self.kind, self.head, self.node, self.parents, self.composer = kind, head, node, parents, composer
+        self.parent_adapters = None   # per-parent recovery adapters (reuse), installed by a merge
+        self.node_adapter = None      # recovery adapter on the grown node's output, installed by a merge
 
     @torch.no_grad()
     def logits(self, x: torch.Tensor) -> torch.Tensor:
         if self.kind == "grow":
-            return self.head(forward_dag_memoized(self.node, x))
-        stack = torch.stack([forward_dag_memoized(p, x) for p in self.parents], dim=1)  # (B,P,D)
+            emb = forward_dag_memoized(self.node, x)
+            if self.node_adapter is not None:
+                emb = self.node_adapter(emb)
+            return self.head(emb)
+        outs = [forward_dag_memoized(p, x) for p in self.parents]
+        adapters = getattr(self, "parent_adapters", None)
+        if adapters:
+            outs = [o if a is None else a(o) for o, a in zip(outs, adapters)]
+        stack = torch.stack(outs, dim=1)  # (B,P,D)
         return self.composer(stack)   # ReuseComposer already applies the task head
 
     @torch.no_grad()
@@ -114,36 +123,80 @@ def distill_merge(keep: DAGNode, drop: DAGNode, loader, device: str,
     rejects the merge (they are not actually redundant). See module/keep docs.
     """
     D = keep.concept_module.out_dim
-    Xk, Xd, _ = [], [], None
     keep.eval(); drop.eval()
+
+    # Cache inputs + ORIGINAL reference targets (keep's and drop's outputs BEFORE keep is retrained).
+    xs, tgt_keep_ref, tgt_drop_ref = [], [], []
     with torch.no_grad():
         for x, _y in loader:
             x = x.to(device)
-            Xk.append(forward_dag_memoized(keep, x).cpu())
-            Xd.append(forward_dag_memoized(drop, x).cpu())
-    Ak = torch.cat(Xk, 0)            # (N, D) keep outputs (targets to preserve)
-    Ad = torch.cat(Xd, 0)           # (N, D) drop outputs (targets to preserve)
+            xs.append(x.cpu())
+            tgt_keep_ref.append(forward_dag_memoized(keep, x).cpu())
+            tgt_drop_ref.append(forward_dag_memoized(drop, x).cpu())
 
-    # Train keep's concept_module so both Ak and Ad are linearly recoverable from its (new) output.
-    keep.unfreeze()
-    W_keep = nn.Linear(D, D, bias=False)
-    W_drop = nn.Linear(D, D, bias=False)
+    # Train ONLY keep's concept module so both original outputs are linearly recoverable from the new
+    # keep output; W_keep, W_drop are the recovery (transport) maps.
+    for p in keep.concept_module.parameters():
+        p.requires_grad_(True)
+    keep.concept_module.train()
+    W_keep = nn.Linear(D, D, bias=True).to(device)
+    W_drop = nn.Linear(D, D, bias=True).to(device)
     params = list(keep.concept_module.parameters()) + list(W_keep.parameters()) + list(W_drop.parameters())
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-5)
-    idx_all = torch.arange(Ak.shape[0])
-    # We need keep's *input* to recompute its output during training. Recompute via the loader.
+    last = 0.0
     for _ in range(epochs):
-        for x, _y in loader:
-            x = x.to(device)
-            out = forward_dag_memoized(keep, x)                    # (B, D), grad flows into keep
-            # match this batch's stored targets by recomputing drop (frozen) on the same x
-            with torch.no_grad():
-                tgt_drop = forward_dag_memoized(drop, x)
-                tgt_keep = out.detach()  # anchor keep near its own current function (regulariser)
-            loss = ((W_keep(out) - tgt_keep) ** 2).mean() + ((W_drop(out) - tgt_drop) ** 2).mean()
+        for xb, tk, td in zip(xs, tgt_keep_ref, tgt_drop_ref):
+            xb, tk, td = xb.to(device), tk.to(device), td.to(device)
+            out = forward_dag_memoized(keep, xb)                   # (B, D), grad flows into keep only
+            loss = ((W_keep(out) - tk) ** 2).mean() + ((W_drop(out) - td) ** 2).mean()
             opt.zero_grad(); loss.backward(); opt.step()
+            last = float(loss.item())
     keep.concept_module.eval(); keep.freeze()
-    return {"keep": W_keep, "drop": W_drop, "recon_loss": float(loss.item())}
+    for W in (W_keep, W_drop):
+        for p in W.parameters():
+            p.requires_grad_(False)
+        W.eval()
+    return {"keep": W_keep, "drop": W_drop, "recon_loss": last}
+
+
+def _combined_loader(tasks: List[Dict], ta: int, tb: int, batch_size: int = 128):
+    ds = torch.utils.data.ConcatDataset([tasks[ta]["train"].dataset, tasks[tb]["train"].dataset])
+    return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+
+def _snapshot_topology(nodes: List[DAGNode], predictors: List[TaskPredictor], keep: DAGNode) -> dict:
+    """Everything a tentative merge can mutate: the node list, every edge, and keep's own weights."""
+    return {
+        "nodes": list(nodes),
+        "node_edges": {id(n): (list(n.parent_models),
+                               list(getattr(n, "parent_adapters", None) or []),
+                               n.concept_module.n_parents) for n in nodes},
+        "pred_edges": {id(p): (list(p.parents or []), list(getattr(p, "parent_adapters", None) or []))
+                       for p in predictors if p.kind == "reuse"},
+        "grow_preds": {id(p): (p.node, p.node_adapter) for p in predictors if p.kind == "grow"},
+        "keep_state": {k: v.detach().clone() for k, v in keep.concept_module.state_dict().items()},
+        "keep_id": id(keep),
+    }
+
+
+def _restore_topology(nodes: List[DAGNode], predictors: List[TaskPredictor], snap: dict):
+    nodes[:] = snap["nodes"]
+    for n in nodes:
+        pm, pa, npar = snap["node_edges"][id(n)]
+        n.parent_models = list(pm)
+        n.parent_adapters = list(pa) if pa else None
+        n.concept_module.n_parents = npar
+    for p in predictors:
+        if id(p) in snap["pred_edges"]:
+            par, pa = snap["pred_edges"][id(p)]
+            p.parents = list(par)
+            p.parent_adapters = list(pa) if pa else None
+        if id(p) in snap["grow_preds"]:
+            p.node, p.node_adapter = snap["grow_preds"][id(p)]
+    for n in nodes:
+        if id(n) == snap["keep_id"]:
+            n.concept_module.load_state_dict(snap["keep_state"])
+            n.concept_module.eval()
 
 
 def consolidate_nodes(
@@ -157,6 +210,9 @@ def consolidate_nodes(
     subspace_k: int = 8,
     truncate_energy: Optional[float] = 0.99,
     truncate_max_rel_error: float = 0.05,
+    distill: bool = True,
+    distill_epochs: int = 20,
+    merge_tolerance: float = 0.01,
 ) -> Dict[str, object]:
     """
     One consolidation pass over the grown DAGNode list.
@@ -210,12 +266,34 @@ def consolidate_nodes(
                 if sim < similarity_threshold:
                     continue
                 affected = affected_task_ids(a) | affected_task_ids(b)
-                if not accept_fn(a, b, affected):
-                    continue
-                _merge_nodes(nodes, predictors, keep=a, drop=b)
-                ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id, "similarity": sim})
-                merged = True
-                break
+
+                if not distill:
+                    # Structural merge (safe only for near-identical subspaces); gate decides.
+                    if not accept_fn(a, b, affected):
+                        continue
+                    _merge_nodes(nodes, predictors, keep=a, drop=b)
+                    ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id,
+                                "similarity": sim, "distilled": False})
+                    merged = True
+                    break
+
+                # Distilled merge: snapshot → distill keep → tentatively apply adapted merge →
+                # forgetting check → commit or roll back (topology + keep weights).
+                base = {t: predictors[t].accuracy(tasks[t]["test"], device)
+                        for t in affected if t < len(predictors)}
+                snap = _snapshot_topology(nodes, predictors, keep=a)
+                loader = _combined_loader(tasks, a.task_id, b.task_id)
+                W = distill_merge(a, b, loader, device, epochs=distill_epochs)
+                _merge_nodes(nodes, predictors, keep=a, drop=b, W_keep=W["keep"], W_drop=W["drop"])
+                ok = all(predictors[t].accuracy(tasks[t]["test"], device) >= base.get(t, 0.0) - merge_tolerance
+                         for t in affected if t < len(predictors))
+                if ok:
+                    ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id,
+                                "similarity": sim, "distilled": True, "recon_loss": W["recon_loss"]})
+                    merged = True
+                    break
+                else:
+                    _restore_topology(nodes, predictors, snap)
             if merged:
                 break
 
@@ -240,21 +318,63 @@ def _subspace_similarity(a: DAGNode, b: DAGNode, top_k: int) -> float:
     return float(torch.cos(angles).sum().item())
 
 
-def _merge_nodes(nodes: List[DAGNode], predictors: List[TaskPredictor], keep: DAGNode, drop: DAGNode):
-    """Re-point every child's parent list drop→keep, drop the node, and fix predictors."""
+def _compose(existing: Optional[nn.Module], recovery: Optional[nn.Module]) -> Optional[nn.Module]:
+    """
+    Compose an edge's existing adapter with a new recovery map. `recovery` reconstructs the OLD parent
+    output from the merged parent's output; `existing` (if any) is what the child already applied to
+    the old output. Applied order on the merged output is recovery THEN existing, so the child ends up
+    with (approximately) the activation it was trained on.
+    """
+    if recovery is None:
+        return existing
+    if existing is None:
+        return recovery
+    return nn.Sequential(recovery, existing)
+
+
+def _repoint_with_adapters(models, adapters, keep, drop, W_keep, W_drop):
+    """Return (new_models, new_adapters): drop→keep gets W_drop, keep→keep gets W_keep. No dedup, so
+    parent counts (and thus aggregator / composer input dims) stay fixed."""
+    adapters = adapters or [None] * len(models)
+    new_models, new_adapters = [], []
+    for p, ad in zip(models, adapters):
+        if p is drop:
+            new_models.append(keep); new_adapters.append(_compose(ad, W_drop))
+        elif p is keep:
+            new_models.append(keep); new_adapters.append(_compose(ad, W_keep))
+        else:
+            new_models.append(p); new_adapters.append(ad)
+    return new_models, new_adapters
+
+
+def _merge_nodes(nodes: List[DAGNode], predictors: List[TaskPredictor], keep: DAGNode, drop: DAGNode,
+                 W_keep: Optional[nn.Module] = None, W_drop: Optional[nn.Module] = None):
+    """
+    Merge `drop` into `keep`: re-point every child/predictor edge drop→keep (and keep→keep, whose
+    function changed under distillation) installing the recovery adapters, then remove `drop`.
+    Parent counts are preserved (no dedup), so a child that had BOTH keep and drop keeps two edges to
+    keep with distinct adapters — exactly the two signals it was trained on.
+    """
     for c in nodes:
-        if drop in c.parent_models:
-            c.parent_models = [keep if p is drop else p for p in c.parent_models]
-            # dedupe if keep already a parent
-            seen, uniq = set(), []
-            for p in c.parent_models:
-                if id(p) not in seen:
-                    seen.add(id(p)); uniq.append(p)
-            c.parent_models = uniq
-            c.concept_module.n_parents = len(uniq)
+        if keep in c.parent_models or drop in c.parent_models:
+            c.parent_models, adapters = _repoint_with_adapters(
+                c.parent_models, getattr(c, "parent_adapters", None), keep, drop, W_keep, W_drop)
+            c.parent_adapters = adapters if any(a is not None for a in adapters) else None
+            c.concept_module.n_parents = len(c.parent_models)
     for pred in predictors:
-        if pred.parents and drop in pred.parents:
-            pred.parents = [keep if p is drop else p for p in pred.parents]
+        if pred.kind == "reuse" and pred.parents and (keep in pred.parents or drop in pred.parents):
+            pred.parents, adapters = _repoint_with_adapters(
+                pred.parents, getattr(pred, "parent_adapters", None), keep, drop, W_keep, W_drop)
+            pred.parent_adapters = adapters if any(a is not None for a in adapters) else None
+        elif pred.kind == "grow" and pred.node is not None:
+            # The dropped node's OWN task must now read `keep` through the recovery map (else the task
+            # loses its predictor and `drop` is never actually freed). keep's own task reads through
+            # W_keep because keep's function changed under distillation.
+            if pred.node is drop:
+                pred.node_adapter = _compose(pred.node_adapter, W_drop)
+                pred.node = keep
+            elif pred.node is keep:
+                pred.node_adapter = _compose(pred.node_adapter, W_keep)
     nodes.remove(drop)
 
 
@@ -314,6 +434,8 @@ class KanExpConfig(Exp3Config):
     consolidate_every:   int   = 0        # 0 = only at end; K = every K tasks
     similarity_threshold: float = 7.0     # principal-angle sim (max = subspace_k) for a merge
     merge_tolerance:     float = 0.01
+    distill:             bool  = True     # functional (distilled) merge with recovery adapters
+    distill_epochs:      int   = 20
 
 
 def run_exp3a_kan(
@@ -406,7 +528,8 @@ def run_exp3a_kan(
             accept = make_accuracy_accept_fn(nodes, predictors, tasks, device, cfg.merge_tolerance)
             summ = consolidate_nodes(nodes, predictors, tasks, device, accept_fn=accept,
                                      similarity_threshold=cfg.similarity_threshold,
-                                     subspace_k=cfg.subspace_k)
+                                     subspace_k=cfg.subspace_k, distill=cfg.distill,
+                                     distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance)
             print(f"  [consolidate @ task {t}] saved {summ['params_saved']} params, {summ['n_ops']} ops")
         _flush(device)
 
@@ -414,7 +537,8 @@ def run_exp3a_kan(
     accept = make_accuracy_accept_fn(nodes, predictors, tasks, device, cfg.merge_tolerance)
     consolidation = consolidate_nodes(nodes, predictors, tasks, device, accept_fn=accept,
                                       similarity_threshold=cfg.similarity_threshold,
-                                      subspace_k=cfg.subspace_k)
+                                      subspace_k=cfg.subspace_k, distill=cfg.distill,
+                                      distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance)
 
     n_grow = sum(1 for d in decisions if d["decision"] == "grow")
     results = {
