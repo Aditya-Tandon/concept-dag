@@ -32,12 +32,20 @@ import torch
 def main():
     parser = argparse.ArgumentParser(description="Concept DAG experiment runner")
     parser.add_argument("--exp",      type=str,   default="1a",
-                        choices=["1a", "1b", "2a", "2b", "3a", "3a-kan", "3b",
+                        choices=["1a", "1b", "2a", "2b", "3a", "3a-kan", "5ds-kan", "3b",
                                  "4", "4f", "5a", "5b", "5", "6", "plot"],
                         help="Which experiment to run ('3a-kan' = Kan-gated growth + consolidation)")
     parser.add_argument("--eps_rel", type=float, default=0.05,
                         help="[3a-kan] reuse-vs-grow threshold: min fraction of reducible info a new "
                              "concept must capture beyond reuse to justify growing")
+    parser.add_argument("--datasets", type=str, nargs="+", default=None,
+                        help="[5ds-kan] heterogeneous stream datasets (subset/order of "
+                             "mnist fashion kmnist svhn cifar10; default = all five)")
+    parser.add_argument("--max_per_task", type=int, default=None,
+                        help="[5ds-kan] cap train examples/task for light laptop runs (None = full)")
+    parser.add_argument("--inject_dup", action="store_true",
+                        help="[5ds-kan] append a force-grown duplicate of the first task to stress "
+                             "the consolidation/merge path (creates a deliberately redundant concept)")
     parser.add_argument("--consolidate_every", type=int, default=0,
                         help="[3a-kan] run the consolidation (reduction) pass every K tasks (0 = only "
                              "at the end)")
@@ -88,7 +96,7 @@ def main():
                              "Use 'cross_attention' to test the task-0 backbone confound.")
     # SSL backbone arguments (DINO swap)
     parser.add_argument("--backbone", type=str, default="smallcnn",
-                        choices=["smallcnn", "dinov2_vits14", "clip_vitb16", "resnet50"],
+                        choices=["smallcnn", "dinov2_vits14", "clip_vitb16", "resnet50", "resnet18"],
                         help="Feature extractor backbone. 'smallcnn' = original task-trained CNN. "
                              "Other options use a frozen SSL encoder + feature caching.")
     parser.add_argument("--cache_dir", type=str, default=None,
@@ -143,8 +151,8 @@ def main():
         import gc; gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
-        elif device == "mps":
-            torch.mps.empty_cache()
+        elif device == "mps" and hasattr(torch, "mps"):
+            torch.mps.empty_cache()  # not present on torch 2.0.0
         return tasks, tasks[0]["feature_dim"]
 
     # Download mode
@@ -210,6 +218,45 @@ def main():
             raw_tasks, args.backbone, args.cache_dir, args.data_root)
         if feature_dim is not None:
             cfg.feature_dim = feature_dim
+        run_exp3a_kan(cfg, tasks=tasks)
+
+    elif args.exp == "5ds-kan":
+        # Heterogeneous "5-Datasets" stream on a frozen backbone — stresses the grow path
+        # (genuinely different domains) and, with --inject_dup, the merge path.
+        from concept_dag.experiments.kan_exp import KanExpConfig, run_exp3a_kan
+        from concept_dag.data.loaders import make_five_datasets, inject_duplicates
+        backbone = args.backbone if args.backbone != "smallcnn" else "resnet18"
+        raw_tasks = make_five_datasets(
+            data_root=args.data_root, datasets_list=args.datasets,
+            batch_size=args.batch_size, max_per_task=args.max_per_task,
+            download=bool(args.download), seed=args.seed,
+        )
+        tasks, feature_dim = _prepare_tasks_with_backbone(
+            raw_tasks, backbone, args.cache_dir, args.data_root)
+        force_grow_ids = ()
+        if args.inject_dup:
+            # Revisit the first dataset at the end of the stream and force-grow it.
+            tasks, dup_positions = inject_duplicates(tasks, dup_after={0: len(tasks) - 1})
+            force_grow_ids = tuple(dup_positions)
+            print(f"[5ds-kan] injected duplicate(s) at stream positions {dup_positions} "
+                  f"(force-grown to stress merge)")
+        cfg = KanExpConfig(
+            data_root   = args.data_root,
+            device      = device,
+            root_epochs = args.epochs,
+            child_epochs= args.epochs,
+            results_dir = f"{args.out_dir}/exp5ds_kan",
+            seed        = args.seed,
+            batch_size  = args.batch_size,
+            n_tasks     = len(tasks),
+            n_parents   = 2,
+            backbone    = backbone,
+            cache_dir   = args.cache_dir,
+            feature_dim = feature_dim,
+            eps_rel     = getattr(args, "eps_rel", 0.05),
+            consolidate_every = getattr(args, "consolidate_every", 0),
+            force_grow_ids = force_grow_ids,
+        )
         run_exp3a_kan(cfg, tasks=tasks)
 
     elif args.exp in ("3a", "3b"):
@@ -310,7 +357,7 @@ def main():
             if args.aggregation is not None:
                 cfg.aggregation = args.aggregation
                 print(f"[exp 4f] aggregation override: {cfg.aggregation}")
-            import json, os
+            import json  # os already imported at module scope
             result = run_forced_hub_causal(cfg, tasks)
             os.makedirs(cfg.results_dir, exist_ok=True)
             agg_tag = f"_{cfg.aggregation}" if args.aggregation is not None else ""

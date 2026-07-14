@@ -330,8 +330,8 @@ def forward_dag_memoized(
 
 def _flush(device: str):
     gc.collect()
-    if device == "mps":
-        torch.mps.empty_cache()
+    if device == "mps" and hasattr(torch, "mps"):
+        torch.mps.empty_cache()  # torch.mps absent on 2.0.0
     elif device.startswith("cuda"):
         torch.cuda.empty_cache()
 

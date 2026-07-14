@@ -101,6 +101,30 @@ def test_distill_merge_recovery_adapter_preserves_child():
     assert rel < 0.25                                     # function transported through the adapter
 
 
+def test_force_grow_ids_overrides_gate(tmp_path):
+    """
+    The merge stress-test instrument: a task listed in `force_grow_ids` must GROW even when the gate
+    would reuse. Task 3 is an exact duplicate of task 0's distribution — the gate would normally reuse
+    it — so force-growing it manufactures the redundant concept the consolidation pass exists to merge.
+    """
+    tasks = _make_synth_tasks(n_tasks=4)
+    tasks[3] = tasks[0]                     # exact duplicate distribution at the end of the stream
+    cfg = KanExpConfig(
+        backbone="synthetic", feature_dim=32, concept_dim=32, cnn_out_dim=32,
+        n_tasks=4, n_parents=2, subspace_k=8, soft_pca_k=8, routing_batches=10,
+        root_epochs=6, child_epochs=6, gate_epochs=20, gate_lr=3e-3, lr=3e-3,
+        eps_rel=0.30,                       # high threshold ⇒ gate would reuse the duplicate...
+        force_grow_ids=(3,),                # ...but we force it to grow.
+        similarity_threshold=7.0, results_dir=str(tmp_path), device="cpu", log_every=100,
+    )
+    res = run_exp3a_kan(cfg, tasks)
+    d3 = next(d for d in res["decisions"] if d["task"] == 3)
+    assert d3["decision"] == "grow"
+    assert d3.get("reason") == "force-grow(dup-stress)"
+    # a redundant concept now exists → the consolidation pass has something it may merge
+    assert res["consolidation"]["params_after"] <= res["consolidation"]["params_before"]
+
+
 def _loader_xy(x):
     y = torch.zeros(x.shape[0], dtype=torch.long)
     return torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x, y), batch_size=64, shuffle=True)
@@ -110,4 +134,5 @@ if __name__ == "__main__":
     import tempfile, pathlib
     test_run_exp3a_kan_end_to_end(pathlib.Path(tempfile.mkdtemp()))
     test_distill_merge_recovery_adapter_preserves_child()
+    test_force_grow_ids_overrides_gate(pathlib.Path(tempfile.mkdtemp()))
     print("\nKan-exp end-to-end smoke test passed.")

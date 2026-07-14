@@ -436,6 +436,8 @@ class KanExpConfig(Exp3Config):
     merge_tolerance:     float = 0.01
     distill:             bool  = True     # functional (distilled) merge with recovery adapters
     distill_epochs:      int   = 20
+    force_grow_ids:      tuple = ()       # stream positions to grow unconditionally (merge stress-test:
+                                          # forces a redundant concept the consolidation pass must merge)
 
 
 def run_exp3a_kan(
@@ -493,13 +495,26 @@ def run_exp3a_kan(
             parents = [nodes[i] for i in sel_idx]
             # --- Kan gate on cached parent embeddings ---
             X, y = _cache_parent_stack(parents, task["train"], device, max_batches=cfg.routing_batches)
-            rec = decide_reuse_vs_grow(
-                X, y, new_module_factory(parents), spec,
-                concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
-                n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_rel=cfg.eps_rel,
-            )
-            decisions.append({"task": t, "decision": rec.decision, "parents": sel_idx,
-                              **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}})
+            if t in cfg.force_grow_ids:
+                # Merge stress-test: skip the gate and grow unconditionally, so a redundant
+                # concept exists for the consolidation pass to detect and merge. NOT a claim
+                # the gate would grow here — the injected duplicate would correctly reuse.
+                rec = decide_reuse_vs_grow(
+                    X, y, new_module_factory(parents), spec,
+                    concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
+                    n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_rel=cfg.eps_rel,
+                )
+                rec.decision = "grow"
+                decisions.append({"task": t, "decision": "grow", "parents": sel_idx, "reason": "force-grow(dup-stress)",
+                                  **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}})
+            else:
+                rec = decide_reuse_vs_grow(
+                    X, y, new_module_factory(parents), spec,
+                    concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
+                    n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_rel=cfg.eps_rel,
+                )
+                decisions.append({"task": t, "decision": rec.decision, "parents": sel_idx,
+                                  **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}})
 
             if rec.decision == "grow":
                 node = DAGNode(task_id=t, concept_dim=cfg.concept_dim, cnn_out_dim=cfg.cnn_out_dim,

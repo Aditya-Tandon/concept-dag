@@ -157,6 +157,42 @@ class ResNet50Encoder(RootEncoder):
 
 
 # ---------------------------------------------------------------------------
+# ResNet-18 (light laptop backbone)
+# ---------------------------------------------------------------------------
+
+class ResNet18Encoder(RootEncoder):
+    """
+    ImageNet-pretrained ResNet-18 with the final FC stripped, 512-dim.
+
+    The light backbone for on-laptop (M1/MPS) validation runs: ~11M frozen params,
+    weights auto-download once via torchvision. Not the headline encoder — use
+    DINOv2/CLIP on HPC — but enough to give the heterogeneous stream a real shared
+    representation so the grow/reuse/merge paths fire.
+    """
+
+    feature_dim = 512
+    input_size  = 224
+
+    def __init__(self, device: str = "cpu"):
+        super().__init__()
+        try:
+            import torchvision.models as tvm
+        except ImportError:
+            raise ImportError("torchvision required for ResNet18Encoder.")
+        base = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
+        self.model = nn.Sequential(*list(base.children())[:-1])  # up to AvgPool
+        self.flatten = nn.Flatten()
+        self.freeze()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != 224:
+            import torch.nn.functional as F
+            x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        with torch.no_grad():
+            return self.flatten(self.model(x))   # (B, 512)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -164,6 +200,7 @@ _ENCODERS = {
     "dinov2_vits14": DINOv2Encoder,
     "clip_vitb16":   CLIPEncoder,
     "resnet50":      ResNet50Encoder,
+    "resnet18":      ResNet18Encoder,
 }
 
 
