@@ -14,7 +14,9 @@ import torch
 
 from concept_dag.modules.dag import ConceptDAG
 from concept_dag.modules.concept_module import ConceptModule
-from concept_dag.training.kan_gate import reuse_vs_grow, classification_task, kan_gated_grow
+from concept_dag.training.kan_gate import (
+    reuse_vs_grow, decide_reuse_search_grow, classification_task, kan_gated_grow,
+)
 from concept_dag.training.consolidate import low_rank_factorize_final_layer, effective_rank
 
 
@@ -83,6 +85,27 @@ def test_gate_grow_when_nonlinear():
     )
     print("GROW-case record:", rec.reason, "->", rec.decision)
     assert rec.decision == "grow", rec.as_dict()
+
+
+def test_search_level_reclassifies_nonlinear_from_grow_to_search():
+    """The XOR-of-a-concept task the BINARY gate calls 'grow' is caught by the three-way gate as
+    'search': a bounded non-linear recombination of the EXISTING concept solves it, so a new concept
+    adds little beyond the best search (rel_grow small) — test-time compute substitutes for growth."""
+    dag, x, e0 = _build_dag_with_parent()
+    a = e0[:, 0] > e0[:, 0].median()
+    b = e0[:, 1] > e0[:, 1].median()
+    y = (a ^ b).long()
+    stack = e0.unsqueeze(1)                       # (N, 1, DIM) parent stack
+    rec = decide_reuse_search_grow(
+        stack, y, _new_module_factory(1), classification_task(2),
+        concept_dim=DIM, n_parents=1, device="cpu", n_epochs=200, lr=3e-3,
+        eps_grow=0.10, eps_search=0.05, search_budget=6, search_rank=16,
+    )
+    print("SEARCH-case:", rec.reason, "->", rec.decision)
+    assert rec.decision == "search", rec.as_dict()
+    assert rec.L_search_bits < rec.L_reuse_bits - 1e-3        # search beat linear reuse
+    assert rec.rel_grow <= 0.10                               # a new concept adds little beyond search
+    assert rec.search_trace[-1][1] <= rec.search_trace[0][1]  # (T, L_search) monotone — the knee
 
 
 def test_gate_forces_growth_for_root():

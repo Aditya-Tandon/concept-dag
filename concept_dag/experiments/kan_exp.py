@@ -30,7 +30,8 @@ import torch.nn as nn
 from ..modules.concept_module import ConceptModule
 from ..models.baselines import LinearHead
 from ..training.kan_gate import (
-    TaskSpec, classification_task, decide_reuse_vs_grow, ReuseComposer, _fit_full,
+    TaskSpec, classification_task, decide_reuse_vs_grow, decide_reuse_search_grow,
+    ReuseComposer, SearchComposer, _fit_full,
 )
 from ..training.consolidate import low_rank_factorize_final_layer
 from ..utils.metrics import principal_angles_between
@@ -51,7 +52,7 @@ class TaskPredictor:
                  node: Optional[DAGNode] = None,
                  parents: Optional[List[DAGNode]] = None,
                  composer: Optional[ReuseComposer] = None):
-        assert kind in ("grow", "reuse")
+        assert kind in ("grow", "reuse", "search")   # search: like reuse but a SearchComposer
         self.kind, self.head, self.node, self.parents, self.composer = kind, head, node, parents, composer
         self.parent_adapters = None   # per-parent recovery adapters (reuse), installed by a merge
         self.node_adapter = None      # recovery adapter on the grown node's output, installed by a merge
@@ -535,6 +536,10 @@ class KanExpConfig(Exp3Config):
     functional_redundancy: bool = True    # detect merge candidates by canonical correlation (basis-
                                           # invariant), not principal-angle subspace overlap
     functional_threshold: float = 0.9     # mean top-k canonical correlation to trigger a merge
+    enable_search:       bool  = False    # three-way reuse/search/grow gate (test-time-compute rung)
+    eps_search:          float = 0.05     # min reducible-info fraction bounded search must add over reuse
+    search_budget:       int   = 6        # trained candidates the Search level may spend
+    search_rank:         int   = 16       # bottleneck rank of the SearchComposer (≪ concept_dim)
 
 
 def run_exp3a_kan(
@@ -593,11 +598,20 @@ def run_exp3a_kan(
             # --- Kan gate on cached parent embeddings ---
             X, y = _cache_parent_stack(parents, task["train"], device, max_batches=cfg.routing_batches)
             force = t in cfg.force_grow_ids
-            rec = decide_reuse_vs_grow(
-                X, y, new_module_factory(parents), spec,
-                concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
-                n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_rel=cfg.eps_rel,
-            )
+            if cfg.enable_search and not force:
+                # Three-way reuse/search/grow escalation (test-time-compute rung).
+                rec = decide_reuse_search_grow(
+                    X, y, new_module_factory(parents), spec,
+                    concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
+                    n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_grow=cfg.eps_rel,
+                    eps_search=cfg.eps_search, search_budget=cfg.search_budget, search_rank=cfg.search_rank,
+                )
+            else:
+                rec = decide_reuse_vs_grow(
+                    X, y, new_module_factory(parents), spec,
+                    concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
+                    n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_rel=cfg.eps_rel,
+                )
             if force:
                 # Merge stress-test: skip the gate and grow unconditionally, so a redundant
                 # concept exists for the consolidation pass to detect and merge. NOT a claim
@@ -609,8 +623,13 @@ def run_exp3a_kan(
                 decisions.append({"task": t, "decision": "grow", "parents": [], "reason": "force-grow(dup-stress,parallel-root)",
                                   **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}})
             else:
-                decisions.append({"task": t, "decision": rec.decision, "parents": sel_idx,
-                                  **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}})
+                d = {"task": t, "decision": rec.decision, "parents": sel_idx,
+                     **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}}
+                for k in ("L_search_bits", "rel_search", "rel_grow", "search_meta", "search_trace"):
+                    v = getattr(rec, k, None)
+                    if v is not None:
+                        d[k] = v
+                decisions.append(d)
 
             if rec.decision == "grow":
                 grow_parents = None if force else parents
@@ -624,8 +643,15 @@ def run_exp3a_kan(
                 node.freeze()
                 nodes.append(node)
                 predictors.append(TaskPredictor("grow", head, node=node))
+            elif rec.decision == "search":
+                # Search: keep the best bounded-search composition over frozen parents; add NO node.
+                meta = rec.search_meta or {}
+                composer = SearchComposer(parent_dim=cfg.concept_dim, n_parents=len(parents), head=head,
+                                          rank=meta.get("rank", cfg.search_rank), subset=meta.get("subset"))
+                _fit_full(composer, lambda m, xb: m(xb), spec, X, y, cfg.child_epochs, cfg.lr, device)
+                predictors.append(TaskPredictor("search", head, parents=parents, composer=composer))
             else:
-                # Reuse: train a composer over frozen parents; add NO node.
+                # Reuse: train a linear composer over frozen parents; add NO node.
                 composer = ReuseComposer(parent_dim=cfg.concept_dim, n_parents=len(parents), head=head)
                 _fit_full(composer, lambda m, xb: m(xb), spec, X, y, cfg.child_epochs, cfg.lr, device)
                 predictors.append(TaskPredictor("reuse", head, parents=parents, composer=composer))
@@ -657,12 +683,15 @@ def run_exp3a_kan(
                                                             if cfg.functional_redundancy else None))
 
     n_grow = sum(1 for d in decisions if d["decision"] == "grow")
+    n_search = sum(1 for d in decisions if d["decision"] == "search")
+    n_reuse = sum(1 for d in decisions if d["decision"] == "reuse")
     results = {
         "average_accuracy": float(np.mean(test_accs)),
         "test_accs": test_accs,
         "n_grow": n_grow,
-        "n_reuse": len(tasks) - n_grow,
-        "reuse_rate": (len(tasks) - n_grow) / len(tasks),
+        "n_search": n_search,
+        "n_reuse": n_reuse,
+        "reuse_rate": (len(tasks) - n_grow) / len(tasks),   # non-grow fraction (reuse+search)
         "param_curve": param_curve,
         "params_final_pre_consolidation": param_curve[-1] if param_curve else 0,
         "consolidation": consolidation,

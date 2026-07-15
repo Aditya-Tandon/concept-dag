@@ -46,6 +46,13 @@ def main():
     parser.add_argument("--inject_dup", action="store_true",
                         help="[5ds-kan] append a force-grown duplicate of the first task to stress "
                              "the consolidation/merge path (creates a deliberately redundant concept)")
+    parser.add_argument("--enable_search", action="store_true",
+                        help="[5ds-kan/3a-kan] three-way reuse/search/grow gate: bounded test-time-compute "
+                             "search over existing concepts before growing a new one")
+    parser.add_argument("--eps_search", type=float, default=0.05,
+                        help="[search] min reducible-info fraction bounded search must add over reuse")
+    parser.add_argument("--search_budget", type=int, default=6,
+                        help="[search] trained candidates the Search level may spend")
     parser.add_argument("--consolidate_every", type=int, default=0,
                         help="[3a-kan] run the consolidation (reduction) pass every K tasks (0 = only "
                              "at the end)")
@@ -256,6 +263,9 @@ def main():
             eps_rel     = getattr(args, "eps_rel", 0.05),
             consolidate_every = getattr(args, "consolidate_every", 0),
             force_grow_ids = force_grow_ids,
+            enable_search = args.enable_search,
+            eps_search  = args.eps_search,
+            search_budget = args.search_budget,
         )
         run_exp3a_kan(cfg, tasks=tasks)
 

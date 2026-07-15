@@ -158,6 +158,35 @@ class ReuseComposer(nn.Module):
         return self.head(self.proj(parent_stack.flatten(1)))
 
 
+class SearchComposer(nn.Module):
+    """
+    The **Search-level** model: a *low-rank non-linear* recombination of a chosen subset of the frozen
+    parent concepts. It is deliberately intermediate between :class:`ReuseComposer` (linear, no hidden
+    layer — retrieval) and a new :class:`ConceptModule` (a full new representation — discovery):
+
+      concat(selected parents) → Linear(·, r) → GELU → Linear(r, D) → head          (r ≪ D)
+
+    The bottleneck rank ``r`` keeps its capacity far below a concept, so a task it solves is solved by
+    *recombining* existing concepts with a little non-linear glue — spending test-time compute — not by
+    minting new structure. Searching over the parent ``subset`` is the routing axis of that compute.
+    """
+
+    def __init__(self, parent_dim: int, n_parents: int, head: nn.Module,
+                 rank: int = 16, subset: Optional[Tuple[int, ...]] = None):
+        super().__init__()
+        self.subset = tuple(range(n_parents)) if subset is None else tuple(subset)
+        in_dim = max(len(self.subset), 1) * parent_dim
+        self.enc = nn.Linear(in_dim, rank)
+        self.act = nn.GELU()
+        self.dec = nn.Linear(rank, parent_dim)
+        self.head = head
+
+    def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
+        sel = parent_stack[:, self.subset, :] if parent_stack.dim() == 3 else parent_stack
+        z = self.act(self.enc(sel.flatten(1)))
+        return self.head(self.dec(z))
+
+
 # ---------------------------------------------------------------------------
 # The gate record (slots into the vault's gate_verdict convention)
 # ---------------------------------------------------------------------------
@@ -178,6 +207,12 @@ class KanGateRecord:
     obstruction_geometric: Optional[bool]
     obstruction_codelength: bool
     reason: str
+    # --- Search level (three-way gate); None on the binary reuse-vs-grow path. ---
+    L_search_bits: Optional[float] = None       # held-out bits of the best bounded-search composition
+    rel_search: Optional[float] = None          # fraction of reducible info Search adds beyond reuse
+    rel_grow: Optional[float] = None            # fraction of reducible info grow adds beyond best search
+    search_meta: Optional[dict] = None          # winning search config {subset, rank} to rebuild it
+    search_trace: Optional[list] = None         # [(T, best L_search so far)] — the compute knee
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -450,6 +485,166 @@ def decide_reuse_vs_grow(
         net_codelength_delta=net, rel_improvement=rel,
         best_subspace_similarity=best_subspace_similarity, obstruction_geometric=obstruction_geom,
         obstruction_codelength=obstruction_code, reason=reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The Search level — bounded test-time-compute search over existing concepts
+# ---------------------------------------------------------------------------
+
+
+def _enumerate_subsets(n_parents: int) -> List[Tuple[int, ...]]:
+    """Non-empty parent subsets, singletons first then the full set (routing search space)."""
+    singles = [(i,) for i in range(n_parents)]
+    full = [tuple(range(n_parents))] if n_parents > 1 else []
+    return singles + full
+
+
+def search_compose(
+    Xtr: torch.Tensor, ytr: torch.Tensor, Xval: torch.Tensor, yval: torch.Tensor,
+    spec: TaskSpec, *, concept_dim: int, n_parents: int, device: str,
+    n_epochs: int, lr: float, budget: int = 6, rank: int = 16,
+) -> Tuple[float, dict, list]:
+    """Bounded search for the best composition of EXISTING concepts (the middle rung).
+
+    Spends up to ``budget`` trained candidates over the (parent-subset × restart) space, each a
+    :class:`SearchComposer`, and returns the best held-out code length, the winning config
+    ``{subset, rank}``, and the ``(T, best-L-so-far)`` trace. ``T`` (candidate count) is the reported
+    compute budget: L_search is monotone non-increasing in T, so its knee is the epiplexity signal for
+    how much structure is *compute-extractable* from existing concepts before growth is warranted.
+    """
+    subsets = _enumerate_subsets(n_parents)
+    # Interleave: every subset once (seed 0), then extra restarts of each — best-first coverage.
+    candidates: List[Tuple[Tuple[int, ...], int]] = []
+    seed = 0
+    while len(candidates) < budget:
+        for sub in subsets:
+            candidates.append((sub, seed))
+            if len(candidates) >= budget:
+                break
+        seed += 1
+
+    best_L = float("inf")
+    best_cfg = {"subset": subsets[-1], "rank": rank}
+    trace: List[Tuple[int, float]] = []
+    for t, (sub, sd) in enumerate(candidates, start=1):
+        torch.manual_seed(sd)
+        model = SearchComposer(parent_dim=concept_dim, n_parents=n_parents,
+                               head=spec.make_head(concept_dim), rank=rank, subset=sub)
+        L = _held_out_codelength(model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+                                 n_epochs=n_epochs, lr=lr, device=device)
+        if L < best_L:
+            best_L, best_cfg = L, {"subset": sub, "rank": rank}
+        trace.append((t, best_L))
+    return best_L, best_cfg, trace
+
+
+def decide_reuse_search_grow(
+    parent_stack: torch.Tensor,
+    targets: torch.Tensor,
+    new_module_factory: Callable[[], ConceptModule],
+    spec: TaskSpec,
+    *,
+    concept_dim: int,
+    n_parents: int,
+    device: str = "cpu",
+    n_epochs: int = 15,
+    lr: float = 1e-3,
+    val_fraction: float = 0.3,
+    eps_grow: float = 0.05,
+    eps_search: float = 0.05,
+    search_budget: int = 6,
+    search_rank: int = 16,
+    bits_per_param_fn: Optional[Callable[[int, int], float]] = None,
+) -> KanGateRecord:
+    """
+    Three-way escalation: **reuse → search → grow** on one MDL axis.
+
+    All four probes (null, reuse, search, grow) are fit on the SAME held-out split so their code
+    lengths are directly comparable. Residual fractions share the reducible denominator
+    ``(L_null − L_grow)`` so they are additive slices of the total reducible information:
+
+      * ``rel_search = (L_reuse  − L_search) / (L_null − L_grow)`` — what bounded search adds beyond reuse
+      * ``rel_grow   = (L_search − L_grow)   / (L_null − L_grow)`` — what a NEW concept adds beyond search
+
+    Decision (cheapest sufficient rung): grow if ``rel_grow > eps_grow`` (obstruction survives the
+    search budget); else search if ``rel_search > eps_search`` (compute closed the gap, no new concept);
+    else reuse. See [[test-time-compute-search-level]].
+    """
+    X, y = parent_stack, targets
+    n = X.shape[0]
+    n_val = max(1, int(round(val_fraction * n)))
+    perm = torch.randperm(n)
+    val_idx, tr_idx = perm[:n_val], perm[n_val:]
+    Xtr, ytr, Xval, yval = X[tr_idx], y[tr_idx], X[val_idx], y[val_idx]
+
+    # Reuse (linear recombination).
+    reuse_model = ReuseComposer(parent_dim=concept_dim, n_parents=n_parents, head=spec.make_head(concept_dim))
+    L_reuse = _held_out_codelength(reuse_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+                                   n_epochs=n_epochs, lr=lr, device=device)
+
+    # Search (bounded test-time compute over existing concepts).
+    L_search, search_cfg, trace = search_compose(
+        Xtr, ytr, Xval, yval, spec, concept_dim=concept_dim, n_parents=n_parents,
+        device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank)
+
+    # Grow (a new concept over the same parents).
+    new_module = new_module_factory()
+    grow_head = spec.make_head(new_module.out_dim)
+
+    class _GrowModel(nn.Module):
+        def __init__(self, module: ConceptModule, head: nn.Module):
+            super().__init__()
+            self.module = module; self.head = head
+
+        def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
+            outs = [parent_stack[:, i, :] for i in range(parent_stack.shape[1])]
+            return self.head(self.module(x=None, parent_outputs=outs))
+
+    grow_model = _GrowModel(new_module, grow_head)
+    L_grow = _held_out_codelength(grow_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+                                  n_epochs=n_epochs, lr=lr, device=device)
+
+    # Null (marginal) — sets the reducible scale.
+    class _NullModel(nn.Module):
+        def __init__(self, head: nn.Module):
+            super().__init__(); self.head = head
+
+        def forward(self, xb: torch.Tensor) -> torch.Tensor:
+            return self.head(torch.zeros(xb.shape[0], concept_dim, device=xb.device))
+
+    L_null = _held_out_codelength(_NullModel(spec.make_head(concept_dim)), lambda m, xb: m(xb), spec,
+                                  Xtr, ytr, Xval, yval, n_epochs=max(n_epochs // 2, 10), lr=lr, device=device)
+
+    reducible = max(L_null - L_grow, 1e-6)
+    rel_search = (L_reuse - L_search) / reducible
+    rel_grow = (L_search - L_grow) / reducible
+
+    k_extra = max(sum(p.numel() for p in grow_model.parameters())
+                  - sum(p.numel() for p in reuse_model.parameters()), 0)
+    model_bits = (bits_per_param_fn(k_extra, n) if bits_per_param_fn is not None
+                  else 0.5 * k_extra * math.log2(max(n, 2)))
+
+    if rel_grow > eps_grow:
+        decision = "grow"
+    elif rel_search > eps_search:
+        decision = "search"
+    else:
+        decision = "reuse"
+
+    reason = (f"L_null={L_null:.3f} L_reuse={L_reuse:.3f} L_search={L_search:.3f} L_grow={L_grow:.3f} | "
+              f"rel_search={rel_search:.3f} (eps {eps_search}) rel_grow={rel_grow:.3f} (eps {eps_grow}) "
+              f"→ {decision}; search_subset={search_cfg['subset']}")
+    return KanGateRecord(
+        task_name=spec.name, decision=decision,
+        L_reuse_bits=L_reuse, L_grow_bits=L_grow,
+        delta_bits_per_sample=(L_reuse - L_grow), model_bits=model_bits, n_samples=n,
+        net_codelength_delta=(L_reuse - L_grow) * n - model_bits,
+        rel_improvement=(L_reuse - L_grow) / reducible,   # keep the binary field for back-compat/logging
+        best_subspace_similarity=None, obstruction_geometric=None,
+        obstruction_codelength=(rel_grow > eps_grow), reason=reason,
+        L_search_bits=L_search, rel_search=rel_search, rel_grow=rel_grow,
+        search_meta=search_cfg, search_trace=trace,
     )
 
 
