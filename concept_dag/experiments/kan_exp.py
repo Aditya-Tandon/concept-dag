@@ -109,8 +109,31 @@ def _node_children(nodes: List[DAGNode], node: DAGNode) -> List[DAGNode]:
     return [c for c in nodes if node in c.parent_models]
 
 
+def _identity_linear(D: int, device: str) -> nn.Linear:
+    W = nn.Linear(D, D, bias=True).to(device)
+    with torch.no_grad():
+        W.weight.copy_(torch.eye(D, device=device)); W.bias.zero_()
+    for p in W.parameters():
+        p.requires_grad_(False)
+    return W.eval()
+
+
+def _lstsq_linear(src: torch.Tensor, tgt: torch.Tensor, device: str) -> Tuple[nn.Linear, float]:
+    """Least-squares affine map W: src -> tgt (closed form). Returns (frozen Linear, recon MSE)."""
+    D_in, D_out = src.shape[1], tgt.shape[1]
+    A = torch.cat([src, torch.ones(src.shape[0], 1)], dim=1)        # augment for bias
+    sol = torch.linalg.lstsq(A, tgt).solution                       # (D_in+1, D_out)
+    W = nn.Linear(D_in, D_out, bias=True).to(device)
+    with torch.no_grad():
+        W.weight.copy_(sol[:D_in].T.to(device)); W.bias.copy_(sol[D_in].to(device))
+    for p in W.parameters():
+        p.requires_grad_(False)
+    recon = float(((A @ sol) - tgt).pow(2).mean().item())
+    return W.eval(), recon
+
+
 def distill_merge(keep: DAGNode, drop: DAGNode, loader, device: str,
-                  epochs: int = 30, lr: float = 1e-3) -> Dict[str, nn.Module]:
+                  epochs: int = 30, lr: float = 1e-3, freeze_keep: bool = False) -> Dict[str, nn.Module]:
     """
     Functional merge for DAGNodes with *different but overlapping* subspaces.
 
@@ -121,6 +144,13 @@ def distill_merge(keep: DAGNode, drop: DAGNode, loader, device: str,
     subspaces are near-identical, W_keep ≈ W_drop ≈ I and this degrades to a structural merge; when
     their joint rank exceeds concept_dim the reconstruction error stays high and the caller's gate
     rejects the merge (they are not actually redundant). See module/keep docs.
+
+    ``freeze_keep=True`` — the correct mode when ``drop`` is already linearly recoverable from ``keep``
+    (high canonical correlation): keep is left **untouched** (W_keep = I) and only W_drop is fit by
+    least squares (keep's frozen output → drop's output). This is essential when keep has *other-task*
+    reuse consumers: retraining keep shifts the concept those tasks depend on and the forgetting gate
+    then rightly rejects the merge (observed: FashionMNIST −0.078 when two MNIST concepts were merged
+    by retraining keep). Freezing keep makes W_keep exactly identity, so keep's consumers are unchanged.
     """
     D = keep.concept_module.out_dim
     keep.eval(); drop.eval()
@@ -133,6 +163,15 @@ def distill_merge(keep: DAGNode, drop: DAGNode, loader, device: str,
             xs.append(x.cpu())
             tgt_keep_ref.append(forward_dag_memoized(keep, x).cpu())
             tgt_drop_ref.append(forward_dag_memoized(drop, x).cpu())
+
+    if freeze_keep:
+        # Keep is a sufficient statistic already: don't perturb it. W_keep = I (its consumers are
+        # untouched); W_drop = least-squares map from keep's frozen output to drop's output.
+        keep_out = torch.cat(tgt_keep_ref); drop_out = torch.cat(tgt_drop_ref)
+        keep.freeze()
+        W_keep = _identity_linear(D, device)
+        W_drop, recon = _lstsq_linear(keep_out, drop_out, device)
+        return {"keep": W_keep, "drop": W_drop, "recon_loss": recon}
 
     # Train ONLY keep's concept module so both original outputs are linearly recoverable from the new
     # keep output; W_keep, W_drop are the recovery (transport) maps.
@@ -213,6 +252,7 @@ def consolidate_nodes(
     distill: bool = True,
     distill_epochs: int = 20,
     merge_tolerance: float = 0.01,
+    functional_threshold: Optional[float] = None,
 ) -> Dict[str, object]:
     """
     One consolidation pass over the grown DAGNode list.
@@ -262,9 +302,20 @@ def consolidate_nodes(
                 # skip ancestor/descendant pairs (stacked, not parallel)
                 if _is_ancestor(a, b) or _is_ancestor(b, a):
                     continue
-                sim = _subspace_similarity(a, b, subspace_k)
-                if sim < similarity_threshold:
-                    continue
+                # Redundancy trigger. Default (geometric) principal-angle overlap misses concepts
+                # that are functionally identical but sit in different bases; when a functional
+                # threshold is set, use mean canonical correlation instead (basis-invariant).
+                if functional_threshold is not None:
+                    sim = _functional_similarity(
+                        a, b, _combined_loader(tasks, a.task_id, b.task_id), device, subspace_k)
+                    sim_kind = "functional"
+                    if sim < functional_threshold:
+                        continue
+                else:
+                    sim = _subspace_similarity(a, b, subspace_k)
+                    sim_kind = "subspace"
+                    if sim < similarity_threshold:
+                        continue
                 affected = affected_task_ids(a) | affected_task_ids(b)
 
                 if not distill:
@@ -273,7 +324,7 @@ def consolidate_nodes(
                         continue
                     _merge_nodes(nodes, predictors, keep=a, drop=b)
                     ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id,
-                                "similarity": sim, "distilled": False})
+                                "similarity": sim, "sim_kind": sim_kind, "distilled": False})
                     merged = True
                     break
 
@@ -283,17 +334,28 @@ def consolidate_nodes(
                         for t in affected if t < len(predictors)}
                 snap = _snapshot_topology(nodes, predictors, keep=a)
                 loader = _combined_loader(tasks, a.task_id, b.task_id)
-                W = distill_merge(a, b, loader, device, epochs=distill_epochs)
+                W = distill_merge(a, b, loader, device, epochs=distill_epochs,
+                                  freeze_keep=(functional_threshold is not None))
                 _merge_nodes(nodes, predictors, keep=a, drop=b, W_keep=W["keep"], W_drop=W["drop"])
-                ok = all(predictors[t].accuracy(tasks[t]["test"], device) >= base.get(t, 0.0) - merge_tolerance
-                         for t in affected if t < len(predictors))
+                post = {t: predictors[t].accuracy(tasks[t]["test"], device)
+                        for t in affected if t < len(predictors)}
+                deltas = {t: round(post[t] - base[t], 4) for t in post}
+                ok = all(post[t] >= base.get(t, 0.0) - merge_tolerance for t in post)
                 if ok:
                     ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id,
-                                "similarity": sim, "distilled": True, "recon_loss": W["recon_loss"]})
+                                "similarity": sim, "sim_kind": sim_kind, "distilled": True,
+                                "recon_loss": W["recon_loss"], "backward_deltas": deltas})
                     merged = True
                     break
                 else:
+                    # Forgetting gate rejected the merge — roll back, but RECORD it (a silent
+                    # rollback is invisible to the research loop and looks identical to "no
+                    # candidate found"). worst_delta says how far the backward check was missed.
                     _restore_topology(nodes, predictors, snap)
+                    ops.append({"op": "merge_rejected", "keep": a.task_id, "drop": b.task_id,
+                                "similarity": sim, "sim_kind": sim_kind, "recon_loss": W["recon_loss"],
+                                "backward_deltas": deltas, "worst_delta": min(deltas.values()),
+                                "merge_tolerance": merge_tolerance})
             if merged:
                 break
 
@@ -316,6 +378,38 @@ def _subspace_similarity(a: DAGNode, b: DAGNode, top_k: int) -> float:
     cb = b.concept_module.get_concept_subspace()
     angles = principal_angles_between(ca, cb)
     return float(torch.cos(angles).sum().item())
+
+
+def _functional_similarity(a: DAGNode, b: DAGNode, loader, device: str, top_k: int,
+                           max_batches: int = 8) -> float:
+    """Mean of the top-k canonical correlations between the two concepts' outputs over `loader`.
+
+    This is a *functional* redundancy signal, in [0, 1], and — unlike principal-angle subspace
+    overlap — it is invariant to the basis each concept happens to have learned. Two concepts trained
+    independently on the same data are functionally near-identical (CCA ≈ 0.99) yet occupy nearly
+    orthogonal subspaces (principal-angle sim ≈ 1.9/8); the geometric detector misses them entirely,
+    so this is the correct trigger for the distill+recovery-adapter merge (which linearly re-aligns
+    the surviving concept anyway). See Central Library: five-datasets-kan-merge-detector.
+    """
+    a_out, b_out = [], []
+    a.eval(); b.eval()
+    with torch.no_grad():
+        for bi, batch in enumerate(loader):
+            if bi >= max_batches:
+                break
+            x = batch[0].to(device)
+            a_out.append(a(x).detach().cpu().float())
+            b_out.append(b(x).detach().cpu().float())
+    Ha = torch.cat(a_out); Hb = torch.cat(b_out)
+    if Ha.shape[0] <= Ha.shape[1]:               # too few samples for a stable CCA
+        return 0.0
+    Ha = Ha - Ha.mean(0, keepdim=True)
+    Hb = Hb - Hb.mean(0, keepdim=True)
+    qa, _ = torch.linalg.qr(Ha)
+    qb, _ = torch.linalg.qr(Hb)
+    sv = torch.linalg.svdvals(qa.T @ qb).clamp(0.0, 1.0)
+    k = min(top_k, sv.numel())
+    return float(sv[:k].mean().item())
 
 
 def _compose(existing: Optional[nn.Module], recovery: Optional[nn.Module]) -> Optional[nn.Module]:
@@ -438,6 +532,9 @@ class KanExpConfig(Exp3Config):
     distill_epochs:      int   = 20
     force_grow_ids:      tuple = ()       # stream positions to grow unconditionally (merge stress-test:
                                           # forces a redundant concept the consolidation pass must merge)
+    functional_redundancy: bool = True    # detect merge candidates by canonical correlation (basis-
+                                          # invariant), not principal-angle subspace overlap
+    functional_threshold: float = 0.9     # mean top-k canonical correlation to trigger a merge
 
 
 def run_exp3a_kan(
@@ -495,33 +592,33 @@ def run_exp3a_kan(
             parents = [nodes[i] for i in sel_idx]
             # --- Kan gate on cached parent embeddings ---
             X, y = _cache_parent_stack(parents, task["train"], device, max_batches=cfg.routing_batches)
-            if t in cfg.force_grow_ids:
+            force = t in cfg.force_grow_ids
+            rec = decide_reuse_vs_grow(
+                X, y, new_module_factory(parents), spec,
+                concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
+                n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_rel=cfg.eps_rel,
+            )
+            if force:
                 # Merge stress-test: skip the gate and grow unconditionally, so a redundant
                 # concept exists for the consolidation pass to detect and merge. NOT a claim
                 # the gate would grow here — the injected duplicate would correctly reuse.
-                rec = decide_reuse_vs_grow(
-                    X, y, new_module_factory(parents), spec,
-                    concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
-                    n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_rel=cfg.eps_rel,
-                )
+                # Grow it as a ROOT (parent_models=None) so it is PARALLEL to the concept it
+                # duplicates, not stacked on it: find_redundant_pairs excludes ancestor/descendant
+                # pairs, so a child of the original could never be a merge candidate.
                 rec.decision = "grow"
-                decisions.append({"task": t, "decision": "grow", "parents": sel_idx, "reason": "force-grow(dup-stress)",
+                decisions.append({"task": t, "decision": "grow", "parents": [], "reason": "force-grow(dup-stress,parallel-root)",
                                   **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}})
             else:
-                rec = decide_reuse_vs_grow(
-                    X, y, new_module_factory(parents), spec,
-                    concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
-                    n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_rel=cfg.eps_rel,
-                )
                 decisions.append({"task": t, "decision": rec.decision, "parents": sel_idx,
                                   **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}})
 
             if rec.decision == "grow":
+                grow_parents = None if force else parents
                 node = DAGNode(task_id=t, concept_dim=cfg.concept_dim, cnn_out_dim=cfg.cnn_out_dim,
-                               n_mlp_layers=cfg.n_mlp_layers, parent_models=parents,
+                               n_mlp_layers=cfg.n_mlp_layers, parent_models=grow_parents,
                                soft_pca_k=cfg.soft_pca_k, use_cnn=use_cnn, feature_dim=cfg.feature_dim)
                 train_node(node, head, task["train"], cfg.child_epochs, cfg.lr, device, cfg.log_every,
-                           name=f"t{t}-grow", orth_weight=cfg.orth_weight)
+                           name=f"t{t}-grow{'-root' if force else ''}", orth_weight=cfg.orth_weight)
                 node.compute_concept_subspace(task["train"], device, top_k=cfg.subspace_k,
                                               max_batches=cfg.routing_batches)
                 node.freeze()
@@ -544,7 +641,9 @@ def run_exp3a_kan(
             summ = consolidate_nodes(nodes, predictors, tasks, device, accept_fn=accept,
                                      similarity_threshold=cfg.similarity_threshold,
                                      subspace_k=cfg.subspace_k, distill=cfg.distill,
-                                     distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance)
+                                     distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance,
+                                     functional_threshold=(cfg.functional_threshold
+                                                           if cfg.functional_redundancy else None))
             print(f"  [consolidate @ task {t}] saved {summ['params_saved']} params, {summ['n_ops']} ops")
         _flush(device)
 
@@ -553,7 +652,9 @@ def run_exp3a_kan(
     consolidation = consolidate_nodes(nodes, predictors, tasks, device, accept_fn=accept,
                                       similarity_threshold=cfg.similarity_threshold,
                                       subspace_k=cfg.subspace_k, distill=cfg.distill,
-                                      distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance)
+                                      distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance,
+                                      functional_threshold=(cfg.functional_threshold
+                                                            if cfg.functional_redundancy else None))
 
     n_grow = sum(1 for d in decisions if d["decision"] == "grow")
     results = {

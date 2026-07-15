@@ -120,7 +120,8 @@ def test_force_grow_ids_overrides_gate(tmp_path):
     res = run_exp3a_kan(cfg, tasks)
     d3 = next(d for d in res["decisions"] if d["task"] == 3)
     assert d3["decision"] == "grow"
-    assert d3.get("reason") == "force-grow(dup-stress)"
+    assert d3.get("reason", "").startswith("force-grow(dup-stress")
+    assert d3.get("parents") == []                          # grown as a parallel root, not a child
     # a redundant concept now exists → the consolidation pass has something it may merge
     assert res["consolidation"]["params_after"] <= res["consolidation"]["params_before"]
 
