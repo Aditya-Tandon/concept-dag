@@ -12,3 +12,9 @@ __pycache__/
 temp.ipynb
 Anthropic_Fellows_Application_Draft.md
 *.docx
+
+# Internal planning docs
+PLAN.md
+WRITEUP_NOTES.md
+DINO_SWAP_PLAN.md
+*.docx
