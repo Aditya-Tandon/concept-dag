@@ -66,3 +66,9 @@ python run_experiment.py --exp 5 --device cuda
 # Best-config confirmation (k=16, n_parents=4)
 python run_experiment.py --exp 6 --device cuda --best_subspace_k 16 --best_n_parents 4
 ```
+
+---
+
+## Direction being explored
+
+The sequential baseline achieves the highest accuracy (0.7871) but at 20× the parameter count — one full model per task. The shared-parameter variants close part of that gap while keeping backward transfer at zero, but the remaining accuracy shortfall suggests that fixed-size nodes under-represent later tasks as the DAG grows. An open question is whether the DAG structure can be extended with a routing or node-sharing strategy that grows total parameters sub-linearly in the number of tasks while preserving the crystallization guarantee. This is an idea being played around with and is not yet implemented.
