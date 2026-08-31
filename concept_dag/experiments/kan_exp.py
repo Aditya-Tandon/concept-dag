@@ -89,16 +89,19 @@ class TaskPredictor:
 
 @torch.no_grad()
 def _cache_parent_stack(parents: List[DAGNode], loader, device: str,
-                        max_batches: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
-    stacks, ys = [], []
+                        max_batches: int = 0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns (parent_stack (N,P,D), raw_inputs (N,...), targets). The raw inputs are the same
+    batches the parent stack was computed from, so a raw-root grow probe shares the gate's split."""
+    stacks, raws, ys = [], [], []
     for i, (x, y) in enumerate(loader):
         if max_batches and i >= max_batches:
             break
         x = x.to(device)
         outs = [forward_dag_memoized(p, x) for p in parents]      # each (B, D)
         stacks.append(torch.stack(outs, dim=1).cpu())             # (B, P, D)
+        raws.append(x.cpu())
         ys.append(y.cpu())
-    return torch.cat(stacks, 0), torch.cat(ys, 0)
+    return torch.cat(stacks, 0), torch.cat(raws, 0), torch.cat(ys, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +543,11 @@ class KanExpConfig(Exp3Config):
     eps_search:          float = 0.05     # min reducible-info fraction bounded search must add over reuse
     search_budget:       int   = 6        # trained candidates the Search level may spend
     search_rank:         int   = 16       # bottleneck rank of the SearchComposer (≪ concept_dim)
+    raw_grow_probe:      bool  = False    # grow probe sees the raw encoder features (a real grown
+                                          # root's view) instead of the frozen parent stack; an
+                                          # organic grow then mints a ROOT node. Feature-mode only
+                                          # (use_cnn=False) — the parents-only probe cannot certify
+                                          # obstructions on domains absent from the parents.
 
 
 def run_exp3a_kan(
@@ -573,6 +581,17 @@ def run_exp3a_kan(
             )
         return factory
 
+    # Raw-root grow probe: capacity-matched to a real grown root DAGNode (ConceptModule on the raw
+    # encoder features, n_parents=0). Feature-mode only — in CNN mode the raw input is an image and
+    # the probe would need its own backbone, so we fall back to the parents-only probe there.
+    use_raw_probe = cfg.raw_grow_probe and not use_cnn and cfg.feature_dim is not None
+
+    def root_module_factory():
+        return ConceptModule(
+            module_id="__root_probe__", in_dim=cfg.feature_dim, hidden_dim=cfg.concept_dim,
+            out_dim=cfg.concept_dim, n_layers=cfg.n_mlp_layers, n_parents=0,
+        )
+
     for t, task in enumerate(tasks):
         n_par = min(cfg.n_parents, t)
         spec = spec_factory(task)
@@ -595,8 +614,11 @@ def run_exp3a_kan(
             sel_idx, _scores = route_for_task(nodes, task["train"], n_par, cfg.subspace_k,
                                               device, cfg.routing_batches)
             parents = [nodes[i] for i in sel_idx]
-            # --- Kan gate on cached parent embeddings ---
-            X, y = _cache_parent_stack(parents, task["train"], device, max_batches=cfg.routing_batches)
+            # --- Kan gate on cached parent embeddings (+ raw features for the root grow probe) ---
+            X, Xraw, y = _cache_parent_stack(parents, task["train"], device,
+                                             max_batches=cfg.routing_batches)
+            raw_kwargs = ({"raw_stack": Xraw, "root_module_factory": root_module_factory}
+                          if use_raw_probe else {})
             force = t in cfg.force_grow_ids
             if cfg.enable_search and not force:
                 # Three-way reuse/search/grow escalation (test-time-compute rung).
@@ -605,12 +627,14 @@ def run_exp3a_kan(
                     concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
                     n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_grow=cfg.eps_rel,
                     eps_search=cfg.eps_search, search_budget=cfg.search_budget, search_rank=cfg.search_rank,
+                    **raw_kwargs,
                 )
             else:
                 rec = decide_reuse_vs_grow(
                     X, y, new_module_factory(parents), spec,
                     concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
                     n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_rel=cfg.eps_rel,
+                    **raw_kwargs,
                 )
             if force:
                 # Merge stress-test: skip the gate and grow unconditionally, so a redundant
@@ -624,6 +648,7 @@ def run_exp3a_kan(
                                   **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}})
             else:
                 d = {"task": t, "decision": rec.decision, "parents": sel_idx,
+                     "grow_probe_input": rec.grow_probe_input,
                      **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}}
                 for k in ("L_search_bits", "rel_search", "rel_grow", "search_meta", "search_trace"):
                     v = getattr(rec, k, None)
@@ -632,12 +657,15 @@ def run_exp3a_kan(
                 decisions.append(d)
 
             if rec.decision == "grow":
-                grow_parents = None if force else parents
+                # A raw-probe grow certified a ROOT's view (raw encoder features), so mint a root —
+                # composition over existing concepts is reuse/search's job, not the grown node's.
+                grow_as_root = force or use_raw_probe
+                grow_parents = None if grow_as_root else parents
                 node = DAGNode(task_id=t, concept_dim=cfg.concept_dim, cnn_out_dim=cfg.cnn_out_dim,
                                n_mlp_layers=cfg.n_mlp_layers, parent_models=grow_parents,
                                soft_pca_k=cfg.soft_pca_k, use_cnn=use_cnn, feature_dim=cfg.feature_dim)
                 train_node(node, head, task["train"], cfg.child_epochs, cfg.lr, device, cfg.log_every,
-                           name=f"t{t}-grow{'-root' if force else ''}", orth_weight=cfg.orth_weight)
+                           name=f"t{t}-grow{'-root' if grow_as_root else ''}", orth_weight=cfg.orth_weight)
                 node.compute_concept_subspace(task["train"], device, top_k=cfg.subspace_k,
                                               max_batches=cfg.routing_batches)
                 node.freeze()

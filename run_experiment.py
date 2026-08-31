@@ -43,6 +43,13 @@ def main():
                              "mnist fashion kmnist svhn cifar10; default = all five)")
     parser.add_argument("--max_per_task", type=int, default=None,
                         help="[5ds-kan] cap train examples/task for light laptop runs (None = full)")
+    parser.add_argument("--raw_grow_probe", action="store_true",
+                        help="[5ds-kan/3a-kan] gate's grow probe sees the raw encoder features (a real "
+                             "grown root's view) instead of only frozen parent outputs; organic grows "
+                             "then mint ROOT nodes. Feature-backbone mode only (ignored for smallcnn).")
+    parser.add_argument("--dup_organic", action="store_true",
+                        help="[5ds-kan] with --inject_dup, let the gate decide the duplicate organically "
+                             "instead of force-growing it (grow-heavy-bias check: the dup should reuse)")
     parser.add_argument("--inject_dup", action="store_true",
                         help="[5ds-kan] append a force-grown duplicate of the first task to stress "
                              "the consolidation/merge path (creates a deliberately redundant concept)")
@@ -216,6 +223,7 @@ def main():
             cache_dir   = args.cache_dir,
             eps_rel     = getattr(args, "eps_rel", 0.05),
             consolidate_every = getattr(args, "consolidate_every", 0),
+            raw_grow_probe = args.raw_grow_probe,
         )
         raw_tasks = make_split_cifar100(
             data_root=args.data_root, n_tasks=n_tasks,
@@ -242,11 +250,14 @@ def main():
             raw_tasks, backbone, args.cache_dir, args.data_root)
         force_grow_ids = ()
         if args.inject_dup:
-            # Revisit the first dataset at the end of the stream and force-grow it.
+            # Revisit the first dataset at the end of the stream; force-grow it (merge stress-test)
+            # unless --dup_organic, where the gate decides — the grow-heavy-bias check: a raw-root
+            # grow probe must still REUSE on a task whose concept already exists.
             tasks, dup_positions = inject_duplicates(tasks, dup_after={0: len(tasks) - 1})
-            force_grow_ids = tuple(dup_positions)
+            if not args.dup_organic:
+                force_grow_ids = tuple(dup_positions)
             print(f"[5ds-kan] injected duplicate(s) at stream positions {dup_positions} "
-                  f"(force-grown to stress merge)")
+                  f"({'gate decides organically (bias check)' if args.dup_organic else 'force-grown to stress merge'})")
         cfg = KanExpConfig(
             data_root   = args.data_root,
             device      = device,
@@ -266,6 +277,7 @@ def main():
             enable_search = args.enable_search,
             eps_search  = args.eps_search,
             search_budget = args.search_budget,
+            raw_grow_probe = args.raw_grow_probe,
         )
         run_exp3a_kan(cfg, tasks=tasks)
 

@@ -187,6 +187,19 @@ class SearchComposer(nn.Module):
         return self.head(self.dec(z))
 
 
+class _RootGrowModel(nn.Module):
+    """Grow probe in raw-root mode: a candidate root concept (n_parents=0) reading the raw encoder
+    features, exactly the view a grown root DAGNode has. Kept module-level so both deciders share it."""
+
+    def __init__(self, module: nn.Module, head: nn.Module):
+        super().__init__()
+        self.module = module
+        self.head = head
+
+    def forward(self, raw_x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.module(raw_x))
+
+
 # ---------------------------------------------------------------------------
 # The gate record (slots into the vault's gate_verdict convention)
 # ---------------------------------------------------------------------------
@@ -213,6 +226,10 @@ class KanGateRecord:
     rel_grow: Optional[float] = None            # fraction of reducible info grow adds beyond best search
     search_meta: Optional[dict] = None          # winning search config {subset, rank} to rebuild it
     search_trace: Optional[list] = None         # [(T, best L_search so far)] — the compute knee
+    # What the grow probe consumed: "parents" (legacy — capped by parent information, cannot certify
+    # obstructions on domains absent from parents) or "raw-root" (a real grown root's view: the raw
+    # encoder features; L_grow then estimates what a NEW root concept can actually achieve).
+    grow_probe_input: str = "parents"
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -383,6 +400,8 @@ def decide_reuse_vs_grow(
     require_geometric: bool = False,
     require_mdl: bool = False,
     bits_per_param_fn: Optional[Callable[[int, int], float]] = None,
+    raw_stack: Optional[torch.Tensor] = None,
+    root_module_factory: Optional[Callable[[], nn.Module]] = None,
 ) -> KanGateRecord:
     """
     Backbone-agnostic reuse-vs-grow decision on a precomputed parent stack.
@@ -391,6 +410,16 @@ def decide_reuse_vs_grow(
     ``targets`` is (N, ...). This is the shared core used by both the ConceptDAG path
     (:func:`reuse_vs_grow`) and the DAGNode experiment path, so the decision logic lives in exactly
     one place. ``best_subspace_similarity`` is the (loss-free) geometric signal, if available.
+
+    ``raw_stack`` (N, feature_dim) + ``root_module_factory`` switch the grow probe to **raw-root
+    mode**: L_grow is measured by a probe with a real grown root's view — ``root_module_factory()``
+    (a ConceptModule with n_parents=0, capacity-matched to an actual root node) consuming the raw
+    encoder features. Without raw access the probe is bottlenecked through the very parents whose
+    inadequacy it is meant to certify, so obstructions on domains absent from the parents are
+    invisible (the 5-Datasets SVHN failure). Reuse and search stay parents-only by construction —
+    that asymmetry IS the reuse-vs-grow distinction: recombine what exists vs. mint new structure
+    from raw input. Held-out early-stopped bits remain the capacity charge (prequential-MDL style):
+    an over-capacity raw probe that only memorises does not lower held-out code length.
     """
     X, y = parent_stack, targets
     n = X.shape[0]
@@ -398,6 +427,10 @@ def decide_reuse_vs_grow(
     perm = torch.randperm(n)
     val_idx, tr_idx = perm[:n_val], perm[n_val:]
     Xtr, ytr, Xval, yval = X[tr_idx], y[tr_idx], X[val_idx], y[val_idx]
+    use_raw = raw_stack is not None and root_module_factory is not None
+    if use_raw:
+        # Same split indices as the parent stack, so all code lengths share one held-out set.
+        Rtr, Rval = raw_stack[tr_idx], raw_stack[val_idx]
 
     # --- Reuse-only model: linear recombination of frozen parents + task head. ---
     reuse_model = ReuseComposer(parent_dim=concept_dim, n_parents=n_parents,
@@ -407,25 +440,35 @@ def decide_reuse_vs_grow(
         n_epochs=n_epochs, lr=lr, device=device,
     )
 
-    # --- Grow model: a new ConceptModule over the same parents + task head. ---
-    new_module = new_module_factory()
-    grow_head = spec.make_head(new_module.out_dim)
+    # --- Grow model: what a NEW concept achieves. Raw-root mode probes a real grown root's view
+    # (raw encoder features, n_parents=0); legacy mode probes a child over the same parents. ---
+    if use_raw:
+        new_module = root_module_factory()
+        grow_head = spec.make_head(new_module.out_dim)
+        grow_model = _RootGrowModel(new_module, grow_head)
+        L_grow = _held_out_codelength(
+            grow_model, lambda m, xb: m(xb), spec, Rtr, ytr, Rval, yval,
+            n_epochs=n_epochs, lr=lr, device=device,
+        )
+    else:
+        new_module = new_module_factory()
+        grow_head = spec.make_head(new_module.out_dim)
 
-    class _GrowModel(nn.Module):
-        def __init__(self, module: ConceptModule, head: nn.Module):
-            super().__init__()
-            self.module = module
-            self.head = head
+        class _GrowModel(nn.Module):
+            def __init__(self, module: ConceptModule, head: nn.Module):
+                super().__init__()
+                self.module = module
+                self.head = head
 
-        def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
-            outs = [parent_stack[:, i, :] for i in range(parent_stack.shape[1])]
-            return self.head(self.module(x=None, parent_outputs=outs))
+            def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
+                outs = [parent_stack[:, i, :] for i in range(parent_stack.shape[1])]
+                return self.head(self.module(x=None, parent_outputs=outs))
 
-    grow_model = _GrowModel(new_module, grow_head)
-    L_grow = _held_out_codelength(
-        grow_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
-        n_epochs=n_epochs, lr=lr, device=device,
-    )
+        grow_model = _GrowModel(new_module, grow_head)
+        L_grow = _held_out_codelength(
+            grow_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+            n_epochs=n_epochs, lr=lr, device=device,
+        )
 
     # --- Null (marginal) code length: best input-independent predictor. Sets the "reducible" scale. ---
     class _NullModel(nn.Module):
@@ -473,9 +516,10 @@ def decide_reuse_vs_grow(
     else:
         grow = obstruction_code
 
+    probe_input = "raw-root" if use_raw else "parents"
     reason = (
         f"ΔL={delta:.4f} bits/sample (L_null={L_null:.3f} L_reuse={L_reuse:.3f} L_grow={L_grow:.3f}), "
-        f"residual_frac={rel:.3f} vs eps_rel={eps_rel}"
+        f"residual_frac={rel:.3f} vs eps_rel={eps_rel}, grow_probe={probe_input}"
         + (f", best_sim={best_subspace_similarity:.3f}" if best_subspace_similarity is not None else "")
     )
     return KanGateRecord(
@@ -485,6 +529,7 @@ def decide_reuse_vs_grow(
         net_codelength_delta=net, rel_improvement=rel,
         best_subspace_similarity=best_subspace_similarity, obstruction_geometric=obstruction_geom,
         obstruction_codelength=obstruction_code, reason=reason,
+        grow_probe_input=probe_input,
     )
 
 
@@ -556,9 +601,16 @@ def decide_reuse_search_grow(
     search_budget: int = 6,
     search_rank: int = 16,
     bits_per_param_fn: Optional[Callable[[int, int], float]] = None,
+    raw_stack: Optional[torch.Tensor] = None,
+    root_module_factory: Optional[Callable[[], nn.Module]] = None,
 ) -> KanGateRecord:
     """
     Three-way escalation: **reuse → search → grow** on one MDL axis.
+
+    With ``raw_stack`` + ``root_module_factory`` the grow probe runs in raw-root mode (see
+    :func:`decide_reuse_vs_grow`): reuse and search stay parents-only, grow probes a real root's
+    view of the raw encoder features. The ladder then reads: grow only when even bounded search
+    over existing concepts leaves a residual that a raw-input concept closes.
 
     All four probes (null, reuse, search, grow) are fit on the SAME held-out split so their code
     lengths are directly comparable. Residual fractions share the reducible denominator
@@ -577,6 +629,9 @@ def decide_reuse_search_grow(
     perm = torch.randperm(n)
     val_idx, tr_idx = perm[:n_val], perm[n_val:]
     Xtr, ytr, Xval, yval = X[tr_idx], y[tr_idx], X[val_idx], y[val_idx]
+    use_raw = raw_stack is not None and root_module_factory is not None
+    if use_raw:
+        Rtr, Rval = raw_stack[tr_idx], raw_stack[val_idx]
 
     # Reuse (linear recombination).
     reuse_model = ReuseComposer(parent_dim=concept_dim, n_parents=n_parents, head=spec.make_head(concept_dim))
@@ -588,22 +643,30 @@ def decide_reuse_search_grow(
         Xtr, ytr, Xval, yval, spec, concept_dim=concept_dim, n_parents=n_parents,
         device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank)
 
-    # Grow (a new concept over the same parents).
-    new_module = new_module_factory()
-    grow_head = spec.make_head(new_module.out_dim)
+    # Grow: raw-root mode (a candidate root on raw encoder features) or legacy (a new concept over
+    # the same parents).
+    if use_raw:
+        new_module = root_module_factory()
+        grow_head = spec.make_head(new_module.out_dim)
+        grow_model = _RootGrowModel(new_module, grow_head)
+        L_grow = _held_out_codelength(grow_model, lambda m, xb: m(xb), spec, Rtr, ytr, Rval, yval,
+                                      n_epochs=n_epochs, lr=lr, device=device)
+    else:
+        new_module = new_module_factory()
+        grow_head = spec.make_head(new_module.out_dim)
 
-    class _GrowModel(nn.Module):
-        def __init__(self, module: ConceptModule, head: nn.Module):
-            super().__init__()
-            self.module = module; self.head = head
+        class _GrowModel(nn.Module):
+            def __init__(self, module: ConceptModule, head: nn.Module):
+                super().__init__()
+                self.module = module; self.head = head
 
-        def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
-            outs = [parent_stack[:, i, :] for i in range(parent_stack.shape[1])]
-            return self.head(self.module(x=None, parent_outputs=outs))
+            def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
+                outs = [parent_stack[:, i, :] for i in range(parent_stack.shape[1])]
+                return self.head(self.module(x=None, parent_outputs=outs))
 
-    grow_model = _GrowModel(new_module, grow_head)
-    L_grow = _held_out_codelength(grow_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
-                                  n_epochs=n_epochs, lr=lr, device=device)
+        grow_model = _GrowModel(new_module, grow_head)
+        L_grow = _held_out_codelength(grow_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+                                      n_epochs=n_epochs, lr=lr, device=device)
 
     # Null (marginal) — sets the reducible scale.
     class _NullModel(nn.Module):
@@ -632,9 +695,10 @@ def decide_reuse_search_grow(
     else:
         decision = "reuse"
 
+    probe_input = "raw-root" if use_raw else "parents"
     reason = (f"L_null={L_null:.3f} L_reuse={L_reuse:.3f} L_search={L_search:.3f} L_grow={L_grow:.3f} | "
               f"rel_search={rel_search:.3f} (eps {eps_search}) rel_grow={rel_grow:.3f} (eps {eps_grow}) "
-              f"→ {decision}; search_subset={search_cfg['subset']}")
+              f"→ {decision}; search_subset={search_cfg['subset']}; grow_probe={probe_input}")
     return KanGateRecord(
         task_name=spec.name, decision=decision,
         L_reuse_bits=L_reuse, L_grow_bits=L_grow,
@@ -645,6 +709,7 @@ def decide_reuse_search_grow(
         obstruction_codelength=(rel_grow > eps_grow), reason=reason,
         L_search_bits=L_search, rel_search=rel_search, rel_grow=rel_grow,
         search_meta=search_cfg, search_trace=trace,
+        grow_probe_input=probe_input,
     )
 
 
