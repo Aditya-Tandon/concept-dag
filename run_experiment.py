@@ -32,7 +32,7 @@ import torch
 def main():
     parser = argparse.ArgumentParser(description="Concept DAG experiment runner")
     parser.add_argument("--exp",      type=str,   default="1a",
-                        choices=["1a", "1b", "2a", "2b", "3a", "3a-kan", "5ds-kan", "3b",
+                        choices=["1a", "1b", "2a", "2b", "3a", "3a-kan", "5ds-kan", "ctrl", "3b",
                                  "4", "4f", "5a", "5b", "5", "6", "plot"],
                         help="Which experiment to run ('3a-kan' = Kan-gated growth + consolidation)")
     parser.add_argument("--eps_rel", type=float, default=0.05,
@@ -43,6 +43,17 @@ def main():
                              "mnist fashion kmnist svhn cifar10; default = all five)")
     parser.add_argument("--max_per_task", type=int, default=None,
                         help="[5ds-kan] cap train examples/task for light laptop runs (None = full)")
+    parser.add_argument("--ctrl_stream", type=str, default="s_minus",
+                        choices=["s_minus", "s_plus", "s_in", "s_out", "s_pl"],
+                        help="[ctrl] which CTrL-style stream to run (see loaders.make_ctrl_stream)")
+    parser.add_argument("--ctrl_first", type=str, default="mnist",
+                        help="[ctrl] the revisited first task's dataset")
+    parser.add_argument("--ctrl_middles", type=str, nargs="+", default=None,
+                        help="[ctrl] middle (distractor) datasets; default = the other four")
+    parser.add_argument("--ctrl_n_large", type=int, default=4000,
+                        help="[ctrl] train samples for the data-rich tasks")
+    parser.add_argument("--ctrl_n_small", type=int, default=400,
+                        help="[ctrl] train samples for the data-poor tasks")
     parser.add_argument("--raw_grow_probe", action="store_true",
                         help="[5ds-kan/3a-kan] gate's grow probe sees the raw encoder features (a real "
                              "grown root's view) instead of only frozen parent outputs; organic grows "
@@ -280,6 +291,56 @@ def main():
             raw_grow_probe = args.raw_grow_probe,
         )
         run_exp3a_kan(cfg, tasks=tasks)
+
+    elif args.exp == "ctrl":
+        # CTrL-style streams (Veniat 2021): controlled similarity + revisits with ground-truth
+        # relations — the axis 5-Datasets cannot give (there, every domain is novel, so the
+        # right gate grows everywhere; here reuse must WIN on s_minus/s_out revisits).
+        from concept_dag.experiments.kan_exp import KanExpConfig, run_exp3a_kan
+        from concept_dag.data.loaders import make_ctrl_stream
+        backbone = args.backbone if args.backbone != "smallcnn" else "resnet18"
+        raw_tasks = make_ctrl_stream(
+            args.ctrl_stream, data_root=args.data_root, first_dataset=args.ctrl_first,
+            middle_datasets=args.ctrl_middles,
+            n_large=args.ctrl_n_large, n_small=args.ctrl_n_small,
+            batch_size=args.batch_size, download=bool(args.download), seed=args.seed,
+        )
+        ground_truth = [t.get("ctrl") for t in raw_tasks]
+        # Stream identity in the cache path: task files are keyed by position, so two streams
+        # sharing a dir would silently serve each other's features.
+        cache_dir = args.cache_dir or os.path.join(
+            args.data_root, f"features_{backbone}_ctrl_{args.ctrl_stream}")
+        tasks, feature_dim = _prepare_tasks_with_backbone(
+            raw_tasks, backbone, cache_dir, args.data_root)
+        cfg = KanExpConfig(
+            data_root   = args.data_root,
+            device      = device,
+            root_epochs = args.epochs,
+            child_epochs= args.epochs,
+            results_dir = f"{args.out_dir}/exp_ctrl_{args.ctrl_stream}",
+            seed        = args.seed,
+            batch_size  = args.batch_size,
+            n_tasks     = len(tasks),
+            n_parents   = 2,
+            backbone    = backbone,
+            cache_dir   = cache_dir,
+            feature_dim = feature_dim,
+            eps_rel     = getattr(args, "eps_rel", 0.05),
+            consolidate_every = getattr(args, "consolidate_every", 0),
+            enable_search = args.enable_search,
+            eps_search  = args.eps_search,
+            search_budget = args.search_budget,
+            raw_grow_probe = args.raw_grow_probe,
+        )
+        results = run_exp3a_kan(cfg, tasks=tasks)
+        # Score decisions against the pre-registered ground truth and persist alongside.
+        results["ctrl_stream"] = args.ctrl_stream
+        results["ctrl_ground_truth"] = ground_truth
+        import json
+        out_path = os.path.join(cfg.results_dir, "exp3a_kan_results.json")
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"[ctrl] ground-truth relations appended to {out_path}")
 
     elif args.exp in ("3a", "3b"):
         from concept_dag.experiments.exp3_growing_dag import Exp3Config, run_exp3a, run_exp3b

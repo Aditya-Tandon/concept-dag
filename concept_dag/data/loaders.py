@@ -665,3 +665,151 @@ def inject_duplicates(
     for pos, task in enumerate(out):
         task["task_id"] = pos
     return out, dup_positions
+
+
+# ---------------------------------------------------------------------------
+# CTrL-style streams (Veniat et al., ICLR 2021) over the 5-Datasets family
+# ---------------------------------------------------------------------------
+
+_CTRL_STREAMS = ("s_minus", "s_plus", "s_in", "s_out", "s_pl")
+
+
+class _PermutedLabels(Dataset):
+    """Wrap a dataset, applying a fixed label permutation (the CTrL S_out output shift)."""
+
+    def __init__(self, base: Dataset, perm: List[int]):
+        self.base, self.perm = base, list(perm)
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        x, y = self.base[i]
+        return x, self.perm[int(y)]
+
+
+def _build_shifted_transform(image_size: int = 32):
+    """S_in input shift: colour inversion after RGB conversion, before normalisation.
+
+    Deterministic and label-preserving — the concept needed is the same, the input
+    distribution is not. (CTrL uses background-colour changes; inversion is the
+    closest transform that needs no extra assets and survives feature caching.)
+    """
+    import torchvision.transforms as T
+    return T.Compose([
+        T.Lambda(lambda img: img.convert("RGB")),
+        T.Resize((image_size, image_size)),
+        T.ToTensor(),
+        T.Lambda(lambda x: 1.0 - x),
+        T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+    ])
+
+
+def make_ctrl_stream(
+    stream: str,
+    data_root: str = "./data",
+    first_dataset: str = "mnist",
+    middle_datasets: Optional[List[str]] = None,
+    n_large: int = 4000,
+    n_small: int = 400,
+    batch_size: int = 128,
+    val_frac: float = 0.1,
+    image_size: int = 32,
+    download: bool = False,
+    seed: int = 42,
+) -> List[Dict]:
+    """CTrL-style task streams with ground-truth task relations (Veniat et al. 2021).
+
+    5-Datasets does not let reuse *win* — every domain is novel, so the right gate
+    grows everywhere. CTrL streams add controlled similarity + revisits, giving the
+    decision-vs-similarity axis a ground truth. Streams (first task t1, middles m2..m5,
+    then a revisit t1' whose relation to t1 is known):
+
+      s_minus: t1 LARGE data -> middles small -> t1 revisit SMALL data (same distribution).
+               Ground truth: REUSE (the concept exists; small data cannot justify a new one).
+      s_plus:  t1 SMALL data -> middles small -> t1 revisit LARGE data.
+               Ground truth: the revisit carries genuinely more information than the first
+               pass could — reuse-with-update or grow are both defensible; record the decision.
+      s_in:    t1 -> middles -> t1 revisit with a deterministic INPUT shift (colour
+               inversion), same labels. Ground truth: same concept, shifted input.
+      s_out:   t1 -> middles -> t1 revisit with PERMUTED labels, identical inputs.
+               Ground truth: REUSE (a new readout of the same concept suffices; the
+               sufficient statistic is unchanged).
+      s_pl:    all five datasets once, moderate data, no revisit (plasticity baseline).
+
+    Every task dict follows the standard schema plus a "ctrl" field:
+        {"revisit_of": Optional[int], "relation": "same"|"input_shift"|"output_perm"|None,
+         "n_train": int}
+    so a decision trace can be scored against the known relation.
+    """
+    stream = stream.lower()
+    if stream not in _CTRL_STREAMS:
+        raise ValueError(f"Unknown CTrL stream '{stream}'. Known: {_CTRL_STREAMS}")
+    middles = middle_datasets or [d for d in _FIVE_DATASETS_DEFAULT if d != first_dataset][:4]
+    transform = _build_stream_transform(image_size)
+
+    def _subsampled_task(pos, name, n_train, *, tf=None, label_perm=None,
+                         revisit_of=None, relation=None, sub_seed=0):
+        tf = tf or transform
+        try:
+            train_full = _load_raw_dataset(name, data_root, True,  tf, download)
+            test_full  = _load_raw_dataset(name, data_root, False, tf, download)
+        except Exception as e:
+            if download:
+                raise
+            raise DatasetNotDownloadedError(name, data_root) from e
+        if label_perm is not None:
+            train_full = _PermutedLabels(train_full, label_perm)
+            test_full  = _PermutedLabels(test_full, label_perm)
+        rng = np.random.default_rng(seed + 1000 * sub_seed)
+        order = np.arange(len(train_full)); rng.shuffle(order)
+        n_val = int(n_train * val_frac)
+        take = order[: n_train + n_val]
+        val_idx, tr_idx = take[:n_val].tolist(), take[n_val:].tolist()
+        test_order = np.arange(len(test_full)); rng.shuffle(test_order)
+        test_idx = test_order[: max(500, n_train // 4)].tolist()
+        return {
+            "task_id": pos,
+            "train": DataLoader(Subset(train_full, tr_idx), batch_size=batch_size,
+                                shuffle=True, num_workers=0, pin_memory=False),
+            "val":   DataLoader(Subset(train_full, val_idx), batch_size=batch_size,
+                                shuffle=False, num_workers=0, pin_memory=False),
+            "test":  DataLoader(Subset(test_full, test_idx), batch_size=batch_size,
+                                shuffle=False, num_workers=0, pin_memory=False),
+            "n_classes": 10,
+            "class_ids": list(range(10)),
+            "name":    f"{name}_ctrl{pos}",
+            "dataset": name.lower(),
+            "ctrl": {"revisit_of": revisit_of, "relation": relation, "n_train": n_train},
+        }
+
+    tasks: List[Dict] = []
+    if stream == "s_pl":
+        for i, name in enumerate([first_dataset] + middles):
+            tasks.append(_subsampled_task(i, name, n_large // 2, sub_seed=i))
+        return tasks
+
+    first_n = n_small if stream == "s_plus" else n_large
+    tasks.append(_subsampled_task(0, first_dataset, first_n, sub_seed=0))
+    for i, name in enumerate(middles, start=1):
+        tasks.append(_subsampled_task(i, name, n_small, sub_seed=i))
+    pos = len(tasks)
+
+    if stream == "s_minus":
+        # Same distribution, small data: DIFFERENT subsample seed so the revisit is not the
+        # literal same tensors, only the same task.
+        tasks.append(_subsampled_task(pos, first_dataset, n_small,
+                                      revisit_of=0, relation="same", sub_seed=pos))
+    elif stream == "s_plus":
+        tasks.append(_subsampled_task(pos, first_dataset, n_large,
+                                      revisit_of=0, relation="same", sub_seed=pos))
+    elif stream == "s_in":
+        tasks.append(_subsampled_task(pos, first_dataset, n_small,
+                                      tf=_build_shifted_transform(image_size),
+                                      revisit_of=0, relation="input_shift", sub_seed=pos))
+    elif stream == "s_out":
+        rng = np.random.default_rng(seed + 7)
+        perm = rng.permutation(10).tolist()
+        tasks.append(_subsampled_task(pos, first_dataset, n_small, label_perm=perm,
+                                      revisit_of=0, relation="output_perm", sub_seed=0))
+    return tasks
