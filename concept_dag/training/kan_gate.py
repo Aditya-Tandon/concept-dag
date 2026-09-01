@@ -161,7 +161,7 @@ class ReuseComposer(nn.Module):
 class SearchComposer(nn.Module):
     """
     The **Search-level** model: a *low-rank non-linear* recombination of a chosen subset of the frozen
-    parent concepts. It is deliberately intermediate between :class:`ReuseComposer` (linear, no hidden
+    parent concepts. It is meant to be intermediate between :class:`ReuseComposer` (linear, no hidden
     layer — retrieval) and a new :class:`ConceptModule` (a full new representation — discovery):
 
       concat(selected parents) → Linear(·, r) → GELU → Linear(r, D) → head          (r ≪ D)
@@ -169,22 +169,45 @@ class SearchComposer(nn.Module):
     The bottleneck rank ``r`` keeps its capacity far below a concept, so a task it solves is solved by
     *recombining* existing concepts with a little non-linear glue — spending test-time compute — not by
     minting new structure. Searching over the parent ``subset`` is the routing axis of that compute.
+
+    ``skip`` — the nesting fix. The bottleneck above is narrower than ReuseComposer's *full-rank*
+    linear map (r=16 vs D=128), so the plain form is NOT a superset of reuse: it can and does score
+    WORSE in held-out bits than plain linear recombination, making ``rel_search`` negative and the
+    reuse→search→grow ladder non-monotone (measured: [[search-on-raw-probe-result]], rel_search in
+    [−0.107, +0.017] on every 5-Datasets task, Search never fires). With ``skip=True`` the composer
+    adds a full-rank linear path in parallel with the bottleneck:
+
+      out = Linear_full(concat) + Linear(r→D)(GELU(Linear(concat→r)))  → head
+
+    Zeroing the non-linear branch recovers ReuseComposer exactly, so ``L_search ≤ L_reuse`` now holds
+    by construction (up to optimisation noise) and ``rel_search ≥ 0`` is meaningful: it measures what
+    the non-linear glue adds *on top of* reuse, which is what the decision rule assumes.
     """
 
     def __init__(self, parent_dim: int, n_parents: int, head: nn.Module,
-                 rank: int = 16, subset: Optional[Tuple[int, ...]] = None):
+                 rank: int = 16, subset: Optional[Tuple[int, ...]] = None,
+                 skip: bool = False):
         super().__init__()
         self.subset = tuple(range(n_parents)) if subset is None else tuple(subset)
         in_dim = max(len(self.subset), 1) * parent_dim
         self.enc = nn.Linear(in_dim, rank)
         self.act = nn.GELU()
         self.dec = nn.Linear(rank, parent_dim)
+        self.skip = nn.Linear(in_dim, parent_dim) if skip else None
+        if self.skip is not None:
+            # Start at the reuse solution: the non-linear branch contributes nothing until training
+            # finds a use for it, so search begins from reuse rather than racing it from scratch.
+            nn.init.zeros_(self.dec.weight)
+            nn.init.zeros_(self.dec.bias)
         self.head = head
 
     def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
         sel = parent_stack[:, self.subset, :] if parent_stack.dim() == 3 else parent_stack
-        z = self.act(self.enc(sel.flatten(1)))
-        return self.head(self.dec(z))
+        flat = sel.flatten(1)
+        z = self.dec(self.act(self.enc(flat)))
+        if self.skip is not None:
+            z = z + self.skip(flat)
+        return self.head(z)
 
 
 class _RootGrowModel(nn.Module):
@@ -548,7 +571,8 @@ def _enumerate_subsets(n_parents: int) -> List[Tuple[int, ...]]:
 def search_compose(
     Xtr: torch.Tensor, ytr: torch.Tensor, Xval: torch.Tensor, yval: torch.Tensor,
     spec: TaskSpec, *, concept_dim: int, n_parents: int, device: str,
-    n_epochs: int, lr: float, budget: int = 6, rank: int = 16,
+    n_epochs: int, lr: float, budget: int = 6, rank: int = 16, skip: bool = False,
+    baseline_L: Optional[float] = None,
 ) -> Tuple[float, dict, list]:
     """Bounded search for the best composition of EXISTING concepts (the middle rung).
 
@@ -557,6 +581,16 @@ def search_compose(
     ``{subset, rank}``, and the ``(T, best-L-so-far)`` trace. ``T`` (candidate count) is the reported
     compute budget: L_search is monotone non-increasing in T, so its knee is the epiplexity signal for
     how much structure is *compute-extractable* from existing concepts before growth is warranted.
+
+    ``baseline_L`` — pass ``L_reuse`` to seed the search with the **trivial composition**: plain
+    linear recombination is itself a composition of existing concepts, the one that spends no
+    test-time compute, so it belongs in the search space rather than racing it. Seeding makes
+    ``L_search ≤ L_reuse`` hold exactly (not merely at the optimum), so ``rel_search ≥ 0`` and the
+    reuse → search → grow ladder is monotone by construction. If the winning config comes back
+    ``{"trivial": True}`` the search found nothing better than reuse, and ``rel_search == 0``
+    correctly routes the decision to reuse. Without it, the rank-``r`` bottleneck can score WORSE
+    than full-rank linear reuse and Search can never win — measured in
+    [[search-on-raw-probe-result]] (rel_search ∈ [−0.107, +0.017], Search never fired).
     """
     subsets = _enumerate_subsets(n_parents)
     # Interleave: every subset once (seed 0), then extra restarts of each — best-first coverage.
@@ -569,17 +603,18 @@ def search_compose(
                 break
         seed += 1
 
-    best_L = float("inf")
-    best_cfg = {"subset": subsets[-1], "rank": rank}
+    best_L = float("inf") if baseline_L is None else float(baseline_L)
+    best_cfg = ({"subset": subsets[-1], "rank": rank, "skip": skip} if baseline_L is None
+                else {"subset": subsets[-1], "rank": rank, "skip": skip, "trivial": True})
     trace: List[Tuple[int, float]] = []
     for t, (sub, sd) in enumerate(candidates, start=1):
         torch.manual_seed(sd)
         model = SearchComposer(parent_dim=concept_dim, n_parents=n_parents,
-                               head=spec.make_head(concept_dim), rank=rank, subset=sub)
+                               head=spec.make_head(concept_dim), rank=rank, subset=sub, skip=skip)
         L = _held_out_codelength(model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
                                  n_epochs=n_epochs, lr=lr, device=device)
         if L < best_L:
-            best_L, best_cfg = L, {"subset": sub, "rank": rank}
+            best_L, best_cfg = L, {"subset": sub, "rank": rank, "skip": skip}
         trace.append((t, best_L))
     return best_L, best_cfg, trace
 
@@ -600,6 +635,7 @@ def decide_reuse_search_grow(
     eps_search: float = 0.05,
     search_budget: int = 6,
     search_rank: int = 16,
+    search_skip: bool = False,
     bits_per_param_fn: Optional[Callable[[int, int], float]] = None,
     raw_stack: Optional[torch.Tensor] = None,
     root_module_factory: Optional[Callable[[], nn.Module]] = None,
@@ -641,7 +677,8 @@ def decide_reuse_search_grow(
     # Search (bounded test-time compute over existing concepts).
     L_search, search_cfg, trace = search_compose(
         Xtr, ytr, Xval, yval, spec, concept_dim=concept_dim, n_parents=n_parents,
-        device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank)
+        device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank,
+        skip=search_skip, baseline_L=L_reuse)
 
     # Grow: raw-root mode (a candidate root on raw encoder features) or legacy (a new concept over
     # the same parents).

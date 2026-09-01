@@ -69,6 +69,10 @@ def main():
                              "search over existing concepts before growing a new one")
     parser.add_argument("--eps_search", type=float, default=0.05,
                         help="[search] min reducible-info fraction bounded search must add over reuse")
+    parser.add_argument("--search_skip", action="store_true",
+                        help="[5ds-kan/3a-kan/ctrl] give the Search composer a full-rank linear skip so "
+                             "it nests reuse (L_search <= L_reuse by construction). Without it the "
+                             "rank-16 bottleneck is narrower than reuse and Search can never win.")
     parser.add_argument("--search_budget", type=int, default=6,
                         help="[search] trained candidates the Search level may spend")
     parser.add_argument("--consolidate_every", type=int, default=0,
@@ -288,6 +292,7 @@ def main():
             enable_search = args.enable_search,
             eps_search  = args.eps_search,
             search_budget = args.search_budget,
+            search_skip = args.search_skip,
             raw_grow_probe = args.raw_grow_probe,
         )
         run_exp3a_kan(cfg, tasks=tasks)
@@ -330,6 +335,7 @@ def main():
             enable_search = args.enable_search,
             eps_search  = args.eps_search,
             search_budget = args.search_budget,
+            search_skip = args.search_skip,
             raw_grow_probe = args.raw_grow_probe,
         )
         results = run_exp3a_kan(cfg, tasks=tasks)

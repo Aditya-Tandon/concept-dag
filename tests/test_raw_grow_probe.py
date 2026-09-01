@@ -100,3 +100,33 @@ def test_three_way_gate_raw_root_mode():
     # Search over an uninformative parent cannot close the gap; only the raw-root concept can.
     assert rec.decision == "grow"
     assert rec.rel_grow > 0.05
+
+
+# ---------------------------------------------------------------------------
+# Ladder monotonicity: L_search must never exceed L_reuse
+# ---------------------------------------------------------------------------
+
+
+def test_search_never_scores_worse_than_reuse():
+    """rel_search >= 0 — the reuse -> search -> grow ladder must be monotone.
+
+    The rank-16 SearchComposer bottleneck is NARROWER than ReuseComposer's full-rank linear map,
+    so before the fix a linearly-solvable task made L_search > L_reuse and rel_search went negative
+    (measured on NGT: rel_search in [-0.107, +0.017] across every 5-Datasets task, Search never
+    fired). search_compose now seeds the search with the trivial composition (plain linear
+    recombination), so reuse is a member of the search space rather than its competitor.
+    """
+    torch.manual_seed(0)
+    X = torch.randn(N, 2, DIM)
+    w = torch.randn(2 * DIM, 4)
+    y = (X.flatten(1) @ w).argmax(dim=1)      # purely linear in the parents: reuse is optimal
+    rec = decide_reuse_search_grow(
+        X, y, _child_probe_factory(2), classification_task(4),
+        concept_dim=DIM, n_parents=2, n_epochs=8, eps_grow=0.05, eps_search=0.05,
+        search_budget=3,
+    )
+    assert rec.rel_search >= 0.0
+    assert rec.search_meta.get("trivial") is True   # search found nothing better than reuse
+    assert rec.L_search_bits <= rec.L_reuse_bits + 1e-9
+    # (the grow/reuse verdict is incidental here — at this toy width a fresh concept can legitimately
+    # beat linear reuse; what this test pins is that the SEARCH rung never scores worse than reuse.)

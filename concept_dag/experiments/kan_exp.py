@@ -543,6 +543,11 @@ class KanExpConfig(Exp3Config):
     eps_search:          float = 0.05     # min reducible-info fraction bounded search must add over reuse
     search_budget:       int   = 6        # trained candidates the Search level may spend
     search_rank:         int   = 16       # bottleneck rank of the SearchComposer (≪ concept_dim)
+    search_skip:         bool  = False    # give the SearchComposer a full-rank linear skip so it
+                                          # NESTS reuse (L_search ≤ L_reuse by construction). Without
+                                          # it the rank-16 bottleneck is narrower than reuse's
+                                          # full-rank linear map, rel_search goes negative and the
+                                          # ladder is non-monotone — see search-on-raw-probe-result.
     raw_grow_probe:      bool  = False    # grow probe sees the raw encoder features (a real grown
                                           # root's view) instead of the frozen parent stack; an
                                           # organic grow then mints a ROOT node. Feature-mode only
@@ -627,6 +632,7 @@ def run_exp3a_kan(
                     concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
                     n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_grow=cfg.eps_rel,
                     eps_search=cfg.eps_search, search_budget=cfg.search_budget, search_rank=cfg.search_rank,
+                    search_skip=cfg.search_skip,
                     **raw_kwargs,
                 )
             else:
@@ -674,8 +680,14 @@ def run_exp3a_kan(
             elif rec.decision == "search":
                 # Search: keep the best bounded-search composition over frozen parents; add NO node.
                 meta = rec.search_meta or {}
-                composer = SearchComposer(parent_dim=cfg.concept_dim, n_parents=len(parents), head=head,
-                                          rank=meta.get("rank", cfg.search_rank), subset=meta.get("subset"))
+                # "trivial" = the search space's no-compute member (plain linear recombination) won,
+                # so the predictor IS a ReuseComposer; only a genuine non-linear winner needs one.
+                if meta.get("trivial"):
+                    composer = ReuseComposer(parent_dim=cfg.concept_dim, n_parents=len(parents), head=head)
+                else:
+                    composer = SearchComposer(parent_dim=cfg.concept_dim, n_parents=len(parents), head=head,
+                                              rank=meta.get("rank", cfg.search_rank), subset=meta.get("subset"),
+                                              skip=meta.get("skip", cfg.search_skip))
                 _fit_full(composer, lambda m, xb: m(xb), spec, X, y, cfg.child_epochs, cfg.lr, device)
                 predictors.append(TaskPredictor("search", head, parents=parents, composer=composer))
             else:
