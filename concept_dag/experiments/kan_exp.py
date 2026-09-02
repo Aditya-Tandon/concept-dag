@@ -878,72 +878,82 @@ def run_exp3a_kan(
             if cfg.enable_update and not use_cnn and cfg.feature_dim is not None:
                 root_parent_idxs = [i for i, p in enumerate(parents) if p.is_root]
                 if root_parent_idxs:
-                    best = None
-                    for i in root_parent_idxs:
-                        p = parents[i]
-                        L_upd, mcopy = update_probe(
-                            X, Xraw, y, p.concept_module, i, spec,
-                            concept_dim=cfg.concept_dim, n_parents=len(parents),
-                            tr_idx=rec.split_meta["tr_idx"], val_idx=rec.split_meta["val_idx"],
-                            device=device, n_epochs=cfg.gate_epochs, update_lr=cfg.update_lr,
-                            composer_lr=cfg.gate_lr,
-                        )
-                        if best is None or L_upd < best[0]:
-                            best = (L_upd, mcopy, i, p)
-                    L_update, module_copy, best_i, best_p = best
-                    rel_update = (rec.L_reuse_bits - L_update) / max(rec.L_reuse_bits, 1e-6)
+                    # The probe (randperm in update_probe's training loop, deepcopy init, etc.)
+                    # consumes RNG state. Forked + deterministically reseeded so it neither leaks
+                    # into nor depends on the main run's RNG stream — otherwise every later task's
+                    # init/batch order would differ from a control run with enable_update=False,
+                    # and borderline decisions on later tasks would flip for an RNG reason rather
+                    # than because of the update rung. Matches _oracle_rungs' fork_rng usage above.
+                    with torch.random.fork_rng(devices=[]):
+                        torch.manual_seed(cfg.seed * 1000 + t + 500)
+                        best = None
+                        for i in root_parent_idxs:
+                            p = parents[i]
+                            L_upd, mcopy = update_probe(
+                                X, Xraw, y, p.concept_module, i, spec,
+                                concept_dim=cfg.concept_dim, n_parents=len(parents),
+                                tr_idx=rec.split_meta["tr_idx"], val_idx=rec.split_meta["val_idx"],
+                                device=device, n_epochs=cfg.gate_epochs, update_lr=cfg.update_lr,
+                                composer_lr=cfg.gate_lr,
+                            )
+                            if best is None or L_upd < best[0]:
+                                best = (L_upd, mcopy, i, p)
+                        L_update, module_copy, best_i, best_p = best
+                        rel_update = (rec.L_reuse_bits - L_update) / max(rec.L_reuse_bits, 1e-6)
 
-                    # Affected = every earlier task whose predictor reads `best_p`, directly or via
-                    # an ancestor chain (parent_models).
-                    affected: List[int] = []
-                    for tprime, pred in enumerate(predictors[:t]):
-                        reads = False
-                        if pred.kind == "grow" and pred.node is not None:
-                            if pred.node is best_p or _is_ancestor(best_p, pred.node):
-                                reads = True
-                        if not reads and pred.parents:
-                            if best_p in pred.parents or any(_is_ancestor(best_p, par)
-                                                             for par in pred.parents):
-                                reads = True
-                        if reads:
-                            affected.append(tprime)
+                        # Affected = every earlier task whose predictor reads `best_p`, directly or via
+                        # an ancestor chain (parent_models).
+                        affected: List[int] = []
+                        for tprime, pred in enumerate(predictors[:t]):
+                            reads = False
+                            if pred.kind == "grow" and pred.node is not None:
+                                if pred.node is best_p or _is_ancestor(best_p, pred.node):
+                                    reads = True
+                            if not reads and pred.parents:
+                                if best_p in pred.parents or any(_is_ancestor(best_p, par)
+                                                                 for par in pred.parents):
+                                    reads = True
+                            if reads:
+                                affected.append(tprime)
 
-                    orig_module = best_p.concept_module
-                    try:
-                        before_val = {tp: predictors[tp].accuracy(tasks[tp].get("val", tasks[tp]["test"]),
-                                                                   device) for tp in affected}
-                        before_test = {tp: predictors[tp].accuracy(tasks[tp]["test"], device)
-                                       for tp in affected}
-                        best_p.concept_module = module_copy
-                        after_val = {tp: predictors[tp].accuracy(tasks[tp].get("val", tasks[tp]["test"]),
-                                                                  device) for tp in affected}
-                        after_test = {tp: predictors[tp].accuracy(tasks[tp]["test"], device)
-                                     for tp in affected}
-                    finally:
-                        best_p.concept_module = orig_module
+                        orig_module = best_p.concept_module
+                        try:
+                            before_val = {tp: predictors[tp].accuracy(tasks[tp].get("val", tasks[tp]["test"]),
+                                                                       device) for tp in affected}
+                            before_test = {tp: predictors[tp].accuracy(tasks[tp]["test"], device)
+                                           for tp in affected}
+                            best_p.concept_module = module_copy
+                            after_val = {tp: predictors[tp].accuracy(tasks[tp].get("val", tasks[tp]["test"]),
+                                                                      device) for tp in affected}
+                            after_test = {tp: predictors[tp].accuracy(tasks[tp]["test"], device)
+                                         for tp in affected}
+                        finally:
+                            best_p.concept_module = orig_module
 
-                    backward_deltas_val = {str(tp): after_val[tp] - before_val[tp] for tp in affected}
-                    backward_deltas_test = {str(tp): after_test[tp] - before_test[tp] for tp in affected}
-                    backward_safe = all(after_val[tp] >= before_val[tp] - cfg.update_tolerance
-                                        for tp in affected)
+                        backward_deltas_val = {str(tp): after_val[tp] - before_val[tp] for tp in affected}
+                        backward_deltas_test = {str(tp): after_test[tp] - before_test[tp] for tp in affected}
+                        backward_safe = all(after_val[tp] >= before_val[tp] - cfg.update_tolerance
+                                            for tp in affected)
 
-                    selected = (rec.decision in ("reuse", "search") and rel_update > cfg.eps_update
-                               and backward_safe)
-                    logged_only = rec.decision == "grow"
+                        selected = (rec.decision in ("reuse", "search") and rel_update > cfg.eps_update
+                                   and backward_safe)
+                        logged_only = rec.decision == "grow"
 
-                    d["update"] = {
-                        "probed": True,
-                        "parent": sel_idx[best_i],
-                        "parent_task_id": best_p.task_id,
-                        "L_update": L_update,
-                        "rel_update": rel_update,
-                        "backward_safe": backward_safe,
-                        "backward_deltas_val": backward_deltas_val,
-                        "backward_deltas_test": backward_deltas_test,
-                        "selected": selected,
-                        "logged_only": logged_only,
-                    }
+                        d["update"] = {
+                            "probed": True,
+                            "parent": sel_idx[best_i],
+                            "parent_task_id": best_p.task_id,
+                            "L_update": L_update,
+                            "rel_update": rel_update,
+                            "backward_safe": backward_safe,
+                            "backward_deltas_val": backward_deltas_val,
+                            "backward_deltas_test": backward_deltas_test,
+                            "selected": selected,
+                            "logged_only": logged_only,
+                        }
 
+                    # Commit step (parent state mutation) stays in the main RNG stream — it only
+                    # runs when `selected`, and must not be shielded from it.
                     if selected:
                         best_p.concept_module.load_state_dict(module_copy.state_dict())
                         best_p.compute_concept_subspace(tasks[best_p.task_id]["train"], device,

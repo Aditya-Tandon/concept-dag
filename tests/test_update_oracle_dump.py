@@ -261,6 +261,72 @@ def test_update_never_overrides_grow(tmp_path):
     assert res["n_update"] == 0
 
 
+# ---------------------------------------------------------------------------
+# 5. Regression — the update probe must not perturb the main RNG stream
+# ---------------------------------------------------------------------------
+
+
+def _update_probe_rng_stream(feature_dim=24, seed=0):
+    """Three tasks sharing one under-trained root direction `w`. Task 0 is the forced root; tasks
+    1 and 2 are both routed through it, so the update probe (root_parent_idxs non-empty) runs on
+    each of them whenever enable_update=True."""
+    torch.manual_seed(seed)
+    w = torch.randn(feature_dim); w = w / w.norm()
+    task0 = _binary_stream(feature_dim, w, n_train=80, n_test=100, seed=seed + 1)
+    task1 = _binary_stream(feature_dim, w, n_train=120, n_test=100, seed=seed + 2)
+    task2 = _binary_stream(feature_dim, w, n_train=150, n_test=100, seed=seed + 3)
+    return [task0, task1, task2]
+
+
+def test_update_probe_does_not_perturb_main_rng_stream(tmp_path):
+    """Regression test for the update-probe RNG leak ([[reuse-with-update-arm-stress-test]]): with
+    enable_update=True, `update_probe`'s training loop (randperm, deepcopy init) used to run on the
+    GLOBAL torch RNG stream, so every task AFTER the probed one got a different init/batch order
+    than the enable_update=False control — a borderline gate decision on a later task could then
+    flip for an RNG reason, not because of the update rung. Fixed by running the probe +
+    backward-safety measurement inside `torch.random.fork_rng`, reseeded deterministically from
+    `cfg.seed * 1000 + t + 500` (mirrors `_oracle_rungs`'s fork_rng usage).
+
+    `eps_update` is pinned absurdly high so `rel_update > eps_update` can never hold — the update
+    rung is therefore NEVER selected on either task 1 or task 2, whatever the frozen ladder's own
+    decision turns out to be. That keeps the DAG's actual state (nodes, predictors, params)
+    IDENTICAL between the enable_update=False and enable_update=True runs, isolating the one thing
+    that's allowed to differ: whether the probe's own RNG consumption leaks into the global stream
+    and perturbs later tasks. With the fix, every gated task's decision and L_reuse_bits/L_grow_bits
+    must be bit-for-bit identical between the two runs. Before the fix, this test fails on task 2
+    (the task after the first probed one)."""
+    tasks = _update_probe_rng_stream(feature_dim=24, seed=1)
+
+    cfg_off = _update_cfg(tmp_path / "off", enable_update=False)
+    cfg_off.n_tasks = 3
+    res_off = run_exp3a_kan(cfg_off, tasks)
+
+    cfg_on = _update_cfg(tmp_path / "on", enable_update=True)
+    cfg_on.n_tasks = 3
+    cfg_on.eps_update = 10.0   # rel_update in [-1, 1] roughly -> can never clear this -> never selected
+    res_on = run_exp3a_kan(cfg_on, tasks)
+
+    probed_any = False
+    for t in range(1, 3):
+        d_off = res_off["decisions"][t]
+        d_on = res_on["decisions"][t]
+        assert "update" not in d_off
+
+        if "update" in d_on:
+            # Masking guaranteed by eps_update, not incidental to this test.
+            probed_any = True
+            assert d_on["update"]["probed"] is True
+            assert d_on["update"]["selected"] is False
+
+        # The only thing left that could diverge is RNG leakage — assert it doesn't.
+        assert d_on["decision"] == d_off["decision"]
+        assert d_on["L_reuse_bits"] == d_off["L_reuse_bits"]
+        assert d_on["L_grow_bits"] == d_off["L_grow_bits"]
+
+    assert probed_any, "expected the update probe to run on at least one of tasks 1, 2"
+    assert res_on["test_accs"] == res_off["test_accs"]
+
+
 if __name__ == "__main__":
     import tempfile, pathlib
     with tempfile.TemporaryDirectory() as td:
@@ -273,4 +339,6 @@ if __name__ == "__main__":
         test_update_rung_off_reproduces_frozen_ladder(pathlib.Path(td))
     with tempfile.TemporaryDirectory() as td:
         test_update_never_overrides_grow(pathlib.Path(td))
+    with tempfile.TemporaryDirectory() as td:
+        test_update_probe_does_not_perturb_main_rng_stream(pathlib.Path(td))
     print("\nUpdate/oracle/dump smoke tests passed.")
