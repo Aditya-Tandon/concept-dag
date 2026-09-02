@@ -717,6 +717,7 @@ def make_ctrl_stream(
     image_size: int = 32,
     download: bool = False,
     seed: int = 42,
+    n_test: Optional[int] = None,
 ) -> List[Dict]:
     """CTrL-style task streams with ground-truth task relations (Veniat et al. 2021).
 
@@ -741,6 +742,12 @@ def make_ctrl_stream(
         {"revisit_of": Optional[int], "relation": "same"|"input_shift"|"output_perm"|None,
          "n_train": int}
     so a decision trace can be scored against the known relation.
+
+    val_frac: fraction of n_train drawn as held-out val images, IN ADDITION to (not carved
+        out of) the n_train training images — each task samples n_train + n_val examples
+        from the train split.
+    n_test: number of test images per task. None (default) keeps the current behaviour,
+        max(500, n_train // 4). An int uses min(n_test, len(test_full)) test images.
     """
     stream = stream.lower()
     if stream not in _CTRL_STREAMS:
@@ -767,7 +774,8 @@ def make_ctrl_stream(
         take = order[: n_train + n_val]
         val_idx, tr_idx = take[:n_val].tolist(), take[n_val:].tolist()
         test_order = np.arange(len(test_full)); rng.shuffle(test_order)
-        test_idx = test_order[: max(500, n_train // 4)].tolist()
+        n_test_task = max(500, n_train // 4) if n_test is None else min(n_test, len(test_full))
+        test_idx = test_order[:n_test_task].tolist()
         return {
             "task_id": pos,
             "train": DataLoader(Subset(train_full, tr_idx), batch_size=batch_size,

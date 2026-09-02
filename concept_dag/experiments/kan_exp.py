@@ -31,7 +31,7 @@ from ..modules.concept_module import ConceptModule
 from ..models.baselines import LinearHead
 from ..training.kan_gate import (
     TaskSpec, classification_task, decide_reuse_vs_grow, decide_reuse_search_grow,
-    ReuseComposer, SearchComposer, _fit_full,
+    ReuseComposer, SearchComposer, _fit_full, update_probe,
 )
 from ..training.consolidate import low_rank_factorize_final_layer
 from ..utils.metrics import principal_angles_between
@@ -52,7 +52,9 @@ class TaskPredictor:
                  node: Optional[DAGNode] = None,
                  parents: Optional[List[DAGNode]] = None,
                  composer: Optional[ReuseComposer] = None):
-        assert kind in ("grow", "reuse", "search")   # search: like reuse but a SearchComposer
+        assert kind in ("grow", "reuse", "search", "update")   # search: like reuse but a
+                                                               # SearchComposer; update: like reuse
+                                                               # but over a refined parent
         self.kind, self.head, self.node, self.parents, self.composer = kind, head, node, parents, composer
         self.parent_adapters = None   # per-parent recovery adapters (reuse), installed by a merge
         self.node_adapter = None      # recovery adapter on the grown node's output, installed by a merge
@@ -553,6 +555,165 @@ class KanExpConfig(Exp3Config):
                                           # organic grow then mints a ROOT node. Feature-mode only
                                           # (use_cnn=False) — the parents-only probe cannot certify
                                           # obstructions on domains absent from the parents.
+    reducible_mode:      str   = "grow"   # "grow" | "best" — which normaliser DECIDES (both always
+                                          # recorded on the KanGateRecord).
+    gate_estimator:      str   = "single" # "single" | "crossfit" — how the gate's held-out code
+                                          # lengths are measured (decide_reuse_search_grow only).
+    gate_splits:         int   = 5        # crossfit folds (gate_estimator == "crossfit").
+    oracle_rungs:        bool  = False    # after the decision, ALSO train+eval the other rungs'
+                                          # predictors (reuse/search/grow) on task["test"], without
+                                          # altering the DAG — for post-hoc regret analysis.
+    dump_gate_tensors:   bool  = False    # write gate_dump.pt (feature mode only) — raw per-task
+                                          # tensors + node/predictor state, for offline desk-stage
+                                          # re-analysis without re-running training.
+    enable_update:       bool  = False    # the "update" rung: refine an existing root parent's
+                                          # concept in place instead of reuse/search/grow, gated by
+                                          # backward safety on earlier tasks.
+    update_lr:           float = 1e-4     # fine-tune rate for the copied concept in update_probe.
+    eps_update:          float = 0.1      # rel_update = (L_reuse - L_update)/L_reuse must exceed
+                                          # this for the update candidate to be eligible.
+    update_tolerance:    float = 0.01     # backward-safety tolerance on earlier tasks' VAL accuracy.
+
+
+# ---------------------------------------------------------------------------
+# Oracle rungs — post-hoc, without altering the DAG (§5)
+# ---------------------------------------------------------------------------
+
+
+def _oracle_rungs(rec, X: torch.Tensor, y: torch.Tensor, parents: List[DAGNode], task: Dict, t: int,
+                  cfg: "KanExpConfig", spec: TaskSpec, use_cnn: bool, device: str,
+                  chosen_acc: float) -> Dict[str, float]:
+    """Train + evaluate the rungs NOT chosen by the frozen ladder, on the same cache, WITHOUT
+    altering the DAG. The chosen rung's entry reuses `chosen_acc` rather than retraining. Wrapped in
+    `torch.random.fork_rng()` so it does not perturb the main run's RNG stream."""
+    accs: Dict[str, float] = {}
+    with torch.random.fork_rng():
+        if rec.decision == "reuse":
+            accs["reuse"] = chosen_acc
+        else:
+            oh = LinearHead(cfg.concept_dim, task["n_classes"])
+            oc = ReuseComposer(parent_dim=cfg.concept_dim, n_parents=len(parents), head=oh)
+            _fit_full(oc, lambda m, xb: m(xb), spec, X, y, cfg.child_epochs, cfg.lr, device)
+            accs["reuse"] = TaskPredictor("reuse", oh, parents=parents, composer=oc).accuracy(
+                task["test"], device)
+
+        if rec.decision == "search":
+            accs["search"] = chosen_acc
+        else:
+            meta = rec.search_meta or {}
+            oh = LinearHead(cfg.concept_dim, task["n_classes"])
+            if meta.get("trivial"):
+                oc = ReuseComposer(parent_dim=cfg.concept_dim, n_parents=len(parents), head=oh)
+            else:
+                oc = SearchComposer(parent_dim=cfg.concept_dim, n_parents=len(parents), head=oh,
+                                    rank=meta.get("rank", cfg.search_rank), subset=meta.get("subset"),
+                                    skip=meta.get("skip", cfg.search_skip))
+            _fit_full(oc, lambda m, xb: m(xb), spec, X, y, cfg.child_epochs, cfg.lr, device)
+            accs["search"] = TaskPredictor("search", oh, parents=parents, composer=oc).accuracy(
+                task["test"], device)
+
+        if rec.decision == "grow":
+            accs["grow"] = chosen_acc
+        else:
+            onode = DAGNode(task_id=t, concept_dim=cfg.concept_dim, cnn_out_dim=cfg.cnn_out_dim,
+                            n_mlp_layers=cfg.n_mlp_layers, parent_models=None,
+                            soft_pca_k=cfg.soft_pca_k, use_cnn=use_cnn, feature_dim=cfg.feature_dim)
+            ohead = LinearHead(cfg.concept_dim, task["n_classes"])
+            train_node(onode, ohead, task["train"], cfg.child_epochs, cfg.lr, device, cfg.log_every,
+                       name=f"t{t}-oracle-grow", orth_weight=cfg.orth_weight)
+            accs["grow"] = eval_node(onode, ohead, task["test"], device)
+            del onode, ohead
+            _flush(device)
+    return accs
+
+
+# ---------------------------------------------------------------------------
+# gate_dump.pt — raw per-task tensors + node/predictor state (§6, feature mode only)
+# ---------------------------------------------------------------------------
+
+
+def _cache_raw_capped(loader, max_batches: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    xs, ys = [], []
+    for i, (x, y) in enumerate(loader):
+        if max_batches and i >= max_batches:
+            break
+        xs.append(x.cpu())
+        ys.append(y.cpu())
+    return torch.cat(xs, 0), torch.cat(ys, 0)
+
+
+def _cache_raw_full(loader) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _cache_raw_capped(loader, max_batches=0)
+
+
+def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode],
+                     predictors: List[TaskPredictor], decisions: List[dict]) -> dict:
+    gate_dump_tasks = []
+    for t, task in enumerate(tasks):
+        train_raw, train_y = _cache_raw_capped(task["train"], cfg.routing_batches)
+        val_raw, val_y = _cache_raw_full(task.get("val", task["test"]))
+        test_raw, test_y = _cache_raw_full(task["test"])
+        gate_dump_tasks.append({
+            "task": t, "n_classes": task["n_classes"], "ctrl": task.get("ctrl"),
+            "train_raw": train_raw.float(), "train_y": train_y.long(),
+            "val_raw": val_raw.float(), "val_y": val_y.long(),
+            "test_raw": test_raw.float(), "test_y": test_y.long(),
+        })
+
+    node_index = {id(n): i for i, n in enumerate(nodes)}
+    gate_dump_nodes = []
+    for i, n in enumerate(nodes):
+        gate_dump_nodes.append({
+            "index": i, "task_id": n.task_id, "is_root": n.is_root,
+            "parent_indices": [node_index[id(p)] for p in n.parent_models],
+            "state_dict": {k: v.cpu() for k, v in n.concept_module.state_dict().items()},
+        })
+
+    gate_dump_preds = []
+    for t, pred in enumerate(predictors):
+        head_state = {k: v.cpu() for k, v in pred.head.state_dict().items()}
+        if pred.kind == "grow":
+            gate_dump_preds.append({
+                "task": t, "kind": pred.kind, "head_state": head_state,
+                "node_index": node_index.get(id(pred.node)), "parent_indices": None,
+                "composer_kind": None, "composer_state": None, "search_meta": None,
+            })
+        else:
+            composer = pred.composer
+            if isinstance(composer, SearchComposer):
+                composer_kind = "search"
+            elif isinstance(composer, ReuseComposer):
+                composer_kind = "reuse"
+            else:
+                composer_kind = None
+            composer_state = ({k: v.cpu() for k, v in composer.state_dict().items()}
+                              if composer is not None else None)
+            search_meta = decisions[t].get("search_meta") if pred.kind == "search" else None
+            gate_dump_preds.append({
+                "task": t, "kind": pred.kind, "head_state": head_state,
+                "node_index": None,
+                "parent_indices": [node_index.get(id(p)) for p in (pred.parents or [])],
+                "composer_kind": composer_kind, "composer_state": composer_state,
+                "search_meta": search_meta,
+            })
+
+    return {
+        "feature_mode": True,
+        "concept_dim": cfg.concept_dim,
+        "feature_dim": cfg.feature_dim,
+        "n_parents": cfg.n_parents,
+        "seed": cfg.seed,
+        "config": {k: getattr(cfg, k) for k in (
+            "gate_epochs", "gate_lr", "eps_rel", "eps_search", "search_budget", "search_rank",
+            "search_skip", "routing_batches", "child_epochs", "lr", "reducible_mode",
+            "gate_estimator", "gate_splits", "update_lr", "eps_update", "update_tolerance",
+            "subspace_k", "n_mlp_layers",
+        )},
+        "tasks": gate_dump_tasks,
+        "nodes": gate_dump_nodes,
+        "predictors": gate_dump_preds,
+        "decisions": decisions,
+    }
 
 
 def run_exp3a_kan(
@@ -625,6 +786,7 @@ def run_exp3a_kan(
             raw_kwargs = ({"raw_stack": Xraw, "root_module_factory": root_module_factory}
                           if use_raw_probe else {})
             force = t in cfg.force_grow_ids
+            split_gen = torch.Generator().manual_seed(cfg.seed * 1000 + t)
             if cfg.enable_search and not force:
                 # Three-way reuse/search/grow escalation (test-time-compute rung).
                 rec = decide_reuse_search_grow(
@@ -632,7 +794,8 @@ def run_exp3a_kan(
                     concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
                     n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_grow=cfg.eps_rel,
                     eps_search=cfg.eps_search, search_budget=cfg.search_budget, search_rank=cfg.search_rank,
-                    search_skip=cfg.search_skip,
+                    search_skip=cfg.search_skip, reducible_mode=cfg.reducible_mode,
+                    estimator=cfg.gate_estimator, n_splits=cfg.gate_splits, split_generator=split_gen,
                     **raw_kwargs,
                 )
             else:
@@ -640,6 +803,7 @@ def run_exp3a_kan(
                     X, y, new_module_factory(parents), spec,
                     concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
                     n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_rel=cfg.eps_rel,
+                    reducible_mode=cfg.reducible_mode,
                     **raw_kwargs,
                 )
             if force:
@@ -650,8 +814,8 @@ def run_exp3a_kan(
                 # duplicates, not stacked on it: find_redundant_pairs excludes ancestor/descendant
                 # pairs, so a child of the original could never be a merge candidate.
                 rec.decision = "grow"
-                decisions.append({"task": t, "decision": "grow", "parents": [], "reason": "force-grow(dup-stress,parallel-root)",
-                                  **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}})
+                d = {"task": t, "decision": "grow", "parents": [], "reason": "force-grow(dup-stress,parallel-root)",
+                     **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}}
             else:
                 d = {"task": t, "decision": rec.decision, "parents": sel_idx,
                      "grow_probe_input": rec.grow_probe_input,
@@ -660,7 +824,13 @@ def run_exp3a_kan(
                     v = getattr(rec, k, None)
                     if v is not None:
                         d[k] = v
-                decisions.append(d)
+                for k in ("L_null_bits", "reducible_grow", "reducible_best", "reducible_mode",
+                          "rel_search_best", "rel_grow_best", "rel_improvement_best",
+                          "n_rungs_above_null", "estimator_meta"):
+                    v = getattr(rec, k, None)
+                    if v is not None:
+                        d[k] = v
+            decisions.append(d)
 
             if rec.decision == "grow":
                 # A raw-probe grow certified a ROOT's view (raw encoder features), so mint a root —
@@ -697,6 +867,110 @@ def run_exp3a_kan(
                 predictors.append(TaskPredictor("reuse", head, parents=parents, composer=composer))
 
         acc = predictors[t].accuracy(task["test"], device)
+
+        if n_par > 0 and not force:
+            # --- Oracle rungs (§5): computed on the FROZEN state, before any update commit. ---
+            if cfg.oracle_rungs:
+                d["oracle_accs"] = _oracle_rungs(rec, X, y, parents, task, t, cfg, spec, use_cnn,
+                                                 device, acc)
+
+            # --- Update rung (§4): refinement placement, cannot mask a grow decision. ---
+            if cfg.enable_update and not use_cnn and cfg.feature_dim is not None:
+                root_parent_idxs = [i for i, p in enumerate(parents) if p.is_root]
+                if root_parent_idxs:
+                    # The probe (randperm in update_probe's training loop, deepcopy init, etc.)
+                    # consumes RNG state. Forked + deterministically reseeded so it neither leaks
+                    # into nor depends on the main run's RNG stream — otherwise every later task's
+                    # init/batch order would differ from a control run with enable_update=False,
+                    # and borderline decisions on later tasks would flip for an RNG reason rather
+                    # than because of the update rung. Matches _oracle_rungs' fork_rng usage above.
+                    with torch.random.fork_rng(devices=[]):
+                        torch.manual_seed(cfg.seed * 1000 + t + 500)
+                        best = None
+                        for i in root_parent_idxs:
+                            p = parents[i]
+                            L_upd, mcopy = update_probe(
+                                X, Xraw, y, p.concept_module, i, spec,
+                                concept_dim=cfg.concept_dim, n_parents=len(parents),
+                                tr_idx=rec.split_meta["tr_idx"], val_idx=rec.split_meta["val_idx"],
+                                device=device, n_epochs=cfg.gate_epochs, update_lr=cfg.update_lr,
+                                composer_lr=cfg.gate_lr,
+                            )
+                            if best is None or L_upd < best[0]:
+                                best = (L_upd, mcopy, i, p)
+                        L_update, module_copy, best_i, best_p = best
+                        rel_update = (rec.L_reuse_bits - L_update) / max(rec.L_reuse_bits, 1e-6)
+
+                        # Affected = every earlier task whose predictor reads `best_p`, directly or via
+                        # an ancestor chain (parent_models).
+                        affected: List[int] = []
+                        for tprime, pred in enumerate(predictors[:t]):
+                            reads = False
+                            if pred.kind == "grow" and pred.node is not None:
+                                if pred.node is best_p or _is_ancestor(best_p, pred.node):
+                                    reads = True
+                            if not reads and pred.parents:
+                                if best_p in pred.parents or any(_is_ancestor(best_p, par)
+                                                                 for par in pred.parents):
+                                    reads = True
+                            if reads:
+                                affected.append(tprime)
+
+                        orig_module = best_p.concept_module
+                        try:
+                            before_val = {tp: predictors[tp].accuracy(tasks[tp].get("val", tasks[tp]["test"]),
+                                                                       device) for tp in affected}
+                            before_test = {tp: predictors[tp].accuracy(tasks[tp]["test"], device)
+                                           for tp in affected}
+                            best_p.concept_module = module_copy
+                            after_val = {tp: predictors[tp].accuracy(tasks[tp].get("val", tasks[tp]["test"]),
+                                                                      device) for tp in affected}
+                            after_test = {tp: predictors[tp].accuracy(tasks[tp]["test"], device)
+                                         for tp in affected}
+                        finally:
+                            best_p.concept_module = orig_module
+
+                        backward_deltas_val = {str(tp): after_val[tp] - before_val[tp] for tp in affected}
+                        backward_deltas_test = {str(tp): after_test[tp] - before_test[tp] for tp in affected}
+                        backward_safe = all(after_val[tp] >= before_val[tp] - cfg.update_tolerance
+                                            for tp in affected)
+
+                        selected = (rec.decision in ("reuse", "search") and rel_update > cfg.eps_update
+                                   and backward_safe)
+                        logged_only = rec.decision == "grow"
+
+                        d["update"] = {
+                            "probed": True,
+                            "parent": sel_idx[best_i],
+                            "parent_task_id": best_p.task_id,
+                            "L_update": L_update,
+                            "rel_update": rel_update,
+                            "backward_safe": backward_safe,
+                            "backward_deltas_val": backward_deltas_val,
+                            "backward_deltas_test": backward_deltas_test,
+                            "selected": selected,
+                            "logged_only": logged_only,
+                        }
+
+                    # Commit step (parent state mutation) stays in the main RNG stream — it only
+                    # runs when `selected`, and must not be shielded from it.
+                    if selected:
+                        best_p.concept_module.load_state_dict(module_copy.state_dict())
+                        best_p.compute_concept_subspace(tasks[best_p.task_id]["train"], device,
+                                                        top_k=cfg.subspace_k,
+                                                        max_batches=cfg.routing_batches)
+                        best_p.freeze()
+                        X2, Xraw2, y2 = _cache_parent_stack(parents, task["train"], device,
+                                                            max_batches=cfg.routing_batches)
+                        composer2 = ReuseComposer(parent_dim=cfg.concept_dim, n_parents=len(parents),
+                                                  head=head)
+                        _fit_full(composer2, lambda m, xb: m(xb), spec, X2, y2, cfg.child_epochs,
+                                 cfg.lr, device)
+                        predictors[t] = TaskPredictor("update", head, parents=parents,
+                                                      composer=composer2)
+                        d["decision"] = "update"
+                        acc = predictors[t].accuracy(task["test"], device)
+
         test_accs.append(acc)
         param_curve.append(sum(p.numel() for n in nodes for p in n.concept_module.parameters()))
         print(f"  task {t:2d}: decision={decisions[t]['decision']:5s}  acc={acc:.4f}  "
@@ -725,13 +999,15 @@ def run_exp3a_kan(
     n_grow = sum(1 for d in decisions if d["decision"] == "grow")
     n_search = sum(1 for d in decisions if d["decision"] == "search")
     n_reuse = sum(1 for d in decisions if d["decision"] == "reuse")
+    n_update = sum(1 for d in decisions if d["decision"] == "update")
     results = {
         "average_accuracy": float(np.mean(test_accs)),
         "test_accs": test_accs,
         "n_grow": n_grow,
         "n_search": n_search,
         "n_reuse": n_reuse,
-        "reuse_rate": (len(tasks) - n_grow) / len(tasks),   # non-grow fraction (reuse+search)
+        "n_update": n_update,
+        "reuse_rate": (len(tasks) - n_grow) / len(tasks),   # non-grow fraction (reuse+search+update)
         "param_curve": param_curve,
         "params_final_pre_consolidation": param_curve[-1] if param_curve else 0,
         "consolidation": consolidation,
@@ -744,4 +1020,11 @@ def run_exp3a_kan(
           f"reuse_rate={results['reuse_rate']:.2f}  "
           f"params {results['params_final_pre_consolidation']}→{consolidation['params_after']}")
     print(f"Results saved to {out_path}")
+
+    if cfg.dump_gate_tensors and not use_cnn:
+        dump = _build_gate_dump(cfg, tasks, nodes, predictors, decisions)
+        dump_path = os.path.join(cfg.results_dir, "gate_dump.pt")
+        torch.save(dump, dump_path)
+        print(f"Gate tensor dump saved to {dump_path}")
+
     return results
