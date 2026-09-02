@@ -794,11 +794,20 @@ def decide_reuse_search_grow(
         perm = torch.randperm(n, generator=gen)
         folds = [perm[k::K] for k in range(K)]
         per = []
+        fold_sel_idx = []
         for k in range(K):
             sc = folds[k]
             rest = torch.cat([folds[j] for j in range(K) if j != k])
+            # rest = folds[0] ++ folds[1] ++ ... in fixed ascending order, so a positional prefix
+            # sel = rest[:n_sel] would be (almost) entirely fold 0's examples for every k != 0 —
+            # shuffle rest before slicing so each fold's selection subset is an independent draw.
+            # Reuse the caller's split_generator across folds (deterministic given its seed) when
+            # provided; otherwise fall back to a fresh per-fold generator so folds don't collide.
+            fold_gen = gen if gen is not None else torch.Generator().manual_seed(k)
+            rest = rest[torch.randperm(len(rest), generator=fold_gen)]
             n_sel = max(1, int(round(0.2 * len(rest))))
             sel, tr = rest[:n_sel], rest[n_sel:]
+            fold_sel_idx.append(sel)
             per.append(_fit_rungs(tr, sel, sc))
         def _mean(key): return float(sum(p[key] for p in per) / K)
         def _se(a, b):
@@ -817,10 +826,13 @@ def decide_reuse_search_grow(
             del search_cfg["trivial"]
         trace = per[rep]["trace"]; k_extra = per[rep]["k_extra"]
         est_meta = {"estimator": "crossfit", "n_splits": K,
-                    "n_train": int(len(per) and (n - len(folds[0]) - max(1, int(round(0.2 * (n - len(folds[0]))))))),
+                    "n_train": int(n - len(folds[0]) - max(1, int(round(0.2 * (n - len(folds[0])))))),
                     "n_select": int(max(1, int(round(0.2 * (n - len(folds[0])))))), "n_score": int(len(folds[0])),
-                    "folds": [{k2: (p[k2] if not isinstance(p[k2], (list, dict)) else None)
-                               for k2 in ("L_null", "L_reuse", "L_search", "L_grow")} for p in per],
+                    "folds": [{**{k2: (p[k2] if not isinstance(p[k2], (list, dict)) else None)
+                                  for k2 in ("L_null", "L_reuse", "L_search", "L_grow")},
+                               "sel_idx": fold_sel_idx[i].tolist(),
+                               "score_idx": folds[i].tolist()}
+                              for i, p in enumerate(per)],
                     "se_reuse_minus_search": _se("L_reuse", "L_search"),
                     "se_search_minus_grow": _se("L_search", "L_grow"),
                     "se_reuse_minus_grow": _se("L_reuse", "L_grow"),

@@ -102,6 +102,36 @@ def test_crossfit_estimator_grows_on_novel_domain():
     assert rec.rel_grow > 0.05
 
 
+def test_crossfit_selection_sets_independent_across_folds():
+    """Should-fix (code review): ``sel = rest[:n_sel]`` used to be a positional prefix of
+    ``torch.cat([folds[j] for j != k])`` — since ``rest`` is a fixed-order concatenation of the
+    surviving folds, that prefix was (for K=5) the identical 64-of-400 examples of fold 0 in 4 of
+    the 5 folds, silently correlating the crossfit "independent" selection subsets used by the
+    per-fold SE. Fixed by shuffling ``rest`` (with the caller's ``split_generator``) before
+    slicing off the selection set. This asserts each fold's selection subset is disjoint from its
+    own score (held-out) subset, and that no two folds land on the identical selection subset."""
+    torch.manual_seed(0)
+    X, y = _linear_ladder_case(n=500)
+    rec = decide_reuse_search_grow(
+        X, y, _child_probe_factory(2), classification_task(4),
+        concept_dim=DIM, n_parents=2, n_epochs=2, eps_grow=0.05, eps_search=0.05,
+        search_budget=1, estimator="crossfit", n_splits=5,
+        split_generator=torch.Generator().manual_seed(0),
+    )
+    folds = rec.estimator_meta["folds"]
+    assert len(folds) == 5
+
+    sel_sets = [set(f["sel_idx"]) for f in folds]
+    score_sets = [set(f["score_idx"]) for f in folds]
+
+    for sel, sc in zip(sel_sets, score_sets):
+        assert sel.isdisjoint(sc)
+
+    for i in range(len(sel_sets)):
+        for j in range(i + 1, len(sel_sets)):
+            assert sel_sets[i] != sel_sets[j], f"folds {i} and {j} share an identical selection set"
+
+
 # ---------------------------------------------------------------------------
 # 2. split determinism
 # ---------------------------------------------------------------------------

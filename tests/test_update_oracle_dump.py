@@ -170,6 +170,22 @@ def test_dump_gate_tensors_writes_gate_dump(tmp_path):
                     "composer_kind", "composer_state", "search_meta")) <= set(pdump.keys())
         assert pdump["kind"] in ("grow", "reuse", "search", "update")
 
+    # Should-fix (code review): `train_raw`/`train_y` used to be re-captured at dump time by
+    # re-iterating each task's (shuffle=True, global-RNG) loader — by then the main RNG stream
+    # had been consumed by every later task's training/decisions, so the dumped rows were almost
+    # certainly a DIFFERENT `routing_batches`-sized subsample than the one `_cache_parent_stack`
+    # fed the live gate decision, contradicting INTERFACE_SPEC.md §6 ("SAME cap/order as
+    # _cache_parent_stack"). Fixed by capturing (Xraw, y) once at decision time into `gate_cache`
+    # and dumping that instead of re-sampling post hoc. `_gate_cache_y` is a private,
+    # non-JSON-serialized key (only present when dump_gate_tensors=True) exposing exactly what
+    # each gated task's decision saw, so this can be checked without re-deriving
+    # `_cache_parent_stack`'s output after the fact.
+    assert "_gate_cache_y" in res
+    gated_tasks = [t for t in range(len(tasks)) if t in res["_gate_cache_y"]]
+    assert len(gated_tasks) > 0  # n_parents=2, n_tasks=3 -> tasks 1 and 2 are gated
+    for t in gated_tasks:
+        assert torch.equal(dump["tasks"][t]["train_y"], res["_gate_cache_y"][t])
+
 
 # ---------------------------------------------------------------------------
 # 3. Update rung

@@ -647,10 +647,22 @@ def _cache_raw_full(loader) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode],
-                     predictors: List[TaskPredictor], decisions: List[dict]) -> dict:
+                     predictors: List[TaskPredictor], decisions: List[dict],
+                     gate_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]]) -> dict:
     gate_dump_tasks = []
     for t, task in enumerate(tasks):
-        train_raw, train_y = _cache_raw_capped(task["train"], cfg.routing_batches)
+        if t in gate_cache:
+            # SAME cap/order as the (Xraw, y) that fed this task's live gate decision
+            # (INTERFACE_SPEC.md §6) — captured once at decision time in the main loop, not
+            # re-sampled here (re-sampling from the shuffled loader after the run would draw a
+            # different `routing_batches`-sized subset than `_cache_parent_stack` used).
+            train_raw, train_y = gate_cache[t]
+        else:
+            # No gate decision was made for this task (root: growth forced, nothing to
+            # reproduce) — re-sampling here is harmless, but fork the RNG so it doesn't perturb
+            # the main stream that later tasks' training/decisions already consumed.
+            with torch.random.fork_rng(devices=[]):
+                train_raw, train_y = _cache_raw_capped(task["train"], cfg.routing_batches)
         val_raw, val_y = _cache_raw_full(task.get("val", task["test"]))
         test_raw, test_y = _cache_raw_full(task["test"])
         gate_dump_tasks.append({
@@ -737,6 +749,9 @@ def run_exp3a_kan(
     decisions: List[dict] = []
     param_curve: List[int] = []
     test_accs: List[float] = []
+    # (Xraw, y) actually fed to each gated task's live decision, captured at decision time so
+    # `_build_gate_dump` can dump the SAME rows/order instead of re-sampling post hoc (§6).
+    gate_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def new_module_factory(parents: List[DAGNode]):
         def factory():
@@ -783,6 +798,7 @@ def run_exp3a_kan(
             # --- Kan gate on cached parent embeddings (+ raw features for the root grow probe) ---
             X, Xraw, y = _cache_parent_stack(parents, task["train"], device,
                                              max_batches=cfg.routing_batches)
+            gate_cache[t] = (Xraw, y)  # exact rows/order the live decision below sees
             raw_kwargs = ({"raw_stack": Xraw, "root_module_factory": root_module_factory}
                           if use_raw_probe else {})
             force = t in cfg.force_grow_ids
@@ -1021,8 +1037,15 @@ def run_exp3a_kan(
           f"params {results['params_final_pre_consolidation']}→{consolidation['params_after']}")
     print(f"Results saved to {out_path}")
 
+    if cfg.dump_gate_tensors:
+        # Private, non-JSON-serialized: the exact `y` each gated task's live decision saw, for
+        # tests to check `_build_gate_dump`'s "train_y" against without needing to re-derive
+        # `_cache_parent_stack`'s output post hoc. Added after the JSON write above (tensors
+        # aren't JSON-serializable) and only under this flag, so it never changes on-disk output.
+        results["_gate_cache_y"] = {t: yv for t, (_, yv) in gate_cache.items()}
+
     if cfg.dump_gate_tensors and not use_cnn:
-        dump = _build_gate_dump(cfg, tasks, nodes, predictors, decisions)
+        dump = _build_gate_dump(cfg, tasks, nodes, predictors, decisions, gate_cache)
         dump_path = os.path.join(cfg.results_dir, "gate_dump.pt")
         torch.save(dump, dump_path)
         print(f"Gate tensor dump saved to {dump_path}")
