@@ -608,9 +608,14 @@ def search_compose(
                 else {"subset": subsets[-1], "rank": rank, "skip": skip, "trivial": True})
     trace: List[Tuple[int, float]] = []
     for t, (sub, sd) in enumerate(candidates, start=1):
-        torch.manual_seed(sd)
-        model = SearchComposer(parent_dim=concept_dim, n_parents=n_parents,
-                               head=spec.make_head(concept_dim), rank=rank, subset=sub, skip=skip)
+        # Seed ONLY the candidate's initialisation, inside a forked RNG scope. Re-seeding the global
+        # generator here (the pre-2026-09-02 behaviour) silently made every later split permutation
+        # and initialisation in the run identical across --seed values, so multi-seed spreads
+        # under-stated seed variance (see search-on-raw-probe-fixed-result, claim ledger).
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(sd)
+            model = SearchComposer(parent_dim=concept_dim, n_parents=n_parents,
+                                   head=spec.make_head(concept_dim), rank=rank, subset=sub, skip=skip)
         L = _held_out_codelength(model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
                                  n_epochs=n_epochs, lr=lr, device=device)
         if L < best_L:

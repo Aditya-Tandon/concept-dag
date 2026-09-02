@@ -130,3 +130,18 @@ def test_search_never_scores_worse_than_reuse():
     assert rec.L_search_bits <= rec.L_reuse_bits + 1e-9
     # (the grow/reuse verdict is incidental here — at this toy width a fresh concept can legitimately
     # beat linear reuse; what this test pins is that the SEARCH rung never scores worse than reuse.)
+
+
+def test_search_does_not_reset_global_rng():
+    """search_compose must not touch the global RNG: two runs under different global seeds must
+    leave the generator in different states afterwards (before the fix, torch.manual_seed(cand)
+    inside the loop made everything downstream of the first Search call seed-independent)."""
+    from concept_dag.training.kan_gate import search_compose
+    X = torch.randn(200, 2, DIM); y = torch.randint(0, 4, (200,))
+    outs = []
+    for g in (1, 2):
+        torch.manual_seed(g)
+        search_compose(X[:140], y[:140], X[140:], y[140:], classification_task(4),
+                       concept_dim=DIM, n_parents=2, device="cpu", n_epochs=1, lr=1e-3, budget=2)
+        outs.append(torch.rand(1).item())
+    assert outs[0] != outs[1]
