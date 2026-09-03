@@ -565,6 +565,14 @@ class KanExpConfig(Exp3Config):
     preq_decide:         str   = "tail"   # "tail" | "total" — which prequential quantity DECIDES
                                           # (gate_estimator == "prequential").
     preq_exponent:       float = 0.5      # tail power-law exponent (gate_estimator == "prequential").
+    tie_rule:            str   = "none"   # "none" | "grow" — the select-score tie rule
+                                          # (gate_estimator == "select-score"); "grow" resolves a
+                                          # variance-limited search-vs-grow tie to grow on a novel task.
+    tie_z:               float = 1.0      # tie band width in SEs of the paired SCORE-bit difference
+                                          # (gate_estimator == "select-score", tie_rule == "grow").
+    tie_novelty:         float = 0.1      # novelty guard: (L_null - L_reuse)/L_null must be BELOW
+                                          # this for the tie rule to fire (gate_estimator ==
+                                          # "select-score", tie_rule == "grow").
     oracle_rungs:        bool  = False    # after the decision, ALSO train+eval the other rungs'
                                           # predictors (reuse/search/grow) on task["test"], without
                                           # altering the DAG — for post-hoc regret analysis.
@@ -841,6 +849,10 @@ def run_exp3a_kan(
             preq_kwargs = ({"preq_blocks": cfg.preq_blocks, "preq_decide": cfg.preq_decide,
                             "preq_exponent": cfg.preq_exponent}
                           if cfg.gate_estimator == "prequential" else {})
+            # select-score tie-rule kwargs are passed ONLY when selected, mirroring preq_kwargs —
+            # the call signature for every other gate_estimator is unchanged.
+            ss_kwargs = ({"tie_rule": cfg.tie_rule, "tie_z": cfg.tie_z, "tie_novelty": cfg.tie_novelty}
+                        if cfg.gate_estimator == "select-score" else {})
             force = t in cfg.force_grow_ids
             split_gen = torch.Generator().manual_seed(cfg.seed * 1000 + t)
             if cfg.enable_search and not force:
@@ -852,7 +864,7 @@ def run_exp3a_kan(
                     eps_search=cfg.eps_search, search_budget=cfg.search_budget, search_rank=cfg.search_rank,
                     search_skip=cfg.search_skip, reducible_mode=cfg.reducible_mode,
                     estimator=cfg.gate_estimator, n_splits=cfg.gate_splits, split_generator=split_gen,
-                    **raw_kwargs, **preq_kwargs,
+                    **raw_kwargs, **preq_kwargs, **ss_kwargs,
                 )
             else:
                 rec = decide_reuse_vs_grow(
