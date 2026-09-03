@@ -223,6 +223,34 @@ class _RootGrowModel(nn.Module):
         return self.head(self.module(raw_x))
 
 
+class _GrowModel(nn.Module):
+    """Grow probe in legacy (parents-only) mode: a fresh child ConceptModule over the SAME frozen
+    parent stack the reuse rung sees. Module level so every decider (and every estimator branch)
+    builds the identical probe."""
+
+    def __init__(self, module: ConceptModule, head: nn.Module):
+        super().__init__()
+        self.module = module
+        self.head = head
+
+    def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
+        outs = [parent_stack[:, i, :] for i in range(parent_stack.shape[1])]
+        return self.head(self.module(x=None, parent_outputs=outs))
+
+
+class _NullModel(nn.Module):
+    """Marginal (input-independent) predictor: the head applied to a zero embedding. Sets the
+    ``reducible`` scale every rung fraction is normalised by."""
+
+    def __init__(self, head: nn.Module, concept_dim: int):
+        super().__init__()
+        self.head = head
+        self.concept_dim = concept_dim
+
+    def forward(self, xb: torch.Tensor) -> torch.Tensor:
+        return self.head(torch.zeros(xb.shape[0], self.concept_dim, device=xb.device))
+
+
 # ---------------------------------------------------------------------------
 # The gate record (slots into the vault's gate_verdict convention)
 # ---------------------------------------------------------------------------
@@ -351,6 +379,181 @@ def _held_out_codelength(
                     sout = forward(model, score_X.to(device))
                     best_score = float(spec.nll_bits(sout, score_y.to(device)).mean().item())
     return best_val if score_X is None else best_score
+
+
+# ---------------------------------------------------------------------------
+# Prequential (online / description-length) code length — [[prequential-grow-probe]],
+# [[blier-ollivier-2018-description-length]]
+# ---------------------------------------------------------------------------
+
+
+def _blocks_from_order(order: torch.Tensor, n_blocks: int) -> List[torch.Tensor]:
+    """Split ``order`` (a permutation of the cache indices) into ``n_blocks`` near-equal CONTIGUOUS
+    chunks — the prequential coding schedule.
+
+    Contiguity in ``order`` is what makes the rungs *paired*: two rungs handed the same ``order``
+    see the identical block index sets, so their block curves differ only by model class, never by
+    which examples they were trained/scored on. The first ``N % B`` blocks get one extra element
+    (``numpy.array_split`` semantics). ``B`` is clamped to ``[2, N]`` — a single block has no
+    prediction step and would make the curve empty.
+    """
+    n = int(order.numel())
+    if n < 2:
+        raise ValueError(f"prequential coding needs at least 2 examples, got {n}")
+    B = max(2, min(int(n_blocks), n))
+    base, rem = divmod(n, B)
+    blocks, start = [], 0
+    for b in range(B):
+        size = base + (1 if b < rem else 0)
+        blocks.append(order[start : start + size])
+        start += size
+    return blocks
+
+
+def _fit_tail(curve: List[Tuple[int, float]], n_deploy: int, exponent: float) -> float:
+    """Extrapolate a prequential block curve to the DEPLOYED sample size.
+
+    Fits ``bits ≈ a + c · n_seen^(−exponent)`` by ordinary least squares in the two-function basis
+    ``{1, n^(−exponent)}`` (closed form, evaluated in float64) and returns the fit at
+    ``n_deploy``. Exponent ½ is the pre-registered default (Amari-style 1/√n learning curve of a
+    fixed-capacity predictor); {¼, ½, 1} are logged for sensitivity — see
+    [[prequential-grow-probe]].
+
+    Guards:
+      * fewer than 2 curve points → the last block's bits (nothing to extrapolate from);
+      * singular design (every ``n_seen`` identical, so the ``n^(−e)`` column has no variance) →
+        the last block's bits;
+      * the fit is CLAMPED to ``[min(bits) − 0.5, max(bits)]`` so a wild extrapolation cannot claim
+        more than half a bit beyond the best block actually observed, nor land above the worst.
+        Unclamped, a noisy 3–4 point curve can extrapolate arbitrarily far below zero and hand the
+        gate an unbounded ``reducible``. Note the floor is *relative*: on a nearly-solved task
+        (best block ≈ 0.1 bits) the clamped tail can still be slightly negative. It is an estimate
+        of a code length, not one — it enters the gate only through differences.
+
+    Bits are non-negative, so the tail is floored at 0 after the clamp above.
+    """
+    if not curve:
+        return float("nan")
+    bits = [float(b) for _, b in curve]
+    if len(curve) < 2:
+        return bits[-1]
+    e = float(exponent)
+    u = torch.tensor([float(n) ** (-e) for n, _ in curve], dtype=torch.float64)
+    b64 = torch.tensor(bits, dtype=torch.float64)
+    u_mean, b_mean = u.mean(), b64.mean()
+    du = u - u_mean
+    s_uu = float((du * du).sum())
+    # Scale-free singularity test: no spread in the regressor ⇒ {1, n^(−e)} is rank 1.
+    if s_uu <= 1e-24 * max(1.0, float((u * u).sum())):
+        return bits[-1]
+    c = float((du * (b64 - b_mean)).sum()) / s_uu
+    a = float(b_mean) - c * float(u_mean)
+    pred = a + c * float(n_deploy) ** (-e)
+    lo, hi = min(bits) - 0.5, max(bits)
+    tail = float(min(max(pred, lo), hi))
+    return max(tail, 0.0)
+
+
+def _prequential_codelength(
+    model: nn.Module,
+    forward: Callable[[nn.Module, torch.Tensor], torch.Tensor],
+    spec: TaskSpec,
+    X: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    n_blocks: int,
+    n_epochs: int,
+    lr: float,
+    device: str,
+    order: torch.Tensor,
+    n_classes_or_uniform_bits: float,
+    batch_size: int = 128,
+    tail_exponent: float = 0.5,
+    tail_exponents_logged: Tuple[float, ...] = (0.25, 0.5, 1.0),
+) -> dict:
+    """Code the task's own data ONLINE and report both MDL quantities the gate can decide on.
+
+    ``order`` (a permutation supplied by the caller — the SAME one for every rung of a task, so the
+    rungs are paired) is split into ``B`` contiguous blocks. Block 0 is coded at the uniform rate
+    (``n_classes_or_uniform_bits`` bits/sample: no model has seen anything yet). For ``b = 1..B−1``
+    the model is trained — WARM-STARTED, the same object keeps learning, so the whole curve costs
+    ≈2× one fit rather than B× — on the prefix ``blocks[:b]`` and then codes the not-yet-seen block
+    ``b``. There is no held-out set and no early stopping: every example is paid for exactly once,
+    as a prediction before it is trained on ([[blier-ollivier-2018-description-length]]).
+
+    Returns (all JSON-serialisable):
+      ``total``      strict prequential description length per sample — the honest MDL number,
+                     which CHARGES a data-hungry model class for its expensive early blocks;
+      ``curve``      ``[(n_seen_b, bits_b)]``, the learning curve measured on the task itself;
+      ``tail``       ``curve`` extrapolated to ``n_deploy = N`` via :func:`_fit_tail` — the bits the
+                     rung is expected to achieve once trained on ALL of the task's data, i.e. the
+                     regime the chosen rung is actually deployed in;
+      ``tail_by_exponent`` the same fit under each logged exponent (sensitivity, never decided on);
+      ``last_block``, ``n_deploy``, ``n_blocks``, ``tail_exponent``, ``uniform_bits``.
+
+    The model is left trained on ``blocks[:B−1]`` (everything but the last block).
+    """
+    blocks = _blocks_from_order(order, n_blocks)
+    B = len(blocks)
+    N = int(order.numel())
+    uniform_bits = float(n_classes_or_uniform_bits)
+
+    model = model.to(device)
+    curve: List[Tuple[int, float]] = []
+    weighted = uniform_bits * int(blocks[0].numel())  # block 0: coded before any training
+    for b in range(1, B):
+        prefix = torch.cat(blocks[:b])
+        m = int(prefix.numel())
+        # Warm start: the SAME model keeps its weights; only the optimiser state is refreshed for
+        # the enlarged prefix. Training matches _held_out_codelength exactly (AdamW, wd 1e-4,
+        # grad-clip 1.0) except that there is nothing to early-stop on.
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        for _ in range(n_epochs):
+            model.train()
+            perm = torch.randperm(m)
+            for i in range(0, m, batch_size):
+                idx = prefix[perm[i : i + batch_size]]
+                xb = X[idx].to(device)
+                yb = y[idx].to(device)
+                out = forward(model, xb)
+                loss = spec.nll_bits(out, yb).mean()  # bits/sample
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                opt.step()
+        model.eval()
+        with torch.no_grad():
+            bout = forward(model, X[blocks[b]].to(device))
+            bits_b = float(spec.nll_bits(bout, y[blocks[b]].to(device)).mean().item())
+        curve.append((m, bits_b))
+        weighted += bits_b * int(blocks[b].numel())
+
+    return {
+        "total": weighted / N,
+        "curve": curve,
+        "tail": _fit_tail(curve, N, tail_exponent),
+        "tail_by_exponent": {str(e): _fit_tail(curve, N, float(e)) for e in tail_exponents_logged},
+        "last_block": (curve[-1][1] if curve else uniform_bits),
+        "n_deploy": N,
+        "n_blocks": B,
+        "tail_exponent": float(tail_exponent),
+        "uniform_bits": uniform_bits,
+    }
+
+
+def _uniform_bits_for(y: torch.Tensor) -> float:
+    """Bits/sample of the uniform code that pays for the prequential first block.
+
+    Integer targets are classification labels: ``log2(n_classes)`` with ``n_classes`` read off the
+    cache (``max(y) + 1``). Continuous targets have no canonical uniform code, so the caller must
+    supply one explicitly (``preq_uniform_bits``) rather than have one invented here.
+    """
+    if y.is_floating_point() or y.is_complex():
+        raise ValueError(
+            "prequential coding needs the uniform first-block rate for a non-integer target; "
+            "pass preq_uniform_bits=<bits/sample> explicitly"
+        )
+    return math.log2(max(int(y.max().item()) + 1, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -500,17 +703,6 @@ def decide_reuse_vs_grow(
     else:
         new_module = new_module_factory()
         grow_head = spec.make_head(new_module.out_dim)
-
-        class _GrowModel(nn.Module):
-            def __init__(self, module: ConceptModule, head: nn.Module):
-                super().__init__()
-                self.module = module
-                self.head = head
-
-            def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
-                outs = [parent_stack[:, i, :] for i in range(parent_stack.shape[1])]
-                return self.head(self.module(x=None, parent_outputs=outs))
-
         grow_model = _GrowModel(new_module, grow_head)
         L_grow = _held_out_codelength(
             grow_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
@@ -518,16 +710,8 @@ def decide_reuse_vs_grow(
         )
 
     # --- Null (marginal) code length: best input-independent predictor. Sets the "reducible" scale. ---
-    class _NullModel(nn.Module):
-        def __init__(self, head: nn.Module):
-            super().__init__()
-            self.head = head
-
-        def forward(self, xb: torch.Tensor) -> torch.Tensor:
-            return self.head(torch.zeros(xb.shape[0], concept_dim, device=xb.device))
-
     L_null = _held_out_codelength(
-        _NullModel(spec.make_head(concept_dim)), lambda m, xb: m(xb), spec,
+        _NullModel(spec.make_head(concept_dim), concept_dim), lambda m, xb: m(xb), spec,
         Xtr, ytr, Xval, yval, n_epochs=max(n_epochs // 2, 10), lr=lr, device=device,
     )
 
@@ -609,7 +793,8 @@ def search_compose(
     n_epochs: int, lr: float, budget: int = 6, rank: int = 16, skip: bool = False,
     baseline_L: Optional[float] = None,
     score_X: Optional[torch.Tensor] = None, score_y: Optional[torch.Tensor] = None,
-) -> Tuple[float, dict, list]:
+    estimator_fn: Optional[Callable[[nn.Module, Callable], Tuple[float, dict]]] = None,
+):
     """Bounded search for the best composition of EXISTING concepts (the middle rung).
 
     Spends up to ``budget`` trained candidates over the (parent-subset × restart) space, each a
@@ -627,6 +812,15 @@ def search_compose(
     correctly routes the decision to reuse. Without it, the rank-``r`` bottleneck can score WORSE
     than full-rank linear reuse and Search can never win — measured in
     [[search-on-raw-probe-result]] (rel_search ∈ [−0.107, +0.017], Search never fired).
+
+    ``estimator_fn`` — when given, ``estimator_fn(model, forward) -> (deciding_bits, meta)`` REPLACES
+    :func:`_held_out_codelength` for every candidate (the prequential estimator supplies its own
+    data and schedule, so ``Xtr/ytr/Xval/yval`` and the score set are then unused). Candidates are
+    selected by ``deciding_bits`` — the same quantity the other rungs are compared on, so pairing
+    survives — and the return grows a FOURTH element: the winning candidate's ``meta`` (``None``
+    when the trivial composition won, i.e. no candidate beat ``baseline_L``; the caller then reuses
+    the reuse rung's meta, which is exactly what the trivial composition is). Without
+    ``estimator_fn`` the published 3-tuple return is unchanged.
     """
     subsets = _enumerate_subsets(n_parents)
     # Interleave: every subset once (seed 0), then extra restarts of each — best-first coverage.
@@ -643,6 +837,7 @@ def search_compose(
     best_cfg = ({"subset": subsets[-1], "rank": rank, "skip": skip} if baseline_L is None
                 else {"subset": subsets[-1], "rank": rank, "skip": skip, "trivial": True})
     trace: List[Tuple[int, float]] = []
+    best_meta: Optional[dict] = None
     # With a disjoint score set, candidates are SELECTED on (Xval) and the winner is REPORTED on
     # the score set: baseline_L is then the reuse rung's *score* bits, and the selection value of
     # the trivial composition is unknown, so the trivial composition wins ties on the score set.
@@ -655,12 +850,19 @@ def search_compose(
             torch.manual_seed(sd)
             model = SearchComposer(parent_dim=concept_dim, n_parents=n_parents,
                                    head=spec.make_head(concept_dim), rank=rank, subset=sub, skip=skip)
-        L = _held_out_codelength(model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
-                                 n_epochs=n_epochs, lr=lr, device=device, score_X=score_X, score_y=score_y)
+        if estimator_fn is None:
+            L = _held_out_codelength(model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+                                     n_epochs=n_epochs, lr=lr, device=device, score_X=score_X, score_y=score_y)
+            meta = None
+        else:
+            L, meta = estimator_fn(model, lambda m, xb: m(xb))
         if L < best_L:
             best_L, best_cfg = L, {"subset": sub, "rank": rank, "skip": skip}
+            best_meta = meta
         trace.append((t, best_L))
-    return best_L, best_cfg, trace
+    if estimator_fn is None:
+        return best_L, best_cfg, trace
+    return best_L, best_cfg, trace, best_meta
 
 
 def decide_reuse_search_grow(
@@ -687,6 +889,10 @@ def decide_reuse_search_grow(
     estimator: str = "single",
     n_splits: int = 5,
     split_generator: Optional[torch.Generator] = None,
+    preq_blocks: int = 5,
+    preq_decide: str = "tail",
+    preq_exponent: float = 0.5,
+    preq_uniform_bits: Optional[float] = None,
 ) -> KanGateRecord:
     """
     Three-way escalation: **reuse → search → grow** on one MDL axis.
@@ -718,6 +924,29 @@ def decide_reuse_search_grow(
         scoring never share examples; every rung is scored on the same folds (paired); the reported
         bits are the fold means and ``estimator_meta`` carries per-fold values and the across-fold
         SE of each rung difference.
+      * ``"prequential"``: no held-out set at all. The cache is ordered ONCE (``order``, shared by
+        every rung, so the rungs stay paired), split into ``preq_blocks`` contiguous blocks, and
+        each rung is coded online — train on the prefix, pay for the next block
+        ([[blier-ollivier-2018-description-length]], [[prequential-grow-probe]]). ``preq_decide``
+        picks which of the two resulting quantities DECIDES (both are always recorded):
+
+          - **"total"** — the strict description length: block 0 at the uniform rate plus every
+            block's bits, per sample. This is the MDL number, and it deliberately charges a rung
+            for its expensive early blocks: a data-hungry class pays for being data-hungry.
+          - **"tail"** (default) — the block curve ``bits(n_seen)`` extrapolated to ``n_deploy = N``
+            by ``a + c·n^(−preq_exponent)`` (:func:`_fit_tail`). This estimates the bits the rung
+            reaches once trained on ALL n.
+
+        They differ exactly where the gate was previously biased. Every held-out estimator trains
+        the grow rung on a FRACTION of the task (70 % single / 64 % crossfit) but deploys the grown
+        root on all of it, and grow is the rung whose code length falls fastest with n — so the
+        gate compared an under-trained grow probe against saturated linear rungs and chose Search
+        at a regret ([[gate-arms-multiseed-ctrl-result]]). ``tail`` scores every rung in the regime
+        it is deployed in and removes that training-fraction bias; ``total`` keeps the small-n
+        penalty (it is the right MDL quantity, not the right *deployment* quantity) and is
+        pre-registered as the companion arm predicted NOT to fix the regret. ``preq_exponent`` (½ by
+        default) is a sensitivity knob: ``estimator_meta`` logs the tail under {¼, ½, 1} for every
+        rung so the decision can be recomputed offline under any of them.
 
     Decision (cheapest sufficient rung): grow if ``rel_grow > eps_grow``; else search if
     ``rel_search > eps_search``; else reuse. See [[test-time-compute-search-level]].
@@ -726,6 +955,27 @@ def decide_reuse_search_grow(
     n = X.shape[0]
     use_raw = raw_stack is not None and root_module_factory is not None
     gen = split_generator
+
+    # --- Rung model factories. One definition per rung, shared by every estimator branch, called in
+    # the published order (reuse → search → grow → null) so the global-RNG consumption — and hence
+    # the "single"/"crossfit" numbers — is byte-identical to the pre-prequential code. ---
+    def _new_reuse_model() -> nn.Module:
+        return ReuseComposer(parent_dim=concept_dim, n_parents=n_parents, head=spec.make_head(concept_dim))
+
+    def _new_grow_model() -> nn.Module:
+        """Raw-root mode probes a real grown root's view (raw features, n_parents=0); legacy mode
+        probes a child over the same frozen parents. The probe reads ``grow_source`` below."""
+        if use_raw:
+            new_module = root_module_factory()
+            return _RootGrowModel(new_module, spec.make_head(new_module.out_dim))
+        new_module = new_module_factory()
+        return _GrowModel(new_module, spec.make_head(new_module.out_dim))
+
+    def _new_null_model() -> nn.Module:
+        return _NullModel(spec.make_head(concept_dim), concept_dim)
+
+    grow_source = raw_stack if use_raw else X   # the tensor the grow probe consumes
+    fwd = lambda m, xb: m(xb)                   # noqa: E731 — every rung is a plain callable module
 
     def _fit_rungs(tr, sel, sc):
         """Fit null/reuse/search/grow on one (train, select, score) index triple. ``sc`` may be None
@@ -736,43 +986,21 @@ def decide_reuse_search_grow(
             Rtr, Rsel = raw_stack[tr], raw_stack[sel]
             Rsc = raw_stack[sc] if sc is not None else None
         out = {}
-        reuse_model = ReuseComposer(parent_dim=concept_dim, n_parents=n_parents, head=spec.make_head(concept_dim))
-        out["L_reuse"] = _held_out_codelength(reuse_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xsel, ysel,
+        reuse_model = _new_reuse_model()
+        out["L_reuse"] = _held_out_codelength(reuse_model, fwd, spec, Xtr, ytr, Xsel, ysel,
                                               n_epochs=n_epochs, lr=lr, device=device, score_X=Xsc, score_y=ysc)
         out["L_search"], out["search_cfg"], out["trace"] = search_compose(
             Xtr, ytr, Xsel, ysel, spec, concept_dim=concept_dim, n_parents=n_parents,
             device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank,
             skip=search_skip, baseline_L=out["L_reuse"], score_X=Xsc, score_y=ysc)
+        grow_model = _new_grow_model()
         if use_raw:
-            new_module = root_module_factory()
-            grow_model = _RootGrowModel(new_module, spec.make_head(new_module.out_dim))
-            out["L_grow"] = _held_out_codelength(grow_model, lambda m, xb: m(xb), spec, Rtr, ytr, Rsel, ysel,
+            out["L_grow"] = _held_out_codelength(grow_model, fwd, spec, Rtr, ytr, Rsel, ysel,
                                                  n_epochs=n_epochs, lr=lr, device=device, score_X=Rsc, score_y=ysc)
         else:
-            new_module = new_module_factory()
-            grow_head = spec.make_head(new_module.out_dim)
-
-            class _GrowModel(nn.Module):
-                def __init__(self, module: ConceptModule, head: nn.Module):
-                    super().__init__()
-                    self.module = module; self.head = head
-
-                def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
-                    outs = [parent_stack[:, i, :] for i in range(parent_stack.shape[1])]
-                    return self.head(self.module(x=None, parent_outputs=outs))
-
-            grow_model = _GrowModel(new_module, grow_head)
-            out["L_grow"] = _held_out_codelength(grow_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xsel, ysel,
+            out["L_grow"] = _held_out_codelength(grow_model, fwd, spec, Xtr, ytr, Xsel, ysel,
                                                  n_epochs=n_epochs, lr=lr, device=device, score_X=Xsc, score_y=ysc)
-
-        class _NullModel(nn.Module):
-            def __init__(self, head: nn.Module):
-                super().__init__(); self.head = head
-
-            def forward(self, xb: torch.Tensor) -> torch.Tensor:
-                return self.head(torch.zeros(xb.shape[0], concept_dim, device=xb.device))
-
-        out["L_null"] = _held_out_codelength(_NullModel(spec.make_head(concept_dim)), lambda m, xb: m(xb), spec,
+        out["L_null"] = _held_out_codelength(_new_null_model(), fwd, spec,
                                              Xtr, ytr, Xsel, ysel, n_epochs=max(n_epochs // 2, 10), lr=lr,
                                              device=device, score_X=Xsc, score_y=ysc)
         out["k_extra"] = max(sum(p.numel() for p in grow_model.parameters())
@@ -840,6 +1068,62 @@ def decide_reuse_search_grow(
         # The update probe / any follow-up that needs ONE split uses fold 0's (train ∪ select, score).
         sc0 = folds[0]; rest0 = torch.cat([folds[j] for j in range(1, K)])
         split_meta = {"tr_idx": rest0.tolist(), "val_idx": sc0.tolist()}
+    elif estimator == "prequential":
+        if preq_decide not in ("tail", "total"):
+            raise ValueError(f"unknown preq_decide {preq_decide!r} (expected 'tail' or 'total')")
+        # ONE order for the whole call: every rung codes the identical blocks in the identical
+        # sequence, so their curves are paired and their difference is model class, not luck.
+        order = torch.randperm(n, generator=gen)
+        uniform_bits = (float(preq_uniform_bits) if preq_uniform_bits is not None
+                        else _uniform_bits_for(y))
+
+        def _code(model, forward, data):
+            return _prequential_codelength(model, forward, spec, data, y, n_blocks=preq_blocks,
+                                           n_epochs=n_epochs, lr=lr, device=device, order=order,
+                                           n_classes_or_uniform_bits=uniform_bits,
+                                           tail_exponent=preq_exponent)
+
+        # Same rung order as _fit_rungs (reuse → search → grow → null), same factories.
+        reuse_model = _new_reuse_model()
+        meta_reuse = _code(reuse_model, fwd, X)
+        L_reuse = meta_reuse[preq_decide]
+
+        def _estimator_fn(model, forward):
+            m = _code(model, forward, X)
+            return m[preq_decide], m
+
+        L_search, search_cfg, trace, meta_search = search_compose(
+            X, y, X, y, spec, concept_dim=concept_dim, n_parents=n_parents,
+            device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank,
+            skip=search_skip, baseline_L=L_reuse, estimator_fn=_estimator_fn)
+        if meta_search is None:      # trivial composition won ⇒ Search IS the reuse rung
+            meta_search = meta_reuse
+
+        grow_model = _new_grow_model()
+        meta_grow = _code(grow_model, fwd, grow_source)
+        L_grow = meta_grow[preq_decide]
+
+        # The null is a fixed marginal predictor; half the epochs suffice, as on the other branches.
+        meta_null = _prequential_codelength(_new_null_model(), fwd, spec, X, y, n_blocks=preq_blocks,
+                                            n_epochs=max(n_epochs // 2, 10), lr=lr, device=device,
+                                            order=order, n_classes_or_uniform_bits=uniform_bits,
+                                            tail_exponent=preq_exponent)
+        L_null = meta_null[preq_decide]
+
+        k_extra = max(sum(p.numel() for p in grow_model.parameters())
+                      - sum(p.numel() for p in reuse_model.parameters()), 0)
+        rungs = {"null": meta_null, "reuse": meta_reuse, "search": meta_search, "grow": meta_grow}
+        est_meta = {"estimator": "prequential", "n_blocks": int(meta_reuse["n_blocks"]),
+                    "decide": preq_decide, "exponent": float(preq_exponent), "n_train": int(n),
+                    "uniform_bits": uniform_bits, "rungs": rungs,
+                    # The deciding bits each rung WOULD have under the other rule, so the whole
+                    # decision can be recomputed offline under either (the P1/P2 arm comparison).
+                    "alt": {rule: {k: v[rule] for k, v in rungs.items()} for rule in ("tail", "total")}}
+        last = _blocks_from_order(order, preq_blocks)[-1]
+        n_last = int(last.numel())
+        # A follow-up probe (e.g. update_probe) needs ONE split: the prefix every rung was last
+        # trained on vs the final block it was scored on.
+        split_meta = {"tr_idx": order[: n - n_last].tolist(), "val_idx": order[n - n_last :].tolist()}
     else:
         raise ValueError(f"unknown estimator {estimator!r}")
 
