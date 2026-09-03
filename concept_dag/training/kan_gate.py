@@ -336,6 +336,7 @@ def _held_out_codelength(
     batch_size: int = 128,
     score_X: Optional[torch.Tensor] = None,
     score_y: Optional[torch.Tensor] = None,
+    return_both: bool = False,
 ) -> float:
     """
     Fit `model` on (train_X, train_y) minimising bit code length; return the **best** held-out
@@ -346,16 +347,27 @@ def _held_out_codelength(
     removes the min-over-evaluations optimism of scoring on the selection set (the cross-fit
     estimator of [[small-n-codelength-estimator-stress-test]]). Default None = published behaviour.
 
+    ``return_both`` (requires a score set) — instead of the single published scalar, return
+    ``(best_select_bits, score_bits_at_best_select, per_example_score_bits)``: the SELECT (val)
+    bits at the best-selection epoch, the SCORE bits at that same epoch (what the published path
+    already returns), and the per-example ``spec.nll_bits`` vector on the score set at that epoch
+    — the paired quantity the select-score estimator's standard errors are built from
+    ([[search-selection-optimism]]). Existing callers (``return_both=False``, the default) are
+    unaffected.
+
     Early stopping is essential, not cosmetic: without it an over-parameterised grow-probe overfits
     and its final val code length can exceed the reuse model's, masking a real obstruction. The
     minimum held-out code length is the honest estimate of what each model class can achieve, so the
     reuse-vs-grow comparison is between best-achievable code lengths, not arbitrary end-of-run ones.
     """
+    if return_both and score_X is None:
+        raise ValueError("return_both=True requires a score set (score_X/score_y)")
     model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     n = train_X.shape[0]
     best_val = float("inf")
     best_score = float("inf")
+    best_score_bits: Optional[torch.Tensor] = None
     for _ in range(n_epochs):
         model.train()
         perm = torch.randperm(n)
@@ -377,7 +389,12 @@ def _held_out_codelength(
                 best_val = val_bits
                 if score_X is not None:
                     sout = forward(model, score_X.to(device))
-                    best_score = float(spec.nll_bits(sout, score_y.to(device)).mean().item())
+                    per_example = spec.nll_bits(sout, score_y.to(device))
+                    best_score = float(per_example.mean().item())
+                    if return_both:
+                        best_score_bits = per_example.detach().cpu()
+    if return_both:
+        return best_val, best_score, best_score_bits
     return best_val if score_X is None else best_score
 
 
@@ -791,7 +808,8 @@ def search_compose(
     Xtr: torch.Tensor, ytr: torch.Tensor, Xval: torch.Tensor, yval: torch.Tensor,
     spec: TaskSpec, *, concept_dim: int, n_parents: int, device: str,
     n_epochs: int, lr: float, budget: int = 6, rank: int = 16, skip: bool = False,
-    baseline_L: Optional[float] = None,
+    baseline_L: Optional[float] = None, baseline_select_L: Optional[float] = None,
+    select_on: str = "score",
     score_X: Optional[torch.Tensor] = None, score_y: Optional[torch.Tensor] = None,
     estimator_fn: Optional[Callable[[nn.Module, Callable], Tuple[float, dict]]] = None,
 ):
@@ -813,15 +831,50 @@ def search_compose(
     than full-rank linear reuse and Search can never win — measured in
     [[search-on-raw-probe-result]] (rel_search ∈ [−0.107, +0.017], Search never fired).
 
+    ``select_on`` (only meaningful when a disjoint ``score_X/score_y`` is given and
+    ``estimator_fn`` is None) — which quantity picks the winner among the ``budget`` candidates:
+
+      * ``"score"`` (default, published behaviour) — the candidate with the lowest SCORE bits
+        wins. The winner is thus selected on the very set it is reported on — the candidate-
+        selection optimism [[search-selection-optimism]] measures.
+      * ``"select"`` — the candidate with the lowest SELECT (early-stop) bits wins; only the
+        WINNER's SCORE bits are read off and reported. ``baseline_select_L`` must then also be
+        given (the trivial composition's SELECT bits — mirrors ``baseline_L`` being its SCORE
+        bits): the trivial composition wins iff its SELECT bits are the lowest, in which case the
+        reported bits are ``baseline_L`` (its SCORE bits), exactly as the ``"score"`` path already
+        reports ``baseline_L`` when no candidate beats it.
+
     ``estimator_fn`` — when given, ``estimator_fn(model, forward) -> (deciding_bits, meta)`` REPLACES
     :func:`_held_out_codelength` for every candidate (the prequential estimator supplies its own
-    data and schedule, so ``Xtr/ytr/Xval/yval`` and the score set are then unused). Candidates are
-    selected by ``deciding_bits`` — the same quantity the other rungs are compared on, so pairing
-    survives — and the return grows a FOURTH element: the winning candidate's ``meta`` (``None``
-    when the trivial composition won, i.e. no candidate beat ``baseline_L``; the caller then reuses
-    the reuse rung's meta, which is exactly what the trivial composition is). Without
-    ``estimator_fn`` the published 3-tuple return is unchanged.
+    data and schedule, so ``Xtr/ytr/Xval/yval`` and the score set are then unused, and ``select_on``
+    does not apply). Candidates are selected by ``deciding_bits`` — the same quantity the other
+    rungs are compared on, so pairing survives — and the return grows a FOURTH element: the winning
+    candidate's ``meta`` (``None`` when the trivial composition won, i.e. no candidate beat
+    ``baseline_L``; the caller then reuses the reuse rung's meta, which is exactly what the trivial
+    composition is).
+
+    Return shape (unchanged paths are BYTE-IDENTICAL — same ``_held_out_codelength`` call, same
+    comparison key, same trace — to before ``select_on``/``baseline_select_L`` existed):
+      * no ``estimator_fn``, ``select_on="score"`` (the default, published behaviour, whether or
+        not a ``score_X`` is given — this is every existing caller) — the published 3-tuple
+        ``(L, cfg, trace)``, unchanged.
+      * ``estimator_fn`` given — the 4-tuple ``(L, cfg, trace, meta)`` above (``select_on`` does
+        not apply here).
+      * no ``estimator_fn``, ``select_on="select"`` AND a ``score_X`` given — the ONLY new path: a
+        6-tuple ``(L, cfg, trace, winner_select_bits, winner_per_example_score_bits,
+        score_argmin_L)``: the winner's SELECT bits and its per-example SCORE-set
+        ``spec.nll_bits`` vector (``baseline_select_L``/``None`` when the trivial composition won
+        and no per-candidate value is available for it — the caller then reuses the reuse rung's
+        own SELECT bits / per-example vector, exactly as ``baseline_L`` already stands in for the
+        trivial composition's reported bits), and ``score_argmin_L`` — the SCORE bits of whichever
+        candidate WOULD have won under ``select_on="score"``, computed for free from the same
+        per-candidate ``(sel_bits, L)`` pair every candidate already produces (no retraining): the
+        counterfactual the select-score estimator's ``search_selection_optimism`` is built from.
+        ``select_on="select"`` with no ``score_X`` falls back to the 3-tuple (there is nothing to
+        distinguish SELECT from SCORE without a disjoint score set).
     """
+    if select_on not in ("score", "select"):
+        raise ValueError(f"unknown select_on {select_on!r} (expected 'score' or 'select')")
     subsets = _enumerate_subsets(n_parents)
     # Interleave: every subset once (seed 0), then extra restarts of each — best-first coverage.
     candidates: List[Tuple[Tuple[int, ...], int]] = []
@@ -833,9 +886,22 @@ def search_compose(
                 break
         seed += 1
 
+    # use_select is the ONLY branch that changes behaviour or return shape versus the published
+    # function: select_on="score" (default) always takes the `else` arms below, byte-identical to
+    # the pre-select_on code (same _held_out_codelength call, same comparison key, same 3-tuple).
+    use_select = select_on == "select" and score_X is not None and estimator_fn is None
+
     best_L = float("inf") if baseline_L is None else float(baseline_L)
     best_cfg = ({"subset": subsets[-1], "rank": rank, "skip": skip} if baseline_L is None
                 else {"subset": subsets[-1], "rank": rank, "skip": skip, "trivial": True})
+    best_key = (float(baseline_select_L) if (use_select and baseline_select_L is not None)
+                else best_L)
+    best_select_bits: Optional[float] = baseline_select_L if use_select else None
+    best_score_bits_vec: Optional[torch.Tensor] = None
+    # The score-argmin counterfactual: tracked in the SAME pass, from the SAME trained candidates
+    # (every candidate's SCORE bits ``L`` is already computed for the SELECT-argmin above), so it
+    # costs nothing extra and is directly comparable — same models, same data, same seeds.
+    score_argmin_L: float = float("inf") if baseline_L is None else float(baseline_L)
     trace: List[Tuple[int, float]] = []
     best_meta: Optional[dict] = None
     # With a disjoint score set, candidates are SELECTED on (Xval) and the winner is REPORTED on
@@ -851,18 +917,35 @@ def search_compose(
             model = SearchComposer(parent_dim=concept_dim, n_parents=n_parents,
                                    head=spec.make_head(concept_dim), rank=rank, subset=sub, skip=skip)
         if estimator_fn is None:
-            L = _held_out_codelength(model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
-                                     n_epochs=n_epochs, lr=lr, device=device, score_X=score_X, score_y=score_y)
+            if use_select:
+                sel_bits, L, per_example = _held_out_codelength(
+                    model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+                    n_epochs=n_epochs, lr=lr, device=device,
+                    score_X=score_X, score_y=score_y, return_both=True)
+                cand_key = sel_bits
+                if L < score_argmin_L:
+                    score_argmin_L = L
+            else:
+                L = _held_out_codelength(model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+                                         n_epochs=n_epochs, lr=lr, device=device, score_X=score_X, score_y=score_y)
+                cand_key = L
             meta = None
         else:
             L, meta = estimator_fn(model, lambda m, xb: m(xb))
-        if L < best_L:
+            cand_key = L
+        if cand_key < best_key:
+            best_key = cand_key
             best_L, best_cfg = L, {"subset": sub, "rank": rank, "skip": skip}
             best_meta = meta
+            if use_select:
+                best_select_bits = sel_bits
+                best_score_bits_vec = per_example
         trace.append((t, best_L))
-    if estimator_fn is None:
+    if estimator_fn is not None:
+        return best_L, best_cfg, trace, best_meta
+    if not use_select:
         return best_L, best_cfg, trace
-    return best_L, best_cfg, trace, best_meta
+    return best_L, best_cfg, trace, best_select_bits, best_score_bits_vec, score_argmin_L
 
 
 def decide_reuse_search_grow(
@@ -893,6 +976,10 @@ def decide_reuse_search_grow(
     preq_decide: str = "tail",
     preq_exponent: float = 0.5,
     preq_uniform_bits: Optional[float] = None,
+    ss_fracs: Tuple[float, float, float] = (0.65, 0.15, 0.20),
+    tie_rule: str = "none",
+    tie_z: float = 1.0,
+    tie_novelty: float = 0.1,
 ) -> KanGateRecord:
     """
     Three-way escalation: **reuse → search → grow** on one MDL axis.
@@ -947,6 +1034,32 @@ def decide_reuse_search_grow(
         pre-registered as the companion arm predicted NOT to fix the regret. ``preq_exponent`` (½ by
         default) is a sensitivity knob: ``estimator_meta`` logs the tail under {¼, ½, 1} for every
         rung so the decision can be recomputed offline under any of them.
+      * ``"select-score"`` — [[search-selection-optimism]] (H5): ONE permutation, three DISJOINT
+        sets sized by ``ss_fracs`` (train / SELECT / SCORE, default 65/15/20 %). Every rung
+        early-stops on SELECT and is reported on SCORE (paired: all four rungs share the same three
+        sets). Unlike ``"single"``/``"crossfit"`` (where, with a score set, the Search rung's
+        best-of-``search_budget`` candidate is picked by the very SCORE bits it is then reported
+        on — the asymmetry H5 measures, since no other rung has a "pick the best of several" step),
+        here the Search candidate is chosen on SELECT (``search_compose(..., select_on="select")``)
+        and only the winner's SCORE bits are reported, removing that asymmetry. ``estimator_meta``
+        additionally carries per-rung SELECT/SCORE bits, ``search_select_bits``,
+        ``search_early_stop_optimism`` (SELECT bits − SCORE bits of the SELECT-chosen winner — the
+        early-stopping optimism every rung has), ``search_score_bits_selected_on_score`` and
+        ``search_selection_optimism``/``search_selection_optimism_abs`` (the SAME candidate set's
+        counterfactual score-argmin bits, and how much lower they read — the H5a asymmetry, live,
+        measured for free from the one search_compose pass), the three paired standard errors of
+        the SCORE-bit differences between rungs, ``se_split_proxy`` (the per-example SD the search-
+        vs-grow SE was built from), ``novelty`` (how much of the task reuse already explains),
+        ``tie_counterfactual`` (whether the tie rule would fire at z ∈ {0.5, 1, 2}, recorded
+        regardless of ``tie_rule``), and — only when ``tie_rule="grow"`` — a ``"tie"`` dict.
+
+    ``tie_rule`` (only consumed by ``estimator="select-score"``) — ``"none"`` (default, no effect)
+    or ``"grow"``: a free standard error from the SCORE-set paired differences lets the gate declare
+    a **tie** rather than force a decision variance cannot support. After the normal decision, if it
+    is not already "grow" and ``|L_search - L_grow| <= tie_z * se_search_minus_grow`` (the deciding
+    difference sits within ``tie_z`` SEs of zero) AND ``novelty < tie_novelty`` (the task is novel —
+    reuse explains little of it, so a grow-favouring tie-break cannot be the organic-duplicate grow
+    bias the raw-root probe was tested against), the decision becomes "grow".
 
     Decision (cheapest sufficient rung): grow if ``rel_grow > eps_grow``; else search if
     ``rel_search > eps_search``; else reuse. See [[test-time-compute-search-level]].
@@ -1124,6 +1237,100 @@ def decide_reuse_search_grow(
         # A follow-up probe (e.g. update_probe) needs ONE split: the prefix every rung was last
         # trained on vs the final block it was scored on.
         split_meta = {"tr_idx": order[: n - n_last].tolist(), "val_idx": order[n - n_last :].tolist()}
+    elif estimator == "select-score":
+        if tie_rule not in ("none", "grow"):
+            raise ValueError(f"unknown tie_rule {tie_rule!r} (expected 'none' or 'grow')")
+        fr_tr, fr_sel, fr_sc = ss_fracs
+        # SCORE and SELECT are fixed-size prefixes of ONE permutation; train gets everything else
+        # (desk_fraction.py's split order), so the three sets are disjoint and exactly cover N.
+        n_score = max(1, int(round(fr_sc * n)))
+        n_select = max(1, int(round(fr_sel * n)))
+        perm = torch.randperm(n, generator=gen)
+        sc_idx = perm[:n_score]
+        sel_idx = perm[n_score : n_score + n_select]
+        tr_idx = perm[n_score + n_select :]
+        n_train = int(tr_idx.numel())
+
+        Xtr, ytr, Xsel, ysel = X[tr_idx], y[tr_idx], X[sel_idx], y[sel_idx]
+        Xsc, ysc = X[sc_idx], y[sc_idx]
+        if use_raw:
+            Rtr, Rsel, Rsc = raw_stack[tr_idx], raw_stack[sel_idx], raw_stack[sc_idx]
+
+        # Every rung reuses the SAME model factories as the other estimator branches (no
+        # duplicated model code); only the fitting call (return_both=True, so each rung's own
+        # per-example SCORE bits are available for the paired SEs below) differs.
+        reuse_model = _new_reuse_model()
+        sel_reuse, L_reuse, pe_reuse = _held_out_codelength(
+            reuse_model, fwd, spec, Xtr, ytr, Xsel, ysel, n_epochs=n_epochs, lr=lr, device=device,
+            score_X=Xsc, score_y=ysc, return_both=True)
+
+        search_out = search_compose(
+            Xtr, ytr, Xsel, ysel, spec, concept_dim=concept_dim, n_parents=n_parents,
+            device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank,
+            skip=search_skip, baseline_L=L_reuse, baseline_select_L=sel_reuse,
+            select_on="select", score_X=Xsc, score_y=ysc)
+        L_search, search_cfg, trace, sel_search, pe_search, L_search_score_argmin = search_out
+        if pe_search is None:          # trivial composition won: Search IS reuse on SCORE
+            pe_search = pe_reuse
+        if sel_search is None:
+            sel_search = sel_reuse
+
+        grow_model = _new_grow_model()
+        if use_raw:
+            sel_grow, L_grow, pe_grow = _held_out_codelength(
+                grow_model, fwd, spec, Rtr, ytr, Rsel, ysel, n_epochs=n_epochs, lr=lr, device=device,
+                score_X=Rsc, score_y=ysc, return_both=True)
+        else:
+            sel_grow, L_grow, pe_grow = _held_out_codelength(
+                grow_model, fwd, spec, Xtr, ytr, Xsel, ysel, n_epochs=n_epochs, lr=lr, device=device,
+                score_X=Xsc, score_y=ysc, return_both=True)
+
+        null_model = _new_null_model()
+        sel_null, L_null, pe_null = _held_out_codelength(
+            null_model, fwd, spec, Xtr, ytr, Xsel, ysel, n_epochs=max(n_epochs // 2, 10), lr=lr,
+            device=device, score_X=Xsc, score_y=ysc, return_both=True)
+
+        k_extra = max(sum(p.numel() for p in grow_model.parameters())
+                      - sum(p.numel() for p in reuse_model.parameters()), 0)
+
+        def _paired_se(a: torch.Tensor, b: torch.Tensor) -> float:
+            """sd(a - b) / sqrt(n_score); 0.0 (not NaN) below 2 paired examples."""
+            d = (a - b).double()
+            m = int(d.numel())
+            if m < 2:
+                return 0.0
+            mean = d.mean()
+            var = ((d - mean) ** 2).sum() / (m - 1)
+            return float(torch.sqrt(var / m).item())
+
+        se_search_minus_grow = _paired_se(pe_search, pe_grow)
+        se_reuse_minus_grow = _paired_se(pe_reuse, pe_grow)
+        se_reuse_minus_search = _paired_se(pe_reuse, pe_search)
+        novelty = (L_null - L_reuse) / max(L_null, 1e-6)
+
+        # search_selection_optimism: how much lower Search's SCORE bits would read if its winning
+        # candidate were instead chosen BY the SCORE bits it is reported on (the pre-2026-09-03
+        # asymmetry) — <= 0 by construction, since the score-argmin can only find an L at least as
+        # low as the select-argmin's L among the identical candidate set.
+        search_selection_optimism = L_search_score_argmin - L_search
+
+        est_meta = {
+            "estimator": "select-score", "n_train": n_train, "n_select": n_select,
+            "n_score": n_score,
+            "select_bits": {"null": sel_null, "reuse": sel_reuse, "search": sel_search,
+                            "grow": sel_grow},
+            "score_bits": {"null": L_null, "reuse": L_reuse, "search": L_search, "grow": L_grow},
+            "search_select_bits": sel_search,
+            "search_early_stop_optimism": sel_search - L_search,
+            "search_score_bits_selected_on_score": L_search_score_argmin,
+            "search_selection_optimism": search_selection_optimism,
+            "search_selection_optimism_abs": abs(search_selection_optimism),
+            "se_search_minus_grow": se_search_minus_grow,
+            "se_reuse_minus_grow": se_reuse_minus_grow,
+            "se_reuse_minus_search": se_reuse_minus_search,
+            "novelty": novelty,
+        }
+        split_meta = {"tr_idx": torch.cat([tr_idx, sel_idx]).tolist(), "val_idx": sc_idx.tolist()}
     else:
         raise ValueError(f"unknown estimator {estimator!r}")
 
@@ -1149,11 +1356,42 @@ def decide_reuse_search_grow(
     else:
         decision = "reuse"
 
+    # Tie rule (select-score only; spec 1c/H5b) — a free SE from the paired SCORE-set differences
+    # lets the gate declare a tie rather than force a decision variance cannot support, resolved
+    # toward grow ONLY on a novel task (guards against re-introducing a grow-heavy prior).
+    if estimator == "select-score":
+        se = est_meta["se_search_minus_grow"]
+        novelty = est_meta["novelty"]
+        margin = L_search - L_grow
+        pre_tie_grow = (decision == "grow")   # the decision BEFORE any tie adjustment, for every z
+
+        def _tie_fires(z: float) -> bool:
+            return (not pre_tie_grow) and abs(margin) <= float(z) * se and novelty < tie_novelty
+
+        # Recorded for EVERY tie_rule (including "none"): what the tie rule would have done at
+        # each of a few canonical z's, so the firing rate can be recomputed offline without
+        # re-running the gate at each z ([[search-selection-optimism]] S2).
+        est_meta["tie_counterfactual"] = {str(z): bool(_tie_fires(z)) for z in (0.5, 1.0, 2.0)}
+        # The per-example SD the SE was built from (se = sd/sqrt(n_score)), so the desk's own
+        # per-unit SD measurement can be compared directly against the live ladder's.
+        est_meta["se_split_proxy"] = se * math.sqrt(max(est_meta["n_score"], 1))
+
+        if tie_rule == "grow":
+            fires = _tie_fires(tie_z)
+            est_meta["tie"] = {"fired": bool(fires), "margin": float(margin), "se": float(se),
+                               "novelty": float(novelty)}
+            if fires:
+                decision = "grow"
+
     probe_input = "raw-root" if use_raw else "parents"
     reason = (f"L_null={L_null:.3f} L_reuse={L_reuse:.3f} L_search={L_search:.3f} L_grow={L_grow:.3f} | "
               f"rel_search={rel_search:.3f} (eps {eps_search}) rel_grow={rel_grow:.3f} (eps {eps_grow}) "
               f"[{reducible_mode}-denominator; best: {rel_search_b:.3f}/{rel_grow_b:.3f}; {estimator}] "
               f"→ {decision}; search_subset={search_cfg['subset']}; grow_probe={probe_input}")
+    if estimator == "select-score" and "tie" in est_meta:
+        tie = est_meta["tie"]
+        reason += (f"; tie_rule={tie_rule} fired={tie['fired']} margin={tie['margin']:.4f} "
+                  f"se={tie['se']:.4f} novelty={tie['novelty']:.3f}")
     return KanGateRecord(
         task_name=spec.name, decision=decision,
         L_reuse_bits=L_reuse, L_grow_bits=L_grow,
