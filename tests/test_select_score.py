@@ -162,6 +162,39 @@ def test_select_score_ss_fracs_override_split_sizes():
     assert meta["n_train"] == 500
 
 
+@pytest.mark.parametrize("bad_ss_fracs", [
+    (0.1, 0.5, 0.5),     # sums to 1.1 — would silently starve train (n_train=0) without the guard
+    (0.65, 0.15, 0.10),  # sums to 0.90, not 1
+    (0.0, 0.5, 0.5),     # train fraction not positive
+    (0.5, -0.1, 0.6),    # a negative fraction
+    (0.5, 0.5),          # wrong arity
+])
+def test_select_score_bad_ss_fracs_raises_value_error(bad_ss_fracs):
+    torch.manual_seed(0)
+    X, y = _linear_ladder_case(n=500)
+    with pytest.raises(ValueError):
+        decide_reuse_search_grow(
+            X, y, _child_probe_factory(2), classification_task(4),
+            concept_dim=DIM, n_parents=2, n_epochs=1, eps_grow=0.05, eps_search=0.05,
+            search_budget=1, estimator="select-score", ss_fracs=bad_ss_fracs,
+            split_generator=torch.Generator().manual_seed(0),
+        )
+
+
+def test_select_score_ss_fracs_too_small_for_n_raises_value_error():
+    """A valid (sums to 1, all positive) ss_fracs can still starve a set at small n; that must
+    raise too, not silently clamp to size 1 (review finding #2)."""
+    torch.manual_seed(0)
+    X, y = _linear_ladder_case(n=8)
+    with pytest.raises(ValueError):
+        decide_reuse_search_grow(
+            X, y, _child_probe_factory(2), classification_task(4),
+            concept_dim=DIM, n_parents=2, n_epochs=1, eps_grow=0.05, eps_search=0.05,
+            search_budget=1, estimator="select-score", ss_fracs=(0.9, 0.05, 0.05),
+            split_generator=torch.Generator().manual_seed(0),
+        )
+
+
 # ---------------------------------------------------------------------------
 # 3. standard errors, the score-selection-optimism counterfactual, tie_counterfactual
 # ---------------------------------------------------------------------------

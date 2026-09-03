@@ -44,9 +44,17 @@ Gates (exact wording/thresholds from the hypothesis note's S0-S5):
                            A0 reference regret is 0.030; the drop is reported). grow count is
                            descriptive only (no threshold on it). Status "INCONCLUSIVE" (not
                            OK/reject) if the across-position SE >= 0.010.
-  S2 (H5b primary, Q2)     tie fired in >= 60% of the 10 t3 positions AND mean Q2 t3 regret
-                           <= 0.010. Firing counts at z in {0.5, 1, 2} are read off each
-                           position's ``tie_counterfactual`` and reported (descriptive).
+  S2 (H5b primary, Q2)     revised-table rule (search-selection-optimism.md, S2): over Q2's t3
+                           positions, ELIGIBLE = positions whose UN-TIED decision is not grow
+                           (read off the matching Q1 position when available — Q1 and Q2 share
+                           everything but the tie rule, so Q1's decision IS the pre-tie decision
+                           — else derived from Q2's own record: a fired tie implies the pre-tie
+                           decision was not grow, and an un-fired tie means the reported
+                           ``decision`` was never touched by the tie rule). Accept iff
+                           (a) tie fired in >= 50% of ELIGIBLE positions, (b) final grow count is
+                           >= 70% of ALL t3 positions, and (c) mean Q2 t3 regret <= 0.010. Firing
+                           counts at z in {0.5, 1, 2} are read off each position's
+                           ``tie_counterfactual`` and reported (descriptive).
   S3 (specificity)         tie fired at 0 positions outside t3, in Q2 CTrL (any stream, any task
                            != 3) and Q2 5-Datasets (any task). Every such position whose
                            ``novelty`` falls in [0.05, 0.20] (close to the tie_novelty=0.1 guard)
@@ -239,12 +247,28 @@ def s1_primary(q1: dict, t3: int = T3, regret_thresh: float = 0.015,
 
 
 # ---------------------------------------------------------------------------
-# S2 (H5b primary, Q2) — tie-fired fraction + mean regret
+# S2 (H5b primary, Q2) — revised-table rule: tie-fired fraction over the ELIGIBLE (un-tied
+# decision != grow) positions, AND a final-grow-fraction floor, AND mean regret.
 # ---------------------------------------------------------------------------
 
 
-def s2_tie_fixes(q2: dict, t3: int = T3, tie_frac_needed: float = 0.60,
-                 regret_ceiling: float = 0.010) -> dict:
+def s2_tie_fixes(q2: dict, q1: dict | None = None, t3: int = T3, tie_frac_needed: float = 0.50,
+                 grow_frac_needed: float = 0.70, regret_ceiling: float = 0.010) -> dict:
+    """search-selection-optimism.md's REVISED table, row S2.
+
+    ELIGIBLE = the t3 (s_minus + s_plus) positions of Q2 whose UN-TIED decision is not grow.
+    The un-tied decision for a (seed, stream) position is read from the matching Q1 record when
+    one is available (Q1 and Q2 are run with the same estimator/RNG stream and differ ONLY in the
+    tie rule, so Q1's decision at that position IS Q2's pre-tie decision). When no matching Q1
+    position exists it is derived from the Q2 record alone: ``decide_reuse_search_grow`` only
+    ever overrides ``decision`` when the tie fires, and firing itself requires the pre-tie
+    decision to not already be grow (its ``pre_tie_grow`` guard) — so a fired tie means the
+    position is eligible regardless of the (post-override) ``decision`` field, and an un-fired
+    tie means the reported ``decision`` was never touched, i.e. it IS the un-tied decision.
+
+    Accept iff (ties fired among ELIGIBLE / |ELIGIBLE|) >= tie_frac_needed AND
+    (final grow count / all positions) >= grow_frac_needed AND mean regret <= regret_ceiling.
+    """
     if not q2:
         return {"status": "SKIPPED", "reason": "Q2 missing/empty"}
     positions = list(_t3_positions(q2, t3))
@@ -255,22 +279,47 @@ def s2_tie_fixes(q2: dict, t3: int = T3, tie_frac_needed: float = 0.60,
     for seed, stream, d, regret, _results in positions:
         meta = d.get("estimator_meta") or {}
         tie = meta.get("tie") or {}
+        tie_fired = bool(tie.get("fired", False))
         tf = meta.get("tie_counterfactual") or {}
         for z in TIE_Z_GRID:
             if tf.get(z):
                 counterfactual_counts[z] += 1
-        rows.append({"seed": seed, "stream": stream, "decision": d.get("decision"),
-                    "regret": regret, "tie_fired": bool(tie.get("fired", False))})
+
+        final_decision = d.get("decision")
+        q1_decision = None
+        if q1 and seed in q1 and stream in q1.get(seed, {}):
+            q1_d = dec_at(q1[seed][stream], t3)
+            if q1_d is not None:
+                q1_decision = q1_d.get("decision")
+
+        if q1_decision is not None:
+            untied_decision = q1_decision
+            eligible = untied_decision != "grow"
+        else:
+            # No Q1 match — derive purely from Q2's own record (see docstring).
+            untied_decision = final_decision if not tie_fired else None
+            eligible = tie_fired or (final_decision != "grow")
+
+        rows.append({"seed": seed, "stream": stream, "decision": final_decision,
+                    "untied_decision": untied_decision, "untied_source": "Q1" if q1_decision is not None else "Q2",
+                    "regret": regret, "tie_fired": tie_fired, "eligible": eligible})
+
     n = len(rows)
-    tie_count = sum(1 for r in rows if r["tie_fired"])
-    tie_frac = tie_count / n
+    eligible_rows = [r for r in rows if r["eligible"]]
+    n_eligible = len(eligible_rows)
+    tie_count = sum(1 for r in eligible_rows if r["tie_fired"])
+    tie_frac = (tie_count / n_eligible) if n_eligible else None
+    grow_count = sum(1 for r in rows if r["decision"] == "grow")
+    grow_frac = grow_count / n
     mean_regret = _mean([r["regret"] for r in rows])
-    accept = (tie_frac >= tie_frac_needed and mean_regret is not None
-             and mean_regret <= regret_ceiling)
-    return {"status": "OK", "n_positions": n, "tie_count": tie_count, "tie_frac": tie_frac,
-            "tie_frac_needed": tie_frac_needed, "mean_regret": mean_regret,
-            "regret_ceiling": regret_ceiling, "counterfactual_counts": counterfactual_counts,
-            "accept": accept, "rows": rows}
+    accept = (tie_frac is not None and tie_frac >= tie_frac_needed
+             and grow_frac >= grow_frac_needed
+             and mean_regret is not None and mean_regret <= regret_ceiling)
+    return {"status": "OK", "n_positions": n, "n_eligible": n_eligible, "tie_count": tie_count,
+            "tie_frac": tie_frac, "tie_frac_needed": tie_frac_needed,
+            "grow_count": grow_count, "grow_frac": grow_frac, "grow_frac_needed": grow_frac_needed,
+            "mean_regret": mean_regret, "regret_ceiling": regret_ceiling,
+            "counterfactual_counts": counterfactual_counts, "accept": accept, "rows": rows}
 
 
 # ---------------------------------------------------------------------------
@@ -550,8 +599,8 @@ def main():
     s1 = s1_primary(q1)
     print(json.dumps({k: v for k, v in s1.items() if k != "rows"}, indent=2))
 
-    print("\n=== S2 (H5b primary, Q2): tie-fired fraction + mean regret over 10 positions ===")
-    s2 = s2_tie_fixes(q2)
+    print("\n=== S2 (H5b primary, Q2): eligible tie-fired fraction + final grow fraction + mean regret ===")
+    s2 = s2_tie_fixes(q2, q1)
     print(json.dumps({k: v for k, v in s2.items() if k != "rows"}, indent=2))
 
     print("\n=== S3 (specificity): tie firings outside t3 (Q2 CTrL + Q2 5ds); novelty gray zone ===")

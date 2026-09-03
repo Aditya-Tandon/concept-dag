@@ -1240,16 +1240,40 @@ def decide_reuse_search_grow(
     elif estimator == "select-score":
         if tie_rule not in ("none", "grow"):
             raise ValueError(f"unknown tie_rule {tie_rule!r} (expected 'none' or 'grow')")
+        if len(ss_fracs) != 3:
+            raise ValueError(f"ss_fracs must be a (train, select, score) triple, got {ss_fracs!r}")
         fr_tr, fr_sel, fr_sc = ss_fracs
+        if not (fr_tr > 0 and fr_sel > 0 and fr_sc > 0):
+            raise ValueError(
+                f"ss_fracs must be three POSITIVE fractions (train, select, score), got {ss_fracs!r}")
+        if abs((fr_tr + fr_sel + fr_sc) - 1.0) > 1e-6:
+            raise ValueError(
+                f"ss_fracs must sum to 1 (within 1e-6); got {ss_fracs!r} summing to "
+                f"{fr_tr + fr_sel + fr_sc}")
         # SCORE and SELECT are fixed-size prefixes of ONE permutation; train gets everything else
         # (desk_fraction.py's split order), so the three sets are disjoint and exactly cover N.
-        n_score = max(1, int(round(fr_sc * n)))
-        n_select = max(1, int(round(fr_sel * n)))
+        # No silent floor to size-1 here: an ss_fracs/n combination that would starve (or, via a
+        # bad fr_tr, invert) a set is a caller error, not a value to paper over deep inside the
+        # training loop.
+        n_score = int(round(fr_sc * n))
+        n_select = int(round(fr_sel * n))
+        n_train_expected = n - n_score - n_select
+        if n_score < 1 or n_select < 1 or n_train_expected < 1:
+            raise ValueError(
+                f"ss_fracs={ss_fracs!r} at n={n} produces an empty set "
+                f"(n_train={n_train_expected}, n_select={n_select}, n_score={n_score}); "
+                f"every set from ss_fracs must have size >= 1 — use larger fractions or more data")
+        # fr_tr is not just decorative: the resulting train size must actually track it (the
+        # rounding of the other two sets can move it by at most 1 each).
+        assert abs(n_train_expected - round(fr_tr * n)) <= 2, (
+            f"train set size {n_train_expected} does not track ss_fracs train fraction {fr_tr} "
+            f"(expected ~{round(fr_tr * n)} at n={n}); ss_fracs={ss_fracs!r}")
         perm = torch.randperm(n, generator=gen)
         sc_idx = perm[:n_score]
         sel_idx = perm[n_score : n_score + n_select]
         tr_idx = perm[n_score + n_select :]
         n_train = int(tr_idx.numel())
+        assert n_train == n_train_expected
 
         Xtr, ytr, Xsel, ysel = X[tr_idx], y[tr_idx], X[sel_idx], y[sel_idx]
         Xsc, ysc = X[sc_idx], y[sc_idx]

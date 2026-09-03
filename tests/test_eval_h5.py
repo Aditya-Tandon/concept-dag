@@ -37,6 +37,7 @@ eval_h5 = _load_script("eval_h5_arms", "eval_h5_arms.py")
 STREAMS = ("s_minus", "s_plus", "s_out", "s_in")
 G_STREAMS = ("s_minus", "s_plus")
 SEEDS = (42, 43, 44, 45, 46)
+SEEDS20 = tuple(range(42, 52))   # 10 seeds x 2 streams = 20 positions, Q1/Q2's real seed range
 
 
 # ===========================================================================
@@ -126,31 +127,81 @@ def test_s1_primary_skipped_when_missing():
 # --- s2_tie_fixes ---
 
 
-def test_s2_tie_fixes_accepts_high_fired_fraction_and_low_regret():
-    def tie_fn(seed, stream, idx):
-        fired = idx < 7   # 7/10 >= 60%
-        tie = {"fired": fired, "margin": 0.001, "se": 0.01, "novelty": 0.05}
-        tie_cf = {"0.5": fired, "1.0": fired, "2.0": fired}
-        return tie, tie_cf
+def _arm_eligible_mix(n_untied_grow, n_eligible, n_fired, regret=0.005, opt_abs=0.05, seeds=SEEDS20):
+    """Build a Q2 t3 arm with `n_untied_grow` positions whose UN-TIED decision was already grow
+    (the tie never fires there — ``decide_reuse_search_grow``'s ``pre_tie_grow`` guard) followed by
+    `n_eligible` positions whose un-tied decision was NOT grow, of which `n_fired` have a fired tie
+    (final ``decision`` overridden to "grow", mirroring the real gate's override) and the rest
+    un-fired (final ``decision`` stays at the non-grow un-tied decision, "search"). Requires
+    `len(seeds) * len(G_STREAMS) == n_untied_grow + n_eligible`."""
+    total = n_untied_grow + n_eligible
+    assert len(seeds) * len(G_STREAMS) == total, "seeds/streams must exactly cover the requested positions"
+    arm = {}
+    idx = 0
+    for seed in seeds:
+        for stream in G_STREAMS:
+            test_acc = 0.65 - regret
+            if idx < n_untied_grow:
+                decision = "grow"
+                tie = {"fired": False, "margin": 0.001, "se": 0.01, "novelty": 0.05}
+            else:
+                fired = (idx - n_untied_grow) < n_fired
+                decision = "grow" if fired else "search"
+                tie = {"fired": fired, "margin": 0.001, "se": 0.01, "novelty": 0.05}
+            tie_cf = {"0.5": tie["fired"], "1.0": tie["fired"], "2.0": tie["fired"]}
+            t3, _ = _t3_decision(decision, test_acc, opt_abs=opt_abs, tie=tie, tie_cf=tie_cf)
+            arm.setdefault(seed, {})[stream] = _results(t3, test_acc)
+            idx += 1
+    return arm
 
-    q2 = _arm_10_positions(regret=0.005, opt_abs=0.05, decision="grow", tie_fn=tie_fn)
+
+def test_s2_tie_fixes_accepts_with_eligible_denominator():
+    """20 positions: 10 whose un-tied decision was already grow, 10 non-grow of which 6 fire the
+    tie -> tie_frac = 6/10 (the ELIGIBLE, non-grow-un-tied denominator) = 60% >= 50%, final grow =
+    (10 + 6)/20 = 80% >= 70%. Regression for the review's denominator bug: the OLD code computed
+    tie_count/n_ALL = 6/20 = 30%, which would have wrongly rejected this exact scenario."""
+    q2 = _arm_eligible_mix(n_untied_grow=10, n_eligible=10, n_fired=6)
     g = eval_h5.s2_tie_fixes(q2)
     assert g["status"] == "OK"
-    assert g["tie_count"] == 7
-    assert g["tie_frac"] == pytest.approx(0.7)
+    assert g["n_positions"] == 20
+    assert g["n_eligible"] == 10
+    assert g["tie_count"] == 6
+    assert g["tie_frac"] == pytest.approx(0.6)
+    assert g["grow_count"] == 16
+    assert g["grow_frac"] == pytest.approx(0.8)
     assert g["mean_regret"] == pytest.approx(0.005)
     assert g["accept"] is True
-    assert g["counterfactual_counts"]["1.0"] == 7
+    assert g["counterfactual_counts"]["1.0"] == 6
 
 
-def test_s2_tie_fixes_rejects_low_fired_fraction():
-    def tie_fn(seed, stream, idx):
-        fired = idx < 3   # 3/10 < 60%
-        return {"fired": fired}, {"0.5": fired, "1.0": fired, "2.0": fired}
-
-    q2 = _arm_10_positions(regret=0.005, opt_abs=0.05, decision="search", tie_fn=tie_fn)
+def test_s2_tie_fixes_rejects_low_eligible_tie_frac():
+    """4/14 ties fired among the ELIGIBLE (non-grow-un-tied) positions -> 4/14 ~= 28.6% < 50%:
+    reject (this is the shape of a plausible real S2 outcome, not just a synthetic edge case)."""
+    q2 = _arm_eligible_mix(n_untied_grow=6, n_eligible=14, n_fired=4)
     g = eval_h5.s2_tie_fixes(q2)
+    assert g["status"] == "OK"
+    assert g["n_eligible"] == 14
+    assert g["tie_count"] == 4
+    assert g["tie_frac"] == pytest.approx(4 / 14)
     assert g["accept"] is False
+
+
+def test_s2_tie_fixes_uses_q1_decision_for_eligibility_when_available():
+    """When a matching Q1 (seed, stream) position exists, its decision is authoritative for the
+    un-tied decision (Q1 and Q2 share everything but the tie rule), not the Q2-alone derivation."""
+    q2 = _arm_eligible_mix(n_untied_grow=10, n_eligible=10, n_fired=6)
+    # Q1 = the same estimator with tie_rule="none": its decisions ARE Q2's pre-tie decisions.
+    q1 = _arm_eligible_mix(n_untied_grow=10, n_eligible=10, n_fired=0)
+    g = eval_h5.s2_tie_fixes(q2, q1)
+    assert g["n_eligible"] == 10
+    assert g["tie_count"] == 6
+    assert g["tie_frac"] == pytest.approx(0.6)
+    assert g["accept"] is True
+    assert all(r["untied_source"] == "Q1" for r in g["rows"])
+
+
+def test_s2_tie_fixes_skipped_when_missing():
+    assert eval_h5.s2_tie_fixes({})["status"] == "SKIPPED"
 
 
 # --- s3_specificity ---
