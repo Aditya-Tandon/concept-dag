@@ -148,10 +148,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reducible", type=str, default="grow", choices=["grow", "best"],
                         help="[5ds-kan/3a-kan/ctrl] which reducible-info normaliser DECIDES "
                              "reuse-vs-grow (both are always recorded)")
-    parser.add_argument("--gate_estimator", type=str, default="single", choices=["single", "crossfit"],
+    parser.add_argument("--gate_estimator", type=str, default="single",
+                        choices=["single", "crossfit", "prequential", "select-score"],
                         help="[5ds-kan/3a-kan/ctrl] codelength estimator for the gate")
     parser.add_argument("--gate_splits", type=int, default=5,
                         help="[5ds-kan/3a-kan/ctrl] folds for the crossfit gate estimator")
+    parser.add_argument("--preq_blocks", type=int, default=5,
+                        help="[5ds-kan/3a-kan/ctrl] prequential block count B "
+                             "(gate_estimator == prequential)")
+    parser.add_argument("--preq_decide", type=str, default="tail", choices=["tail", "total"],
+                        help="[5ds-kan/3a-kan/ctrl] which prequential quantity DECIDES "
+                             "(gate_estimator == prequential)")
+    parser.add_argument("--preq_exponent", type=float, default=0.5,
+                        help="[5ds-kan/3a-kan/ctrl] tail power-law exponent "
+                             "(gate_estimator == prequential)")
+    parser.add_argument("--tie_rule", type=str, default="none", choices=["none", "grow"],
+                        help="[5ds-kan/3a-kan/ctrl] select-score tie rule: 'grow' resolves a "
+                             "variance-limited search-vs-grow tie to grow on a novel task "
+                             "(gate_estimator == select-score)")
+    parser.add_argument("--tie_z", type=float, default=1.0,
+                        help="[5ds-kan/3a-kan/ctrl] tie band width in SEs of the paired SCORE-bit "
+                             "difference (gate_estimator == select-score, tie_rule == grow)")
+    parser.add_argument("--tie_novelty", type=float, default=0.1,
+                        help="[5ds-kan/3a-kan/ctrl] novelty guard threshold — (L_null-L_reuse)/L_null "
+                             "must be below this for the tie rule to fire "
+                             "(gate_estimator == select-score, tie_rule == grow)")
     parser.add_argument("--oracle_rungs", action="store_true",
                         help="[5ds-kan/3a-kan/ctrl] after the decision, also train the other "
                              "rungs' predictors and record test accuracy")
@@ -277,6 +298,12 @@ def main():
             reducible_mode = args.reducible,
             gate_estimator = args.gate_estimator,
             gate_splits = args.gate_splits,
+            preq_blocks = args.preq_blocks,
+            preq_decide = args.preq_decide,
+            preq_exponent = args.preq_exponent,
+            tie_rule    = args.tie_rule,
+            tie_z       = args.tie_z,
+            tie_novelty = args.tie_novelty,
             oracle_rungs = args.oracle_rungs,
             dump_gate_tensors = args.dump_gate_tensors,
             enable_update = args.enable_update,
@@ -342,6 +369,12 @@ def main():
             reducible_mode = args.reducible,
             gate_estimator = args.gate_estimator,
             gate_splits = args.gate_splits,
+            preq_blocks = args.preq_blocks,
+            preq_decide = args.preq_decide,
+            preq_exponent = args.preq_exponent,
+            tie_rule    = args.tie_rule,
+            tie_z       = args.tie_z,
+            tie_novelty = args.tie_novelty,
             oracle_rungs = args.oracle_rungs,
             dump_gate_tensors = args.dump_gate_tensors,
             enable_update = args.enable_update,
@@ -396,6 +429,12 @@ def main():
             reducible_mode = args.reducible,
             gate_estimator = args.gate_estimator,
             gate_splits = args.gate_splits,
+            preq_blocks = args.preq_blocks,
+            preq_decide = args.preq_decide,
+            preq_exponent = args.preq_exponent,
+            tie_rule    = args.tie_rule,
+            tie_z       = args.tie_z,
+            tie_novelty = args.tie_novelty,
             oracle_rungs = args.oracle_rungs,
             dump_gate_tensors = args.dump_gate_tensors,
             enable_update = args.enable_update,
