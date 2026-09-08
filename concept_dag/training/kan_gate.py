@@ -283,7 +283,11 @@ class KanGateRecord:
     grow_probe_input: str = "parents"
     # --- 2026-09-02 additions (all optional; None on paths that do not compute them) ---
     L_null_bits: Optional[float] = None          # marginal (input-independent) code length
-    reducible_grow: Optional[float] = None       # L_null − L_grow  (published normaliser)
+    reducible_grow: Optional[float] = None       # L_null − L_grow  (published runs up to 2026-09-03
+                                                  # used this normaliser as the default; "best" is the
+                                                  # default now — validated equal decisions in
+                                                  # best-rung-denominator-stress-test /
+                                                  # gate-arms-multiseed-ctrl-result)
     reducible_best: Optional[float] = None       # L_null − min(L_reuse, L_search, L_grow)
     reducible_mode: Optional[str] = None         # which normaliser DECIDED: "grow" | "best"
     rel_search_best: Optional[float] = None      # the fractions under the best-rung normaliser
@@ -668,7 +672,7 @@ def decide_reuse_vs_grow(
     bits_per_param_fn: Optional[Callable[[int, int], float]] = None,
     raw_stack: Optional[torch.Tensor] = None,
     root_module_factory: Optional[Callable[[], nn.Module]] = None,
-    reducible_mode: str = "grow",
+    reducible_mode: str = "best",
 ) -> KanGateRecord:
     """
     Backbone-agnostic reuse-vs-grow decision on a precomputed parent stack.
@@ -968,7 +972,7 @@ def decide_reuse_search_grow(
     bits_per_param_fn: Optional[Callable[[int, int], float]] = None,
     raw_stack: Optional[torch.Tensor] = None,
     root_module_factory: Optional[Callable[[], nn.Module]] = None,
-    reducible_mode: str = "grow",
+    reducible_mode: str = "best",
     estimator: str = "single",
     n_splits: int = 5,
     split_generator: Optional[torch.Generator] = None,
@@ -996,11 +1000,14 @@ def decide_reuse_search_grow(
       * ``rel_grow   = (L_search − L_grow)   / reducible`` — what a NEW concept adds beyond search
 
     ``reducible_mode`` picks the normaliser that DECIDES (both are always recorded):
-      * ``"grow"`` (published default): ``L_null − L_grow``. The slices telescope to exactly 1 but
-        are unbounded when grow is not the best rung (CTrL SVHN@400: rel_search +0.53 for a
-        0.12-bit gain) — see [[best-rung-denominator-stress-test]].
-      * ``"best"``: ``L_null − min(L_reuse, L_search, L_grow)``. Every |slice| ≤ 1 whenever all
-        rungs beat the null; additivity is lost when grow is not the best rung.
+      * ``"best"`` (default): ``L_null − min(L_reuse, L_search, L_grow)``. Every |slice| ≤ 1
+        whenever all rungs beat the null; additivity is lost when grow is not the best rung.
+      * ``"grow"``: ``L_null − L_grow`` — the normaliser published runs up to 2026-09-03 used as
+        the default. The slices telescope to exactly 1 but are unbounded when grow is not the best
+        rung (CTrL SVHN@400: rel_search +0.53 for a 0.12-bit gain) — see
+        [[best-rung-denominator-stress-test]]. Switching the default to "best" was validated to
+        give equal decisions in best-rung-denominator-stress-test and
+        gate-arms-multiseed-ctrl-result; ``"grow"`` stays reachable via ``reducible_mode="grow"``.
 
     ``estimator`` picks how the held-out code lengths are measured — [[small-n-codelength-estimator-stress-test]]:
       * ``"single"`` (published default): one random ``val_fraction`` split; each probe's bits are the

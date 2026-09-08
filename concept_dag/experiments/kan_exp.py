@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -555,8 +556,19 @@ class KanExpConfig(Exp3Config):
                                           # organic grow then mints a ROOT node. Feature-mode only
                                           # (use_cnn=False) — the parents-only probe cannot certify
                                           # obstructions on domains absent from the parents.
-    reducible_mode:      str   = "grow"   # "grow" | "best" — which normaliser DECIDES (both always
-                                          # recorded on the KanGateRecord).
+    reducible_mode:      str   = "best"   # "grow" | "best" — which normaliser DECIDES (both always
+                                          # recorded on the KanGateRecord). Published runs up to
+                                          # 2026-09-03 used "grow"; "best" is the default now —
+                                          # validated equal decisions in best-rung-denominator-
+                                          # stress-test / gate-arms-multiseed-ctrl-result. "grow"
+                                          # stays reachable via --reducible grow.
+    gate_cache_max:       int   = 16384   # samples the GATE's probe cache sees (0 = unlimited /
+                                          # full task). Separate from `routing_batches`, which still
+                                          # caps `route_for_task` / `compute_concept_subspace`: a
+                                          # cache capped at routing_batches * batch_size (2,560 by
+                                          # default) is far below the 50-70k a 5-Datasets root
+                                          # deploys on, so the grow probe was starved on data-rich
+                                          # tasks (5-Datasets SVHN, seed 42).
     gate_estimator:      str   = "single" # "single" | "crossfit" | "prequential" — how the gate's
                                           # held-out code lengths are measured (decide_reuse_search_grow
                                           # only).
@@ -691,20 +703,22 @@ def _cache_raw_full(loader) -> Tuple[torch.Tensor, torch.Tensor]:
 def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode],
                      predictors: List[TaskPredictor], decisions: List[dict],
                      gate_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]]) -> dict:
+    # Same GATE cache sizing as run_exp3a_kan's live decisions — separate from `routing_batches`.
+    gate_batches = math.ceil(cfg.gate_cache_max / cfg.batch_size) if cfg.gate_cache_max else 0
     gate_dump_tasks = []
     for t, task in enumerate(tasks):
         if t in gate_cache:
             # SAME cap/order as the (Xraw, y) that fed this task's live gate decision
             # (INTERFACE_SPEC.md §6) — captured once at decision time in the main loop, not
             # re-sampled here (re-sampling from the shuffled loader after the run would draw a
-            # different `routing_batches`-sized subset than `_cache_parent_stack` used).
+            # different `gate_cache_max`-sized subset than `_cache_parent_stack` used).
             train_raw, train_y = gate_cache[t]
         else:
             # No gate decision was made for this task (root: growth forced, nothing to
             # reproduce) — re-sampling here is harmless, but fork the RNG so it doesn't perturb
             # the main stream that later tasks' training/decisions already consumed.
             with torch.random.fork_rng(devices=[]):
-                train_raw, train_y = _cache_raw_capped(task["train"], cfg.routing_batches)
+                train_raw, train_y = _cache_raw_capped(task["train"], gate_batches)
         val_raw, val_y = _cache_raw_full(task.get("val", task["test"]))
         test_raw, test_y = _cache_raw_full(task["test"])
         gate_dump_tasks.append({
@@ -759,7 +773,7 @@ def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode
         "seed": cfg.seed,
         "config": {k: getattr(cfg, k) for k in (
             "gate_epochs", "gate_lr", "eps_rel", "eps_search", "search_budget", "search_rank",
-            "search_skip", "routing_batches", "child_epochs", "lr", "reducible_mode",
+            "search_skip", "routing_batches", "gate_cache_max", "child_epochs", "lr", "reducible_mode",
             "gate_estimator", "gate_splits", "update_lr", "eps_update", "update_tolerance",
             "subspace_k", "n_mlp_layers",
         )},
@@ -784,6 +798,10 @@ def run_exp3a_kan(
     device = cfg.device
     os.makedirs(cfg.results_dir, exist_ok=True)
     spec_factory = spec_factory or (lambda task: classification_task(task["n_classes"]))
+    # The GATE's probe cache is sized to the task (gate_cache_max samples), separate from
+    # `routing_batches` which still caps `route_for_task` / `compute_concept_subspace`. 0 means
+    # unlimited (no cap passed through to `_cache_parent_stack` / `_cache_raw_capped`).
+    gate_batches = math.ceil(cfg.gate_cache_max / cfg.batch_size) if cfg.gate_cache_max else 0
     use_cnn = (cfg.backbone == "smallcnn")
 
     nodes: List[DAGNode] = []
@@ -838,8 +856,11 @@ def run_exp3a_kan(
                                               device, cfg.routing_batches)
             parents = [nodes[i] for i in sel_idx]
             # --- Kan gate on cached parent embeddings (+ raw features for the root grow probe) ---
+            # Sized to `gate_cache_max`, NOT `routing_batches` — the gate's probe cache is the
+            # task's own budget, decoupled from the (much smaller) routing subspace cap.
             X, Xraw, y = _cache_parent_stack(parents, task["train"], device,
-                                             max_batches=cfg.routing_batches)
+                                             max_batches=gate_batches)
+            gate_cache_n = y.shape[0]
             gate_cache[t] = (Xraw, y)  # exact rows/order the live decision below sees
             raw_kwargs = ({"raw_stack": Xraw, "root_module_factory": root_module_factory}
                           if use_raw_probe else {})
@@ -883,10 +904,11 @@ def run_exp3a_kan(
                 # pairs, so a child of the original could never be a merge candidate.
                 rec.decision = "grow"
                 d = {"task": t, "decision": "grow", "parents": [], "reason": "force-grow(dup-stress,parallel-root)",
+                     "gate_cache_n": gate_cache_n,
                      **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}}
             else:
                 d = {"task": t, "decision": rec.decision, "parents": sel_idx,
-                     "grow_probe_input": rec.grow_probe_input,
+                     "grow_probe_input": rec.grow_probe_input, "gate_cache_n": gate_cache_n,
                      **{k: getattr(rec, k) for k in ("rel_improvement", "L_reuse_bits", "L_grow_bits")}}
                 for k in ("L_search_bits", "rel_search", "rel_grow", "search_meta", "search_trace"):
                     v = getattr(rec, k, None)
@@ -1029,7 +1051,7 @@ def run_exp3a_kan(
                                                         max_batches=cfg.routing_batches)
                         best_p.freeze()
                         X2, Xraw2, y2 = _cache_parent_stack(parents, task["train"], device,
-                                                            max_batches=cfg.routing_batches)
+                                                            max_batches=gate_batches)
                         composer2 = ReuseComposer(parent_dim=cfg.concept_dim, n_parents=len(parents),
                                                   head=head)
                         _fit_full(composer2, lambda m, xb: m(xb), spec, X2, y2, cfg.child_epochs,
