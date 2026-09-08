@@ -145,9 +145,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no_perturbation",     action="store_true",
                         help="Skip the exp3b-style perturbation test inside exp6")
     # Gate-estimator / denominator / update-arm arguments
-    parser.add_argument("--reducible", type=str, default="grow", choices=["grow", "best"],
+    parser.add_argument("--reducible", type=str, default="best", choices=["grow", "best"],
                         help="[5ds-kan/3a-kan/ctrl] which reducible-info normaliser DECIDES "
-                             "reuse-vs-grow (both are always recorded)")
+                             "reuse-vs-grow (both are always recorded). Published runs up to "
+                             "2026-09-03 used 'grow'; 'best' is the default now (validated equal "
+                             "decisions in best-rung-denominator-stress-test / "
+                             "gate-arms-multiseed-ctrl-result)")
+    parser.add_argument("--gate_cache_max", type=int, default=16384,
+                        help="[5ds-kan/3a-kan/ctrl] samples the GATE's probe cache sees (0 = "
+                             "unlimited / full task). Separate from --routing_batches, which still "
+                             "caps route_for_task / compute_concept_subspace.")
     parser.add_argument("--gate_estimator", type=str, default="single",
                         choices=["single", "crossfit", "prequential", "select-score"],
                         help="[5ds-kan/3a-kan/ctrl] codelength estimator for the gate")
@@ -295,6 +302,7 @@ def main():
             consolidate_every = getattr(args, "consolidate_every", 0),
             raw_grow_probe = args.raw_grow_probe,
             routing_batches = args.routing_batches,
+            gate_cache_max = args.gate_cache_max,
             reducible_mode = args.reducible,
             gate_estimator = args.gate_estimator,
             gate_splits = args.gate_splits,
@@ -366,6 +374,7 @@ def main():
             search_skip = args.search_skip,
             raw_grow_probe = args.raw_grow_probe,
             routing_batches = args.routing_batches,
+            gate_cache_max = args.gate_cache_max,
             reducible_mode = args.reducible,
             gate_estimator = args.gate_estimator,
             gate_splits = args.gate_splits,
@@ -426,6 +435,7 @@ def main():
             search_skip = args.search_skip,
             raw_grow_probe = args.raw_grow_probe,
             routing_batches = args.routing_batches,
+            gate_cache_max = args.gate_cache_max,
             reducible_mode = args.reducible,
             gate_estimator = args.gate_estimator,
             gate_splits = args.gate_splits,

@@ -90,10 +90,11 @@ def test_cli_flag_defaults():
     from run_experiment import build_parser
 
     args = build_parser().parse_args([])
-    assert args.reducible == "grow"
+    assert args.reducible == "best"
     assert args.gate_estimator == "single"
     assert args.gate_splits == 5
     assert args.routing_batches == 20
+    assert args.gate_cache_max == 16384
     assert args.ctrl_val_frac == 0.1
     assert args.ctrl_n_test is None
     assert args.update_lr == 1e-4
