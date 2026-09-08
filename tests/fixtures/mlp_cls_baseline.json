@@ -1,0 +1,248 @@
+{
+  "average_accuracy": 0.3141025641025641,
+  "consolidation": {
+    "n_ops": 0,
+    "ops": [],
+    "params_after": 704,
+    "params_before": 704,
+    "params_saved": 0
+  },
+  "decisions": [
+    {
+      "decision": "grow",
+      "reason": "root",
+      "task": 0
+    },
+    {
+      "L_grow_bits": 2.222961664199829,
+      "L_null_bits": 1.9979591369628906,
+      "L_reuse_bits": 1.8450814485549927,
+      "L_search_bits": 1.5297281742095947,
+      "decision": "search",
+      "estimator_meta": {
+        "estimator": "single",
+        "n_score": 34,
+        "n_select": 34,
+        "n_train": 81
+      },
+      "gate_cache_n": 115,
+      "grow_probe_input": "raw-root",
+      "n_rungs_above_null": 1,
+      "oracle_accs": {
+        "grow": 0.7692307692307693,
+        "reuse": 0.20512820512820512,
+        "search": 0.0
+      },
+      "oracle_val_bits": {
+        "grow": 1.3728712734423185,
+        "reuse": 2.1450530102378442,
+        "search": 2.4131922470895866
+      },
+      "parents": [
+        0
+      ],
+      "reducible_best": 0.4682309627532959,
+      "reducible_grow": 1e-06,
+      "reducible_mode": "best",
+      "rel_grow": -1.4805374807207892,
+      "rel_grow_best": -1.4805374807207892,
+      "rel_improvement": -0.8070380767278221,
+      "rel_search": 0.673499403992967,
+      "rel_search_best": 0.673499403992967,
+      "search_meta": {
+        "rank": 16,
+        "skip": true,
+        "subset": [
+          0
+        ]
+      },
+      "search_trace": [
+        [
+          1,
+          1.8450814485549927
+        ],
+        [
+          2,
+          1.717138409614563
+        ],
+        [
+          3,
+          1.6734557151794434
+        ],
+        [
+          4,
+          1.5297281742095947
+        ],
+        [
+          5,
+          1.5297281742095947
+        ],
+        [
+          6,
+          1.5297281742095947
+        ]
+      ],
+      "task": 1
+    },
+    {
+      "L_grow_bits": 2.5738525390625,
+      "L_null_bits": 2.023313522338867,
+      "L_reuse_bits": 1.654556393623352,
+      "L_search_bits": 1.6109089851379395,
+      "decision": "search",
+      "estimator_meta": {
+        "estimator": "single",
+        "n_score": 34,
+        "n_select": 34,
+        "n_train": 81
+      },
+      "gate_cache_n": 115,
+      "grow_probe_input": "raw-root",
+      "n_rungs_above_null": 1,
+      "oracle_accs": {
+        "grow": 0.7435897435897436,
+        "reuse": 0.20512820512820512,
+        "search": 0.28205128205128205
+      },
+      "oracle_val_bits": {
+        "grow": 1.2374065800717002,
+        "reuse": 2.0201899377923263,
+        "search": 1.9504905499910052
+      },
+      "parents": [
+        0
+      ],
+      "reducible_best": 0.41240453720092773,
+      "reducible_grow": 1e-06,
+      "reducible_mode": "best",
+      "rel_grow": -2.334948981066628,
+      "rel_grow_best": -2.334948981066628,
+      "rel_improvement": -2.229112588524353,
+      "rel_search": 0.10583639254227489,
+      "rel_search_best": 0.10583639254227489,
+      "search_meta": {
+        "rank": 16,
+        "skip": true,
+        "subset": [
+          0
+        ]
+      },
+      "search_trace": [
+        [
+          1,
+          1.654556393623352
+        ],
+        [
+          2,
+          1.654556393623352
+        ],
+        [
+          3,
+          1.654556393623352
+        ],
+        [
+          4,
+          1.654556393623352
+        ],
+        [
+          5,
+          1.6109089851379395
+        ],
+        [
+          6,
+          1.6109089851379395
+        ]
+      ],
+      "task": 2
+    },
+    {
+      "L_grow_bits": 2.0052542686462402,
+      "L_null_bits": 2.010758638381958,
+      "L_reuse_bits": 2.087675094604492,
+      "L_search_bits": 1.7418558597564697,
+      "decision": "search",
+      "estimator_meta": {
+        "estimator": "single",
+        "n_score": 34,
+        "n_select": 34,
+        "n_train": 81
+      },
+      "gate_cache_n": 115,
+      "grow_probe_input": "raw-root",
+      "n_rungs_above_null": 1,
+      "oracle_accs": {
+        "grow": 0.7692307692307693,
+        "reuse": 0.41025641025641024,
+        "search": 0.38461538461538464
+      },
+      "oracle_val_bits": {
+        "grow": 1.3471397349708958,
+        "reuse": 2.0716143407319723,
+        "search": 2.0179567086069206
+      },
+      "parents": [
+        0
+      ],
+      "reducible_best": 0.2689027786254883,
+      "reducible_grow": 0.0055043697357177734,
+      "reducible_mode": "best",
+      "rel_grow": -0.9795302608479776,
+      "rel_grow_best": -0.9795302608479776,
+      "rel_improvement": 0.30650789991665633,
+      "rel_search": 1.2860381607646338,
+      "rel_search_best": 1.2860381607646338,
+      "search_meta": {
+        "rank": 16,
+        "skip": true,
+        "subset": [
+          0
+        ]
+      },
+      "search_trace": [
+        [
+          1,
+          2.087675094604492
+        ],
+        [
+          2,
+          2.0747692584991455
+        ],
+        [
+          3,
+          1.7418558597564697
+        ],
+        [
+          4,
+          1.7418558597564697
+        ],
+        [
+          5,
+          1.7418558597564697
+        ],
+        [
+          6,
+          1.7418558597564697
+        ]
+      ],
+      "task": 3
+    }
+  ],
+  "n_grow": 1,
+  "n_reuse": 0,
+  "n_search": 3,
+  "n_update": 0,
+  "param_curve": [
+    704,
+    704,
+    704,
+    704
+  ],
+  "params_final_pre_consolidation": 704,
+  "reuse_rate": 0.75,
+  "test_accs": [
+    0.5897435897435898,
+    0.0,
+    0.28205128205128205,
+    0.38461538461538464
+  ]
+}
