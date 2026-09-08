@@ -21,6 +21,7 @@ import gc
 import json
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -29,6 +30,7 @@ import torch
 import torch.nn as nn
 
 from ..modules.concept_module import ConceptModule
+from ..modules.token_roots import AttnPoolRoot
 from ..models.baselines import LinearHead
 from ..training.kan_gate import (
     TaskSpec, classification_task, decide_reuse_vs_grow, decide_reuse_search_grow,
@@ -167,7 +169,12 @@ def distill_merge(keep: DAGNode, drop: DAGNode, loader, device: str,
     with torch.no_grad():
         for x, _y in loader:
             x = x.to(device)
-            xs.append(x.cpu())
+            # Token inputs (N, 1 + T, D) are cached half-precision: the merge caches BOTH tasks'
+            # full train splits, which at 65 x 384 float32 is ~100 kB/image (12 GB for two
+            # 60k-image tasks). The token feature cache is itself float16 round-tripped
+            # (feature_cache.cache_features), so the cast is exact. 2-D CLS features are
+            # float32 on disk and pass through unchanged.
+            xs.append(x.cpu().half() if x.ndim == 3 else x.cpu())
             tgt_keep_ref.append(forward_dag_memoized(keep, x).cpu())
             tgt_drop_ref.append(forward_dag_memoized(drop, x).cpu())
 
@@ -193,6 +200,8 @@ def distill_merge(keep: DAGNode, drop: DAGNode, loader, device: str,
     for _ in range(epochs):
         for xb, tk, td in zip(xs, tgt_keep_ref, tgt_drop_ref):
             xb, tk, td = xb.to(device), tk.to(device), td.to(device)
+            if xb.dtype == torch.float16:
+                xb = xb.float()
             out = forward_dag_memoized(keep, xb)                   # (B, D), grad flows into keep only
             loss = ((W_keep(out) - tk) ** 2).mean() + ((W_drop(out) - td) ** 2).mean()
             opt.zero_grad(); loss.backward(); opt.step()
@@ -667,7 +676,8 @@ def _oracle_rungs(rec, X: torch.Tensor, y: torch.Tensor, parents: List[DAGNode],
         else:
             onode = DAGNode(task_id=t, concept_dim=cfg.concept_dim, cnn_out_dim=cfg.cnn_out_dim,
                             n_mlp_layers=cfg.n_mlp_layers, parent_models=None,
-                            soft_pca_k=cfg.soft_pca_k, use_cnn=use_cnn, feature_dim=cfg.feature_dim)
+                            soft_pca_k=cfg.soft_pca_k, use_cnn=use_cnn, feature_dim=cfg.feature_dim,
+                           root_family=cfg.root_family)
             ohead = LinearHead(cfg.concept_dim, task["n_classes"])
             train_node(onode, ohead, task["train"], cfg.child_epochs, cfg.lr, device, cfg.log_every,
                        name=f"t{t}-oracle-grow", orth_weight=cfg.orth_weight)
@@ -804,10 +814,33 @@ def run_exp3a_kan(
     gate_batches = math.ceil(cfg.gate_cache_max / cfg.batch_size) if cfg.gate_cache_max else 0
     use_cnn = (cfg.backbone == "smallcnn")
 
+    # --- token-mode preconditions -------------------------------------------------------
+    if cfg.root_family == "attn_pool":
+        if use_cnn:
+            raise ValueError("root_family='attn_pool' requires a feature backbone, not smallcnn.")
+        if cfg.enable_update:
+            raise NotImplementedError(
+                "--enable_update is not supported with root_family='attn_pool': the update probe "
+                "packs the raw features into a flat (N, P*D + F) tensor (pack_update_input), which "
+                "a (N, 1 + T, D) token set has no 2-D form for. Run the update rung under "
+                "root_family='mlp_cls', or extend _UpdateModel to carry a token root."
+            )
+    dump_gate_tensors = cfg.dump_gate_tensors
+    if dump_gate_tensors and cfg.root_family == "attn_pool":
+        # gate_dump.pt stores every task's train/val/test raw inputs; in token mode that is
+        # ~100 kB/image (65 x 384 float32) — tens of GB for a 5-Datasets stream — and the desk
+        # scripts that read it all assume a 2-D feature matrix. Disabled loudly rather than
+        # silently writing something unusable.
+        print("[kan_exp] --dump_gate_tensors is disabled in token mode (root_family='attn_pool'): "
+              "the dump would hold (N, 1+T, D) token sets and the desk scripts expect (N, D). "
+              "Re-run with --root_family mlp_cls to produce a dump.")
+        dump_gate_tensors = False
+
     nodes: List[DAGNode] = []
     predictors: List[TaskPredictor] = []
     decisions: List[dict] = []
     param_curve: List[int] = []
+    param_curve_total: List[int] = []
     test_accs: List[float] = []
     # (Xraw, y) actually fed to each gated task's live decision, captured at decision time so
     # `_build_gate_dump` can dump the SAME rows/order instead of re-sampling post hoc (§6).
@@ -822,12 +855,22 @@ def run_exp3a_kan(
             )
         return factory
 
-    # Raw-root grow probe: capacity-matched to a real grown root DAGNode (ConceptModule on the raw
-    # encoder features, n_parents=0). Feature-mode only — in CNN mode the raw input is an image and
-    # the probe would need its own backbone, so we fall back to the parents-only probe there.
+    # Raw-root grow probe: capacity-matched to a real grown root DAGNode. Feature-mode only — in
+    # CNN mode the raw input is an image and the probe would need its own backbone, so we fall back
+    # to the parents-only probe there.
+    #
+    # The probe must be the SAME FAMILY as the root the decision would deploy, or L_grow prices a
+    # module the DAG would never build. In token mode that is `AttnPoolRoot` — AttentionPool
+    # (feature_dim → concept_dim) + the identical 2-layer ConceptModule the token-mode DAGNode
+    # root carries, in the same construction order; `tests/test_attn_root_adoption.py` asserts the
+    # parameter-count and structural parity. In CLS mode it is the published ConceptModule probe,
+    # unchanged.
     use_raw_probe = cfg.raw_grow_probe and not use_cnn and cfg.feature_dim is not None
+    token_root_mode = (not use_cnn) and cfg.root_family == "attn_pool"
 
     def root_module_factory():
+        if token_root_mode:
+            return AttnPoolRoot(feature_dim=cfg.feature_dim, concept_dim=cfg.concept_dim)
         return ConceptModule(
             module_id="__root_probe__", in_dim=cfg.feature_dim, hidden_dim=cfg.concept_dim,
             out_dim=cfg.concept_dim, n_layers=cfg.n_mlp_layers, n_parents=0,
@@ -842,7 +885,8 @@ def run_exp3a_kan(
             # Root: growth forced.
             node = DAGNode(task_id=t, concept_dim=cfg.concept_dim, cnn_out_dim=cfg.cnn_out_dim,
                            n_mlp_layers=cfg.n_mlp_layers, parent_models=None,
-                           soft_pca_k=cfg.soft_pca_k, use_cnn=use_cnn, feature_dim=cfg.feature_dim)
+                           soft_pca_k=cfg.soft_pca_k, use_cnn=use_cnn, feature_dim=cfg.feature_dim,
+                           root_family=cfg.root_family)
             train_node(node, head, task["train"], cfg.root_epochs, cfg.lr, device, cfg.log_every,
                        name=f"t{t}-root", orth_weight=cfg.orth_weight)
             node.compute_concept_subspace(task["train"], device, top_k=cfg.subspace_k,
@@ -861,7 +905,11 @@ def run_exp3a_kan(
             X, Xraw, y = _cache_parent_stack(parents, task["train"], device,
                                              max_batches=gate_batches)
             gate_cache_n = y.shape[0]
-            gate_cache[t] = (Xraw, y)  # exact rows/order the live decision below sees
+            if dump_gate_tensors:
+                # Only retained when a dump will be written: Xraw is the full gate cache
+                # (16,384 x 1+T x D in token mode ≈ 1.6 GB float32) and holding one per task
+                # would carry the whole stream's caches to the end of the run for nothing.
+                gate_cache[t] = (Xraw, y)  # exact rows/order the live decision below sees
             raw_kwargs = ({"raw_stack": Xraw, "root_module_factory": root_module_factory}
                           if use_raw_probe else {})
             # Prequential-estimator kwargs are passed ONLY when selected, so the call signature
@@ -876,6 +924,7 @@ def run_exp3a_kan(
                         if cfg.gate_estimator == "select-score" else {})
             force = t in cfg.force_grow_ids
             split_gen = torch.Generator().manual_seed(cfg.seed * 1000 + t)
+            gate_t0 = time.perf_counter()
             if cfg.enable_search and not force:
                 # Three-way reuse/search/grow escalation (test-time-compute rung).
                 rec = decide_reuse_search_grow(
@@ -895,6 +944,7 @@ def run_exp3a_kan(
                     reducible_mode=cfg.reducible_mode,
                     **raw_kwargs,
                 )
+            gate_seconds = time.perf_counter() - gate_t0
             if force:
                 # Merge stress-test: skip the gate and grow unconditionally, so a redundant
                 # concept exists for the consolidation pass to detect and merge. NOT a claim
@@ -920,6 +970,9 @@ def run_exp3a_kan(
                     v = getattr(rec, k, None)
                     if v is not None:
                         d[k] = v
+            # Wall time of the ladder itself (probe training + scoring) — the cost axis a token
+            # root moves most, since every rung's grow probe now reads 1 + T tokens per sample.
+            d["gate_seconds"] = gate_seconds
             decisions.append(d)
 
             if rec.decision == "grow":
@@ -929,7 +982,8 @@ def run_exp3a_kan(
                 grow_parents = None if grow_as_root else parents
                 node = DAGNode(task_id=t, concept_dim=cfg.concept_dim, cnn_out_dim=cfg.cnn_out_dim,
                                n_mlp_layers=cfg.n_mlp_layers, parent_models=grow_parents,
-                               soft_pca_k=cfg.soft_pca_k, use_cnn=use_cnn, feature_dim=cfg.feature_dim)
+                               soft_pca_k=cfg.soft_pca_k, use_cnn=use_cnn, feature_dim=cfg.feature_dim,
+                               root_family=cfg.root_family)
                 train_node(node, head, task["train"], cfg.child_epochs, cfg.lr, device, cfg.log_every,
                            name=f"t{t}-grow{'-root' if grow_as_root else ''}", orth_weight=cfg.orth_weight)
                 node.compute_concept_subspace(task["train"], device, top_k=cfg.subspace_k,
@@ -1063,6 +1117,11 @@ def run_exp3a_kan(
 
         test_accs.append(acc)
         param_curve.append(sum(p.numel() for n in nodes for p in n.concept_module.parameters()))
+        # `param_curve` keeps its published meaning (CONCEPT-MODULE parameters only, as in every
+        # earlier run, where a SmallCNN root's backbone was excluded too). `param_curve_total`
+        # is the whole node: in token mode that adds each root's AttentionPool, which is the
+        # honest parameter cost of the attention family. The two are equal in CLS feature mode.
+        param_curve_total.append(sum(p.numel() for n in nodes for p in n.parameters()))
         print(f"  task {t:2d}: decision={decisions[t]['decision']:5s}  acc={acc:.4f}  "
               f"nodes={len(nodes)}  params={param_curve[-1]}")
 
@@ -1099,8 +1158,15 @@ def run_exp3a_kan(
         "n_update": n_update,
         "reuse_rate": (len(tasks) - n_grow) / len(tasks),   # non-grow fraction (reuse+search+update)
         "param_curve": param_curve,
+        "param_curve_total": param_curve_total,
         "params_final_pre_consolidation": param_curve[-1] if param_curve else 0,
+        "params_total_pre_consolidation": param_curve_total[-1] if param_curve_total else 0,
+        "params_per_root": [sum(p.numel() for p in n.parameters()) for n in nodes if n.is_root],
         "consolidation": consolidation,
+        "root_family": cfg.root_family,
+        "n_tokens": cfg.n_tokens,
+        "feature_dim": cfg.feature_dim,
+        "gate_cache_max": cfg.gate_cache_max,
         "decisions": decisions,
     }
     out_path = os.path.join(cfg.results_dir, "exp3a_kan_results.json")
@@ -1111,14 +1177,14 @@ def run_exp3a_kan(
           f"params {results['params_final_pre_consolidation']}→{consolidation['params_after']}")
     print(f"Results saved to {out_path}")
 
-    if cfg.dump_gate_tensors:
+    if dump_gate_tensors:
         # Private, non-JSON-serialized: the exact `y` each gated task's live decision saw, for
         # tests to check `_build_gate_dump`'s "train_y" against without needing to re-derive
         # `_cache_parent_stack`'s output post hoc. Added after the JSON write above (tensors
         # aren't JSON-serializable) and only under this flag, so it never changes on-disk output.
         results["_gate_cache_y"] = {t: yv for t, (_, yv) in gate_cache.items()}
 
-    if cfg.dump_gate_tensors and not use_cnn:
+    if dump_gate_tensors and not use_cnn:
         dump = _build_gate_dump(cfg, tasks, nodes, predictors, decisions, gate_cache)
         dump_path = os.path.join(cfg.results_dir, "gate_dump.pt")
         torch.save(dump, dump_path)
