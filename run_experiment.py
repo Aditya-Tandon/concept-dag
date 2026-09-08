@@ -29,7 +29,7 @@ import argparse
 import torch
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Concept DAG experiment runner")
     parser.add_argument("--exp",      type=str,   default="1a",
                         choices=["1a", "1b", "2a", "2b", "3a", "3a-kan", "5ds-kan", "ctrl", "3b",
@@ -144,7 +144,41 @@ def main():
                         help="Path to exp3a_results.json baseline for AA comparison in exp6")
     parser.add_argument("--no_perturbation",     action="store_true",
                         help="Skip the exp3b-style perturbation test inside exp6")
-    args = parser.parse_args()
+    # Gate-estimator / denominator / update-arm arguments
+    parser.add_argument("--reducible", type=str, default="grow", choices=["grow", "best"],
+                        help="[5ds-kan/3a-kan/ctrl] which reducible-info normaliser DECIDES "
+                             "reuse-vs-grow (both are always recorded)")
+    parser.add_argument("--gate_estimator", type=str, default="single", choices=["single", "crossfit"],
+                        help="[5ds-kan/3a-kan/ctrl] codelength estimator for the gate")
+    parser.add_argument("--gate_splits", type=int, default=5,
+                        help="[5ds-kan/3a-kan/ctrl] folds for the crossfit gate estimator")
+    parser.add_argument("--oracle_rungs", action="store_true",
+                        help="[5ds-kan/3a-kan/ctrl] after the decision, also train the other "
+                             "rungs' predictors and record test accuracy")
+    parser.add_argument("--dump_gate_tensors", action="store_true",
+                        help="[5ds-kan/3a-kan/ctrl] write gate_dump.pt (feature mode only)")
+    parser.add_argument("--enable_update", action="store_true",
+                        help="[5ds-kan/3a-kan/ctrl] enable the update rung (refinement placement)")
+    parser.add_argument("--update_lr", type=float, default=1e-4,
+                        help="[update] learning rate for the update probe")
+    parser.add_argument("--eps_update", type=float, default=0.1,
+                        help="[update] min relative improvement (L_reuse - L_update)/L_reuse "
+                             "the update probe must exceed to be eligible for selection")
+    parser.add_argument("--update_tolerance", type=float, default=0.01,
+                        help="[update] backward-safety tolerance on earlier tasks' VAL accuracy")
+    parser.add_argument("--routing_batches", type=int, default=20,
+                        help="[5ds-kan/3a-kan/ctrl] batches used to compute a node's routing subspace")
+    parser.add_argument("--ctrl_val_frac", type=float, default=0.1,
+                        help="[ctrl] fraction of n_train drawn as held-out val images per task, "
+                             "in addition to the n_train training images")
+    parser.add_argument("--ctrl_n_test", type=int, default=None,
+                        help="[ctrl] test images per task (None = max(500, n_train // 4); an int "
+                             "uses min(ctrl_n_test, len(test_full)))")
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     # Resolve device
     if args.device == "auto":
@@ -239,6 +273,16 @@ def main():
             eps_rel     = getattr(args, "eps_rel", 0.05),
             consolidate_every = getattr(args, "consolidate_every", 0),
             raw_grow_probe = args.raw_grow_probe,
+            routing_batches = args.routing_batches,
+            reducible_mode = args.reducible,
+            gate_estimator = args.gate_estimator,
+            gate_splits = args.gate_splits,
+            oracle_rungs = args.oracle_rungs,
+            dump_gate_tensors = args.dump_gate_tensors,
+            enable_update = args.enable_update,
+            update_lr = args.update_lr,
+            eps_update = args.eps_update,
+            update_tolerance = args.update_tolerance,
         )
         raw_tasks = make_split_cifar100(
             data_root=args.data_root, n_tasks=n_tasks,
@@ -294,6 +338,16 @@ def main():
             search_budget = args.search_budget,
             search_skip = args.search_skip,
             raw_grow_probe = args.raw_grow_probe,
+            routing_batches = args.routing_batches,
+            reducible_mode = args.reducible,
+            gate_estimator = args.gate_estimator,
+            gate_splits = args.gate_splits,
+            oracle_rungs = args.oracle_rungs,
+            dump_gate_tensors = args.dump_gate_tensors,
+            enable_update = args.enable_update,
+            update_lr = args.update_lr,
+            eps_update = args.eps_update,
+            update_tolerance = args.update_tolerance,
         )
         run_exp3a_kan(cfg, tasks=tasks)
 
@@ -309,6 +363,7 @@ def main():
             middle_datasets=args.ctrl_middles,
             n_large=args.ctrl_n_large, n_small=args.ctrl_n_small,
             batch_size=args.batch_size, download=bool(args.download), seed=args.seed,
+            val_frac=args.ctrl_val_frac, n_test=args.ctrl_n_test,
         )
         ground_truth = [t.get("ctrl") for t in raw_tasks]
         # Stream identity in the cache path: task files are keyed by position, so two streams
@@ -337,11 +392,23 @@ def main():
             search_budget = args.search_budget,
             search_skip = args.search_skip,
             raw_grow_probe = args.raw_grow_probe,
+            routing_batches = args.routing_batches,
+            reducible_mode = args.reducible,
+            gate_estimator = args.gate_estimator,
+            gate_splits = args.gate_splits,
+            oracle_rungs = args.oracle_rungs,
+            dump_gate_tensors = args.dump_gate_tensors,
+            enable_update = args.enable_update,
+            update_lr = args.update_lr,
+            eps_update = args.eps_update,
+            update_tolerance = args.update_tolerance,
         )
         results = run_exp3a_kan(cfg, tasks=tasks)
         # Score decisions against the pre-registered ground truth and persist alongside.
         results["ctrl_stream"] = args.ctrl_stream
         results["ctrl_ground_truth"] = ground_truth
+        results["ctrl_val_frac"] = args.ctrl_val_frac
+        results["ctrl_n_test"] = args.ctrl_n_test
         import json
         out_path = os.path.join(cfg.results_dir, "exp3a_kan_results.json")
         with open(out_path, "w") as f:
