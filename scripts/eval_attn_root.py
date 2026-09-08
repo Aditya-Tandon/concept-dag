@@ -185,6 +185,11 @@ def params_per_root(results: Dict) -> Optional[float]:
     when the (newer) key is absent, per the spec."""
     v = results.get("params_per_root")
     if v is not None:
+        # The driver writes a LIST — one whole-node parameter count per ROOT in the run. Every
+        # root of a run is the same family and therefore the same size, so the mean is the
+        # per-root figure; a run with no roots (impossible today) falls through to the curves.
+        if isinstance(v, list):
+            return statistics.mean(v) if v else None
         return v
     pct = results.get("param_curve_total")
     if pct:
