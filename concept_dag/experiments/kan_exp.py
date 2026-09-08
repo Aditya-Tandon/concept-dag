@@ -557,9 +557,22 @@ class KanExpConfig(Exp3Config):
                                           # obstructions on domains absent from the parents.
     reducible_mode:      str   = "grow"   # "grow" | "best" — which normaliser DECIDES (both always
                                           # recorded on the KanGateRecord).
-    gate_estimator:      str   = "single" # "single" | "crossfit" — how the gate's held-out code
-                                          # lengths are measured (decide_reuse_search_grow only).
+    gate_estimator:      str   = "single" # "single" | "crossfit" | "prequential" — how the gate's
+                                          # held-out code lengths are measured (decide_reuse_search_grow
+                                          # only).
     gate_splits:         int   = 5        # crossfit folds (gate_estimator == "crossfit").
+    preq_blocks:         int   = 5        # prequential block count B (gate_estimator == "prequential").
+    preq_decide:         str   = "tail"   # "tail" | "total" — which prequential quantity DECIDES
+                                          # (gate_estimator == "prequential").
+    preq_exponent:       float = 0.5      # tail power-law exponent (gate_estimator == "prequential").
+    tie_rule:            str   = "none"   # "none" | "grow" — the select-score tie rule
+                                          # (gate_estimator == "select-score"); "grow" resolves a
+                                          # variance-limited search-vs-grow tie to grow on a novel task.
+    tie_z:               float = 1.0      # tie band width in SEs of the paired SCORE-bit difference
+                                          # (gate_estimator == "select-score", tie_rule == "grow").
+    tie_novelty:         float = 0.1      # novelty guard: (L_null - L_reuse)/L_null must be BELOW
+                                          # this for the tie rule to fire (gate_estimator ==
+                                          # "select-score", tie_rule == "grow").
     oracle_rungs:        bool  = False    # after the decision, ALSO train+eval the other rungs'
                                           # predictors (reuse/search/grow) on task["test"], without
                                           # altering the DAG — for post-hoc regret analysis.
@@ -580,25 +593,48 @@ class KanExpConfig(Exp3Config):
 # ---------------------------------------------------------------------------
 
 
+@torch.no_grad()
+def _mean_nll_bits(predictor: "TaskPredictor", loader, spec: TaskSpec, device: str) -> float:
+    """Mean `spec.nll_bits` (bits/sample) of `predictor` over every batch in `loader`, weighted by
+    batch size (spec B3) — the calibration target for the prequential tail estimate."""
+    total_bits = 0.0
+    total_n = 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        bits = spec.nll_bits(predictor.logits(x), y)
+        total_bits += bits.sum().item()
+        total_n += y.size(0)
+    return total_bits / max(total_n, 1)
+
+
 def _oracle_rungs(rec, X: torch.Tensor, y: torch.Tensor, parents: List[DAGNode], task: Dict, t: int,
                   cfg: "KanExpConfig", spec: TaskSpec, use_cnn: bool, device: str,
-                  chosen_acc: float) -> Dict[str, float]:
+                  chosen_acc: float, chosen_predictor: Optional["TaskPredictor"] = None,
+                  ) -> Tuple[Dict[str, float], Dict[str, float]]:
     """Train + evaluate the rungs NOT chosen by the frozen ladder, on the same cache, WITHOUT
-    altering the DAG. The chosen rung's entry reuses `chosen_acc` rather than retraining. Wrapped in
-    `torch.random.fork_rng()` so it does not perturb the main run's RNG stream."""
+    altering the DAG. The chosen rung's entry reuses `chosen_acc`/`chosen_predictor` rather than
+    retraining. Wrapped in `torch.random.fork_rng()` so it does not perturb the main run's RNG
+    stream. Returns `(oracle_accs, oracle_val_bits)`: for every rung (reuse/search/grow), also the
+    predictor's mean `spec.nll_bits` on `task["val"]` (fallback `task["test"]` if no `"val"`) —
+    the calibration target for the prequential tail estimate (spec B3)."""
     accs: Dict[str, float] = {}
+    val_bits: Dict[str, float] = {}
+    val_loader = task.get("val", task["test"])
     with torch.random.fork_rng():
         if rec.decision == "reuse":
             accs["reuse"] = chosen_acc
+            val_bits["reuse"] = _mean_nll_bits(chosen_predictor, val_loader, spec, device)
         else:
             oh = LinearHead(cfg.concept_dim, task["n_classes"])
             oc = ReuseComposer(parent_dim=cfg.concept_dim, n_parents=len(parents), head=oh)
             _fit_full(oc, lambda m, xb: m(xb), spec, X, y, cfg.child_epochs, cfg.lr, device)
-            accs["reuse"] = TaskPredictor("reuse", oh, parents=parents, composer=oc).accuracy(
-                task["test"], device)
+            pred = TaskPredictor("reuse", oh, parents=parents, composer=oc)
+            accs["reuse"] = pred.accuracy(task["test"], device)
+            val_bits["reuse"] = _mean_nll_bits(pred, val_loader, spec, device)
 
         if rec.decision == "search":
             accs["search"] = chosen_acc
+            val_bits["search"] = _mean_nll_bits(chosen_predictor, val_loader, spec, device)
         else:
             meta = rec.search_meta or {}
             oh = LinearHead(cfg.concept_dim, task["n_classes"])
@@ -609,11 +645,13 @@ def _oracle_rungs(rec, X: torch.Tensor, y: torch.Tensor, parents: List[DAGNode],
                                     rank=meta.get("rank", cfg.search_rank), subset=meta.get("subset"),
                                     skip=meta.get("skip", cfg.search_skip))
             _fit_full(oc, lambda m, xb: m(xb), spec, X, y, cfg.child_epochs, cfg.lr, device)
-            accs["search"] = TaskPredictor("search", oh, parents=parents, composer=oc).accuracy(
-                task["test"], device)
+            pred = TaskPredictor("search", oh, parents=parents, composer=oc)
+            accs["search"] = pred.accuracy(task["test"], device)
+            val_bits["search"] = _mean_nll_bits(pred, val_loader, spec, device)
 
         if rec.decision == "grow":
             accs["grow"] = chosen_acc
+            val_bits["grow"] = _mean_nll_bits(chosen_predictor, val_loader, spec, device)
         else:
             onode = DAGNode(task_id=t, concept_dim=cfg.concept_dim, cnn_out_dim=cfg.cnn_out_dim,
                             n_mlp_layers=cfg.n_mlp_layers, parent_models=None,
@@ -622,9 +660,13 @@ def _oracle_rungs(rec, X: torch.Tensor, y: torch.Tensor, parents: List[DAGNode],
             train_node(onode, ohead, task["train"], cfg.child_epochs, cfg.lr, device, cfg.log_every,
                        name=f"t{t}-oracle-grow", orth_weight=cfg.orth_weight)
             accs["grow"] = eval_node(onode, ohead, task["test"], device)
-            del onode, ohead
+            # DAGNode root + LinearHead: logits = head(node(x)) — TaskPredictor's "grow" kind
+            # computes exactly that via forward_dag_memoized (a root has no ancestors to memoize).
+            opred = TaskPredictor("grow", ohead, node=onode)
+            val_bits["grow"] = _mean_nll_bits(opred, val_loader, spec, device)
+            del onode, ohead, opred
             _flush(device)
-    return accs
+    return accs, val_bits
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +843,16 @@ def run_exp3a_kan(
             gate_cache[t] = (Xraw, y)  # exact rows/order the live decision below sees
             raw_kwargs = ({"raw_stack": Xraw, "root_module_factory": root_module_factory}
                           if use_raw_probe else {})
+            # Prequential-estimator kwargs are passed ONLY when selected, so the call signature
+            # for "single"/"crossfit" is unchanged even before decide_reuse_search_grow grows a
+            # `preq_*` branch (spec B1) — this file's tests must pass independent of that landing.
+            preq_kwargs = ({"preq_blocks": cfg.preq_blocks, "preq_decide": cfg.preq_decide,
+                            "preq_exponent": cfg.preq_exponent}
+                          if cfg.gate_estimator == "prequential" else {})
+            # select-score tie-rule kwargs are passed ONLY when selected, mirroring preq_kwargs —
+            # the call signature for every other gate_estimator is unchanged.
+            ss_kwargs = ({"tie_rule": cfg.tie_rule, "tie_z": cfg.tie_z, "tie_novelty": cfg.tie_novelty}
+                        if cfg.gate_estimator == "select-score" else {})
             force = t in cfg.force_grow_ids
             split_gen = torch.Generator().manual_seed(cfg.seed * 1000 + t)
             if cfg.enable_search and not force:
@@ -812,7 +864,7 @@ def run_exp3a_kan(
                     eps_search=cfg.eps_search, search_budget=cfg.search_budget, search_rank=cfg.search_rank,
                     search_skip=cfg.search_skip, reducible_mode=cfg.reducible_mode,
                     estimator=cfg.gate_estimator, n_splits=cfg.gate_splits, split_generator=split_gen,
-                    **raw_kwargs,
+                    **raw_kwargs, **preq_kwargs, **ss_kwargs,
                 )
             else:
                 rec = decide_reuse_vs_grow(
@@ -887,8 +939,8 @@ def run_exp3a_kan(
         if n_par > 0 and not force:
             # --- Oracle rungs (§5): computed on the FROZEN state, before any update commit. ---
             if cfg.oracle_rungs:
-                d["oracle_accs"] = _oracle_rungs(rec, X, y, parents, task, t, cfg, spec, use_cnn,
-                                                 device, acc)
+                d["oracle_accs"], d["oracle_val_bits"] = _oracle_rungs(
+                    rec, X, y, parents, task, t, cfg, spec, use_cnn, device, acc, predictors[t])
 
             # --- Update rung (§4): refinement placement, cannot mask a grow decision. ---
             if cfg.enable_update and not use_cnn and cfg.feature_dim is not None:
