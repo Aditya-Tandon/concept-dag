@@ -57,6 +57,7 @@ from torch.utils.data import DataLoader
 
 from ..modules.dag import ConceptDAG
 from ..modules.concept_module import ConceptModule
+from .evalue import decide as _evalue_decide
 from ..utils.metrics import safe_cross_entropy
 
 _LOG2 = math.log(2.0)
@@ -974,6 +975,8 @@ def decide_reuse_search_grow(
     root_module_factory: Optional[Callable[[], nn.Module]] = None,
     reducible_mode: str = "best",
     estimator: str = "single",
+    evalue_bits: Optional[float] = None,
+    evalue_alpha: float = 0.05,
     n_splits: int = 5,
     split_generator: Optional[torch.Generator] = None,
     preq_blocks: int = 5,
@@ -1345,6 +1348,54 @@ def decide_reuse_search_grow(
         # low as the select-argmin's L among the identical candidate set.
         search_selection_optimism = L_search_score_argmin - L_search
 
+        # --- anytime-valid third state ([[provisional-growth-undetermined-gate]] G1) ----------
+        # Computed HERE and nowhere else because this is the only branch whose SCORE set never
+        # selected an epoch: `_held_out_codelength(..., score_X=...)` early-stops on SELECT and
+        # reports SCORE. On the `single` branch the two sets are the same 120 examples, so the
+        # per-example bits at the selected epoch are not conditionally mean-zero given the past,
+        # and the min-over-epochs optimism is capacity-dependent (~0.10 bits between a 132k raw
+        # root and a linear composer, [[gate-h5-select-score-result]]) against a ~0.005-bit
+        # margin. Ville's inequality protects against noise, not against a mis-located null.
+        #
+        # Everything the test depends on is chosen on SELECT, never on SCORE:
+        #   * `alt`   — the better of reuse/search by SELECT bits;
+        #   * `s`     — eps_grow * reducible, from SELECT bits;
+        # so the shift and the rung identity are predictable with respect to the SCORE filtration.
+        evalue_meta = None
+        if evalue_bits:
+            alt_is_search = sel_search <= sel_reuse
+            pe_alt = pe_search if alt_is_search else pe_reuse
+            reducible_sel = max(sel_null - min(sel_reuse, sel_search, sel_grow), 1e-6)
+            shift = float(eps_grow) * reducible_sel
+            d = (pe_alt - pe_grow).double().tolist()          # >0 => grow codes the example better
+            evalue_meta = _evalue_decide(d, float(evalue_bits), threshold_bits=shift,
+                                         alpha=float(evalue_alpha))
+            # Recorded, never acted on: the same test against E[d] > 0 instead of the ladder's
+            # indifference margin. The desk stage (D1-shifted) found the shift costs the test most
+            # of its power exactly where `reducible` is large — on the archived revisit it took
+            # decided units from 28/60 to 4/60 — so which of the two states a position lands in is
+            # the diagnosis for an ALWAYS-UNDETERMINED outcome, and it is free to record.
+            unshifted = _evalue_decide(d, float(evalue_bits), threshold_bits=0.0,
+                                       alpha=float(evalue_alpha))
+            evalue_meta.update({
+                "state_unshifted": unshifted["state"],
+                "log2_e_plus_unshifted": unshifted["log2_e_plus"],
+                "log2_e_minus_unshifted": unshifted["log2_e_minus"],
+            })
+            evalue_meta.update({
+                "alt_rung": "search" if alt_is_search else "reuse",
+                "reducible_select": reducible_sel,
+                "eps_grow": float(eps_grow),
+                # Bias budget (D3): the per-rung early-stopping optimism this test could otherwise
+                # mistake for signal, and how much of the tail the +-B clip removed on each side.
+                "optimism": {"reuse": sel_reuse - L_reuse, "search": sel_search - L_search,
+                             "grow": sel_grow - L_grow},
+                "optimism_grow_minus_alt": (sel_grow - L_grow) - (
+                    (sel_search - L_search) if alt_is_search else (sel_reuse - L_reuse)),
+                "clipped_hi": int(sum(1 for v in d if v - shift > evalue_bits)),
+                "clipped_lo": int(sum(1 for v in d if v - shift < -evalue_bits)),
+            })
+
         est_meta = {
             "estimator": "select-score", "n_train": n_train, "n_select": n_select,
             "n_score": n_score,
@@ -1360,6 +1411,7 @@ def decide_reuse_search_grow(
             "se_reuse_minus_grow": se_reuse_minus_grow,
             "se_reuse_minus_search": se_reuse_minus_search,
             "novelty": novelty,
+            "evalue": evalue_meta,
         }
         split_meta = {"tr_idx": torch.cat([tr_idx, sel_idx]).tolist(), "val_idx": sc_idx.tolist()}
     else:

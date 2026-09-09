@@ -127,6 +127,13 @@ class DAGNode(nn.Module):
         self._is_root    = not parent_models
         self.use_cnn     = use_cnn
         self.root_family = root_family
+        # Decision-timing bookkeeping ([[provisional-growth-undetermined-gate]]). A provisional
+        # root is an ordinary node that consolidation is allowed to resolve (merge or crystallise);
+        # in Loop 1 nothing about it is plastic, so these are labels, not behaviour. Plain
+        # attributes, not buffers: they must never reach a state_dict or a parameter count.
+        self.provisional = False
+        self.minted_at: Optional[int] = None
+        self.evalue_state: Optional[dict] = None
 
         # Token-mode root: the node reads the encoder's (B, 1 + T, feature_dim) token set
         # through a learned-query AttentionPool that emits `concept_dim`, and the
