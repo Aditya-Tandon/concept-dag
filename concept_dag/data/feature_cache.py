@@ -58,7 +58,14 @@ from typing import Dict, List, Optional
 # ---------------------------------------------------------------------------
 
 class FeatureTensorDataset(Dataset):
-    """Simple (feature, label) dataset backed by in-memory or mmap tensors."""
+    """Simple (feature, label) dataset backed by in-memory or mmap tensors.
+
+    A float16 backing tensor is cast to float32 on access. Token caches are held
+    half-precision in RAM (a 65-token ViT-S stream of 300k images is 7.5 GB half vs
+    15 GB single) and the cast is exact — the values already round-tripped through
+    float16 on disk — so every consumer sees the same float32 numbers it would have
+    seen from a float32 buffer. CLS-only caches are float32 and pass through untouched.
+    """
 
     def __init__(self, features: torch.Tensor, labels: torch.Tensor):
         assert len(features) == len(labels)
@@ -69,7 +76,10 @@ class FeatureTensorDataset(Dataset):
         return len(self.features)
 
     def __getitem__(self, idx):
-        return self.features[idx], self.labels[idx]
+        x = self.features[idx]
+        if x.dtype == torch.float16:
+            x = x.float()
+        return x, self.labels[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +178,8 @@ def cache_features(
                 encoder, loader.dataset, feat_path, label_path,
                 device=device, batch_size=batch_size, force_redo=force_redo,
                 tokens=tokens, label=f"task {t} / {split_name}",
+                # Token features stay float16 in RAM; FeatureTensorDataset casts per item.
+                as_float=not tokens,
             )
 
             ds = FeatureTensorDataset(features, labels)
@@ -222,12 +234,15 @@ def cache_split_features(
 
 def _load_or_encode(encoder, dataset, feat_path: str, label_path: str, *,
                     device: str, batch_size: int, force_redo: bool,
-                    tokens: bool, label: str):
+                    tokens: bool, label: str, as_float: bool = True):
     """Read a cached (features, labels) pair, or run the encoder over `dataset` and write it.
 
-    Token caches are stored float16 and returned float32; the freshly-computed tensor is
-    put through the same half() cast before being returned, so a cache-miss run and a
-    cache-hit run hand the caller bit-identical values.
+    Token caches are stored float16; the freshly-computed tensor is put through the same
+    half() cast before being returned, so a cache-miss run and a cache-hit run hand the
+    caller bit-identical values. ``as_float`` (default True) casts them back to float32 on
+    return; ``as_float=False`` leaves them float16 for the caller to cast lazily — used by
+    `cache_features`, whose `FeatureTensorDataset` casts per item, halving resident RAM
+    without changing a single value.
     """
     if not force_redo and os.path.exists(feat_path) and os.path.exists(label_path):
         features = torch.load(feat_path, map_location="cpu", weights_only=True)
@@ -253,7 +268,8 @@ def _load_or_encode(encoder, dataset, feat_path: str, label_path: str, *,
             raise ValueError(
                 f"token cache {feat_path} has shape {tuple(features.shape)}; expected (N, 1 + T, D)."
             )
-        features = features.float()
+        if as_float:
+            features = features.float()
     return features, labels
 
 
