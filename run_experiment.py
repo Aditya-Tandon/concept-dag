@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_per_task", type=int, default=None,
                         help="[5ds-kan] cap train examples/task for light laptop runs (None = full)")
     parser.add_argument("--ctrl_stream", type=str, default="s_minus",
-                        choices=["s_minus", "s_plus", "s_in", "s_out", "s_pl"],
+                        choices=["s_minus", "s_plus", "s_in", "s_out", "s_pl", "s_interleave"],
                         help="[ctrl] which CTrL-style stream to run (see loaders.make_ctrl_stream)")
     parser.add_argument("--ctrl_first", type=str, default="mnist",
                         help="[ctrl] the revisited first task's dataset")
@@ -216,6 +216,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ctrl_n_test", type=int, default=None,
                         help="[ctrl] test images per task (None = max(500, n_train // 4); an int "
                              "uses min(ctrl_n_test, len(test_full)))")
+    # Decision-timing / provisional-growth arguments ([[provisional-growth-undetermined-gate]])
+    parser.add_argument("--provisional", type=str, default="off",
+                        choices=["off", "shadow", "evalue", "se_proxy", "always"],
+                        help="[5ds-kan/ctrl] the UNDETERMINED gate state and deferred (provisional) "
+                             "growth. Necessity controls, per arm: 'off' = published behaviour, "
+                             "nothing computed (the null, C0). 'shadow' = compute the third state "
+                             "on a shadow refit but ACT ON NOTHING (P0b null-perturbation check). "
+                             "'evalue' = mint a provisional root when the e-process is UNDETERMINED "
+                             "(arm T, the hypothesis under test). 'se_proxy' = mint when the cheap "
+                             "|L_alt - L_grow| <= z*paired_SE rule fires instead (arm C1: does the "
+                             "e-process buy anything a one-line rule does not?). 'always' = mint "
+                             "unconditionally at every data-poor gated position (arm C2: the upper "
+                             "bound on what deferral can buy).")
+    parser.add_argument("--provisional_alpha", type=float, default=0.05,
+                        help="[provisional] the e-process level: a side decides at log2(1/alpha) "
+                             "bits of evidence (gate_verdict grow/alt); the type-I error the "
+                             "sensitivity control (D2) is calibrated against.")
+    parser.add_argument("--provisional_z", type=float, default=1.0,
+                        help="[provisional] se_proxy arm (C1) only: margin band, in paired SEs of "
+                             "the SCORE-set bit difference, within which the cheap proxy fires.")
+    parser.add_argument("--always_n_max", type=int, default=1000,
+                        help="[provisional] always arm (C2) only: mint unconditionally, but ONLY "
+                             "at positions whose gate cache is at most this many samples — keeps "
+                             "the upper-bound arm confined to the data-poor positions the "
+                             "hypothesis is actually about (e.g. CTrL t3's 400), not every task.")
+    parser.add_argument("--crystallise_after", type=int, default=3,
+                        help="[provisional] tasks after which a still-flagged provisional root is "
+                             "frozen (crystallised) unresolved, so no provisional root can survive "
+                             "a run indefinitely (P6/P9: every root must end resolved as merge or "
+                             "timeout).")
     return parser
 
 
@@ -233,6 +263,16 @@ def main():
     else:
         device = args.device
     print(f"Using device: {device}")
+
+    # Provisional-growth precondition, checked before anything expensive is built: every arm
+    # needs the shadow refit's per-example SCORE bits, which only exist on the three-way
+    # reuse/search/grow ladder ([[provisional-growth-undetermined-gate]] G1).
+    if args.provisional != "off" and not args.enable_search:
+        raise SystemExit(
+            f"--provisional {args.provisional} requires --enable_search: the shadow refit that "
+            f"computes the third gate state runs the three-way reuse/search/grow ladder, and "
+            f"without it there is nothing for --provisional to act on."
+        )
 
     # Token-mode preconditions, checked before anything expensive is built.
     token_mode = (args.root_family == "attn_pool")
@@ -437,6 +477,11 @@ def main():
             update_lr = args.update_lr,
             eps_update = args.eps_update,
             update_tolerance = args.update_tolerance,
+            provisional = args.provisional,
+            provisional_alpha = args.provisional_alpha,
+            provisional_z = args.provisional_z,
+            always_n_max = args.always_n_max,
+            crystallise_after = args.crystallise_after,
         )
         run_exp3a_kan(cfg, tasks=tasks)
 
@@ -501,6 +546,11 @@ def main():
             update_lr = args.update_lr,
             eps_update = args.eps_update,
             update_tolerance = args.update_tolerance,
+            provisional = args.provisional,
+            provisional_alpha = args.provisional_alpha,
+            provisional_z = args.provisional_z,
+            always_n_max = args.always_n_max,
+            crystallise_after = args.crystallise_after,
         )
         results = run_exp3a_kan(cfg, tasks=tasks)
         # Score decisions against the pre-registered ground truth and persist alongside.

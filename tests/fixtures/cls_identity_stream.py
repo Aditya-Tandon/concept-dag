@@ -24,6 +24,10 @@ from torch.utils.data import TensorDataset, DataLoader
 NEW_OR_NONDETERMINISTIC_KEYS = {
     "root_family", "n_tokens", "feature_dim", "gate_cache_max",
     "param_curve_total", "params_total_pre_consolidation", "params_per_root",
+    # H8 ([[provisional-growth-undetermined-gate]]): provenance fields present on every run.
+    # The PER-DECISION H8 fields are emitted only when `provisional != "off"`, so they need no
+    # exclusion — that is what makes the identity check cover the decision records themselves.
+    "provisional", "provisional_roots",
 }
 DECISION_KEYS_TO_IGNORE = {"gate_seconds"}
 

@@ -671,7 +671,7 @@ def inject_duplicates(
 # CTrL-style streams (Veniat et al., ICLR 2021) over the 5-Datasets family
 # ---------------------------------------------------------------------------
 
-_CTRL_STREAMS = ("s_minus", "s_plus", "s_in", "s_out", "s_pl")
+_CTRL_STREAMS = ("s_minus", "s_plus", "s_in", "s_out", "s_pl", "s_interleave")
 
 
 class _PermutedLabels(Dataset):
@@ -737,11 +737,22 @@ def make_ctrl_stream(
                Ground truth: REUSE (a new readout of the same concept suffices; the
                sufficient statistic is unchanged).
       s_pl:    all five datasets once, moderate data, no revisit (plasticity baseline).
+      s_interleave: t0 first_dataset LARGE (forced root, decidable) -> t1 middles[0] SMALL
+               (novel, data-poor) -> t2 middles[2] (or middles[1] if only 2 middles are given)
+               SMALL, a DIFFERENT domain from t1 (the negative control: must never merge with t1
+               or t3) -> t3 middles[0] SMALL again, same dataset/classes as t1 but drawn from an
+               INDEX-DISJOINT set of training examples (redundant with t1 -> should merge) -> t4
+               first_dataset SMALL (revisit of t0 -> should reuse). Ground truth:
+               [[provisional-growth-undetermined-gate]] G4/P4/P6 — t1 and t3 are the two
+               provisional-root candidates a merge detector must find redundant; t2 is the
+               control it must never merge with either.
 
     Every task dict follows the standard schema plus a "ctrl" field:
         {"revisit_of": Optional[int], "relation": "same"|"input_shift"|"output_perm"|None,
-         "n_train": int}
-    so a decision trace can be scored against the known relation.
+         "n_train": int, "should": "merge"|"reuse"|"not_merge"|None}
+    so a decision trace can be scored against the known relation. "should" is the
+    provisional-growth ground truth ([[provisional-growth-undetermined-gate]] G4): None unless a
+    position is a merge/reuse/negative-control target.
 
     val_frac: fraction of n_train drawn as held-out val images, IN ADDITION to (not carved
         out of) the n_train training images — each task samples n_train + n_val examples
@@ -756,7 +767,8 @@ def make_ctrl_stream(
     transform = _build_stream_transform(image_size)
 
     def _subsampled_task(pos, name, n_train, *, tf=None, label_perm=None,
-                         revisit_of=None, relation=None, sub_seed=0):
+                         revisit_of=None, relation=None, sub_seed=0, should=None,
+                         exclude_train_idx=None):
         tf = tf or transform
         try:
             train_full = _load_raw_dataset(name, data_root, True,  tf, download)
@@ -770,6 +782,12 @@ def make_ctrl_stream(
             test_full  = _PermutedLabels(test_full, label_perm)
         rng = np.random.default_rng(seed + 1000 * sub_seed)
         order = np.arange(len(train_full)); rng.shuffle(order)
+        if exclude_train_idx is not None:
+            # s_interleave t3: provably disjoint from t1's training set. Filtering the shuffled
+            # candidate order BEFORE taking the first n_train+n_val of it means t3's sample can
+            # share no index with `exclude_train_idx` regardless of the two positions' RNG
+            # streams — a set-difference, not a hope that two seeds land on different examples.
+            order = order[~np.isin(order, np.asarray(exclude_train_idx))]
         n_val = int(n_train * val_frac)
         take = order[: n_train + n_val]
         val_idx, tr_idx = take[:n_val].tolist(), take[n_val:].tolist()
@@ -788,7 +806,8 @@ def make_ctrl_stream(
             "class_ids": list(range(10)),
             "name":    f"{name}_ctrl{pos}",
             "dataset": name.lower(),
-            "ctrl": {"revisit_of": revisit_of, "relation": relation, "n_train": n_train},
+            "ctrl": {"revisit_of": revisit_of, "relation": relation, "n_train": n_train,
+                     "should": should},
         }
 
     tasks: List[Dict] = []
@@ -796,6 +815,27 @@ def make_ctrl_stream(
         for i, name in enumerate([first_dataset] + middles):
             tasks.append(_subsampled_task(i, name, n_large // 2, sub_seed=i))
         return tasks
+
+    if stream == "s_interleave":
+        # Fixed 5-position layout — NOT "first + middles + revisit" like the other streams, so
+        # it is built directly rather than falling through the generic loop below.
+        # Ground truth (G4): t1/t3 are the mergeable pair — same dataset AND same classes (this
+        # loader never subsets classes, so that half is automatic), drawn from index-DISJOINT
+        # training sets; t2 is a different-domain negative control that must never merge with
+        # either; t4 is the plain same-distribution revisit of t0 (decided reuse).
+        t2_name = middles[2] if len(middles) > 2 else middles[1]
+        t0 = _subsampled_task(0, first_dataset, n_large, sub_seed=0)
+        t1 = _subsampled_task(1, middles[0], n_small, sub_seed=1)
+        t2 = _subsampled_task(2, t2_name, n_small, sub_seed=2, should="not_merge")
+        # Ground-truth training indices t3 must avoid: Subset(train_full, tr_idx) stores tr_idx
+        # verbatim as `.indices`, so this is the EXACT set t1 trained on, not a re-derivation.
+        t1_train_idx = t1["train"].dataset.indices
+        t3 = _subsampled_task(3, middles[0], n_small, sub_seed=3,
+                              revisit_of=1, relation="same", should="merge",
+                              exclude_train_idx=t1_train_idx)
+        t4 = _subsampled_task(4, first_dataset, n_small, sub_seed=4,
+                              revisit_of=0, relation="same", should="reuse")
+        return [t0, t1, t2, t3, t4]
 
     first_n = n_small if stream == "s_plus" else n_large
     tasks.append(_subsampled_task(0, first_dataset, first_n, sub_seed=0))
