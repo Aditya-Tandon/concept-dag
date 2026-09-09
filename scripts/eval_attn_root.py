@@ -479,6 +479,29 @@ def paired_ctrl(control_ctrl: Dict[int, Dict[str, Dict]],
     return pairs
 
 
+def _seed_level(rows: List[Dict], key: str = "diff") -> Dict:
+    """Mean and SE of a per-(seed, stream) difference collapsed to one value PER SEED.
+
+    The four CTrL streams share tasks t0-t3 within a seed, so 20 runs carry only 5 independent
+    draws at t3 and a stdev/sqrt(20) understates the uncertainty by ~2x. Every t3 gate is
+    therefore reported at both levels: the run level (optimistic) and the seed level (honest).
+    """
+    by_seed: Dict[int, List[float]] = {}
+    for r in rows:
+        if r.get(key) is None:
+            continue
+        by_seed.setdefault(r["seed"], []).append(float(r[key]))
+    per_seed = {s: statistics.mean(v) for s, v in sorted(by_seed.items())}
+    vals = list(per_seed.values())
+    if not vals:
+        return {"n_seeds": 0, "mean": None, "se": None, "per_seed": {}}
+    se = (statistics.stdev(vals) / math.sqrt(len(vals))) if len(vals) >= 2 else None
+    mean = statistics.mean(vals)
+    return {"n_seeds": len(vals), "mean": mean, "se": se,
+            "n_se": (mean / se) if se else None,
+            "per_seed": {str(k): v for k, v in per_seed.items()}}
+
+
 def gate_r2a(control_ctrl: Dict[int, Dict[str, Dict]],
              treatment_ctrl: Dict[int, Dict[str, Dict]]) -> Dict:
     gate = {"gate": "R2a",
@@ -505,10 +528,14 @@ def gate_r2a(control_ctrl: Dict[int, Dict[str, Dict]],
     mean_diff = statistics.mean(diffs)
     se = statistics.stdev(diffs) / math.sqrt(len(diffs)) if len(diffs) >= 2 else None
     pass_ = (se is not None) and (mean_diff >= R2A_MIN_DELTA) and (mean_diff >= R2A_MIN_SE_MULT * se)
-    gate["value"] = {"n_pairs": len(diffs), "mean_diff": mean_diff, "paired_se": se, "rows": rows}
+    seed_level = _seed_level(rows)
+    gate["value"] = {"n_pairs": len(diffs), "mean_diff": mean_diff, "paired_se": se,
+                     "seed_level": seed_level, "rows": rows}
     gate["verdict"] = "pass" if pass_ else "fail"
     se_str = f"{se:.4f}" if se is not None else "n/a"
-    gate["headline"] = f"mean diff={mean_diff:.4f}, paired SE={se_str}, n={len(diffs)}"
+    sl = f"{seed_level['se']:.4f}" if seed_level["se"] is not None else "n/a"
+    gate["headline"] = (f"mean diff={mean_diff:.4f}, run-level SE={se_str}, "
+                        f"seed-level SE={sl} (n_seeds={seed_level['n_seeds']}), n={len(diffs)}")
     if len(pairs) < 20:
         gate["note"] = f"partial: {len(pairs)}/20 paired (seed, stream) runs present so far"
     return gate
@@ -539,10 +566,13 @@ def gate_r2b(control_ctrl: Dict[int, Dict[str, Dict]],
         return gate
     mean_diff = statistics.mean(diffs)
     pass_ = mean_diff <= R2B_MAX_DELTA
-    gate["value"] = {"n_pairs": len(diffs), "mean_diff": mean_diff, "rows": rows,
-                     "skipped_no_oracle": skipped}
+    seed_level = _seed_level(rows)
+    gate["value"] = {"n_pairs": len(diffs), "mean_diff": mean_diff, "seed_level": seed_level,
+                     "rows": rows, "skipped_no_oracle": skipped}
     gate["verdict"] = "pass" if pass_ else "fail"
-    gate["headline"] = f"mean regret diff={mean_diff:.4f}, n={len(diffs)}"
+    sl = f"{seed_level['se']:.4f}" if seed_level["se"] is not None else "n/a"
+    gate["headline"] = (f"mean regret diff={mean_diff:.4f}, seed-level SE={sl} "
+                        f"(n_seeds={seed_level['n_seeds']}), n={len(diffs)}")
     if len(pairs) < 20:
         gate["note"] = f"partial: {len(pairs)}/20 paired (seed, stream) runs present so far"
     return gate
@@ -745,27 +775,31 @@ def gate_r4(control_5ds: Dict[int, Dict], treatment_5ds: Dict[int, Dict],
                           "size on disk, wall time per run — per arm",
             "threshold": "descriptive — all recorded", "value": None, "verdict": "descriptive"}
 
-    def _arm_stats(fivedata: Dict[int, Dict], ctrldata: Dict[int, Dict[str, Dict]]) -> Dict:
-        pprs, gsecs = [], []
-        for r in fivedata.values():
-            p = params_per_root(r)
-            if p is not None:
-                pprs.append(p)
-            g = mean_gate_seconds(r)
-            if g is not None:
-                gsecs.append(g)
-        for streams in ctrldata.values():
-            for r in streams.values():
-                p = params_per_root(r)
-                if p is not None:
-                    pprs.append(p)
-                g = mean_gate_seconds(r)
-                if g is not None:
-                    gsecs.append(g)
+    def _collect(runs: List[Dict]) -> Dict:
+        pprs = [p for p in (params_per_root(r) for r in runs) if p is not None]
+        gsecs = [g for g in (mean_gate_seconds(r) for r in runs) if g is not None]
         return {"mean_params_per_root": statistics.mean(pprs) if pprs else None,
                 "params_per_root_values": sorted(set(pprs)),
                 "mean_gate_seconds": statistics.mean(gsecs) if gsecs else None,
                 "n_runs_with_gate_seconds": len(gsecs)}
+
+    def _arm_stats(fivedata: Dict[int, Dict], ctrldata: Dict[int, Dict[str, Dict]]) -> Dict:
+        """Per-EXPERIMENT stats, not pooled.
+
+        A 5-Datasets gated task spends ~125-152 s in the ladder (a 16,384-sample cache) and a CTrL
+        one ~6-7 s (400-4,000 samples). Averaging the two over 23 runs produces a number dominated
+        by how many runs of each kind happened to be present, which is not a property of the arm.
+        `pooled` is kept only so an older reader of this JSON still finds the field it expects.
+        """
+        five_runs = list(fivedata.values())
+        ctrl_runs = [r for streams in ctrldata.values() for r in streams.values()]
+        out = {"five_datasets": _collect(five_runs), "ctrl": _collect(ctrl_runs),
+               "pooled": _collect(five_runs + ctrl_runs)}
+        # Params per root are a property of the family, not the experiment, so keep them at the
+        # top level too (they agree across experiments or the run is inconsistent).
+        out["mean_params_per_root"] = out["pooled"]["mean_params_per_root"]
+        out["params_per_root_values"] = out["pooled"]["params_per_root_values"]
+        return out
 
     control = _arm_stats(control_5ds, control_ctrl)
     treatment = _arm_stats(treatment_5ds, treatment_ctrl)
@@ -786,7 +820,12 @@ def gate_r4(control_5ds: Dict[int, Dict], treatment_5ds: Dict[int, Dict],
         gate["headline"] = "no data"
     else:
         fmt = lambda x: f"{x:.0f}" if x is not None else "n/a"
-        gate["headline"] = f"params/root C={fmt(cp)}, T={fmt(tp)}"
+        fs = lambda a, k: (a.get(k) or {}).get("mean_gate_seconds")
+        fg = lambda x: f"{x:.1f}s" if x is not None else "n/a"
+        gate["headline"] = (
+            f"params/root C={fmt(cp)}, T={fmt(tp)}; gate/task 5ds "
+            f"{fg(fs(control, 'five_datasets'))}->{fg(fs(treatment, 'five_datasets'))}, ctrl "
+            f"{fg(fs(control, 'ctrl'))}->{fg(fs(treatment, 'ctrl'))}")
     return gate
 
 
