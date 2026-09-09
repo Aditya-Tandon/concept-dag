@@ -1370,6 +1370,18 @@ def decide_reuse_search_grow(
             d = (pe_alt - pe_grow).double().tolist()          # >0 => grow codes the example better
             evalue_meta = _evalue_decide(d, float(evalue_bits), threshold_bits=shift,
                                          alpha=float(evalue_alpha))
+            # Recorded, never acted on: the same test against E[d] > 0 instead of the ladder's
+            # indifference margin. The desk stage (D1-shifted) found the shift costs the test most
+            # of its power exactly where `reducible` is large — on the archived revisit it took
+            # decided units from 28/60 to 4/60 — so which of the two states a position lands in is
+            # the diagnosis for an ALWAYS-UNDETERMINED outcome, and it is free to record.
+            unshifted = _evalue_decide(d, float(evalue_bits), threshold_bits=0.0,
+                                       alpha=float(evalue_alpha))
+            evalue_meta.update({
+                "state_unshifted": unshifted["state"],
+                "log2_e_plus_unshifted": unshifted["log2_e_plus"],
+                "log2_e_minus_unshifted": unshifted["log2_e_minus"],
+            })
             evalue_meta.update({
                 "alt_rung": "search" if alt_is_search else "reuse",
                 "reducible_select": reducible_sel,
