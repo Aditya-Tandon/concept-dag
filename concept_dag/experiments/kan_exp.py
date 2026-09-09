@@ -594,6 +594,18 @@ class KanExpConfig(Exp3Config):
     tie_novelty:         float = 0.1      # novelty guard: (L_null - L_reuse)/L_null must be BELOW
                                           # this for the tie rule to fire (gate_estimator ==
                                           # "select-score", tie_rule == "grow").
+    # --- decision timing ([[provisional-growth-undetermined-gate]]) -----------------------------
+    provisional:         str   = "off"   # "off" | "shadow" | "evalue" | "se_proxy" | "always"
+                                          # off      = published behaviour, nothing computed
+                                          # shadow   = compute the third state, ACT ON NOTHING (P0b)
+                                          # evalue   = UNDETERMINED -> mint a provisional root (arm T)
+                                          # se_proxy = |L_alt - L_grow| <= z*paired_SE -> mint (arm C1)
+                                          # always   = mint unconditionally at every gated position
+                                          #            whose gate cache is <= `always_n_max` (arm C2)
+    provisional_alpha:   float = 0.05     # the e-process level; decide at 1/alpha
+    provisional_z:       float = 1.0      # se_proxy arm: margin band in paired SEs
+    always_n_max:        int   = 1000     # "always" arm: only data-poor positions (CTrL t3 has 400)
+    crystallise_after:   int   = 3        # tasks after which a still-flagged provisional root freezes
     oracle_rungs:        bool  = False    # after the decision, ALSO train+eval the other rungs'
                                           # predictors (reuse/search/grow) on task["test"], without
                                           # altering the DAG — for post-hoc regret analysis.
@@ -845,6 +857,35 @@ def run_exp3a_kan(
     # (Xraw, y) actually fed to each gated task's live decision, captured at decision time so
     # `_build_gate_dump` can dump the SAME rows/order instead of re-sampling post hoc (§6).
     gate_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+    # One record per provisional root, from mint to resolution. `resolution` is the quantity the
+    # loop turns on: a mechanism whose roots are ALL resolved by timeout is delayed unconditional
+    # growth, not decision timing ([[provisional-growth-undetermined-gate]] P6).
+    provisional_log: Dict[int, dict] = {}
+
+    def _resolve_provisional(current_t: int, end_of_stream: bool = False) -> None:
+        """Mark merged provisional roots, and crystallise the ones that have run out of time.
+
+        A provisional root that consolidation merged away is no longer in `nodes` (`_merge_nodes`
+        removes it), which is the merge signal. Anything still standing after
+        `cfg.crystallise_after` further tasks, or at the end of the stream, is frozen and loses
+        the flag: no provisional root may survive the run.
+        """
+        live = {id(n): n for n in nodes}
+        for task_id, rec_p in provisional_log.items():
+            if rec_p["resolution"] is not None:
+                continue
+            node = rec_p["_node"]
+            if id(node) not in live:
+                rec_p["resolution"] = "merge"
+                rec_p["resolved_at"] = current_t
+                continue
+            aged_out = (current_t - rec_p["minted_at"]) >= cfg.crystallise_after
+            if end_of_stream or aged_out:
+                node.provisional = False
+                node.freeze()
+                rec_p["resolution"] = "timeout"
+                rec_p["resolved_at"] = current_t
+                rec_p["params_at_crystallisation"] = sum(p.numel() for p in node.parameters())
 
     def new_module_factory(parents: List[DAGNode]):
         def factory():
@@ -945,6 +986,47 @@ def run_exp3a_kan(
                     **raw_kwargs,
                 )
             gate_seconds = time.perf_counter() - gate_t0
+
+            # --- the third gate state, on a SHADOW refit (G1) -------------------------------
+            # The live ladder above is untouched: this repeats it under the `select-score`
+            # estimator inside a forked RNG, purely to obtain per-example score bits whose set
+            # never selected an epoch. The shadow's own decision is discarded; only its
+            # `estimator_meta["evalue"]` and paired SEs are read. Cost: one extra ladder fit.
+            ev = None
+            shadow_seconds = 0.0
+            if cfg.provisional != "off" and cfg.enable_search and not force:
+                sh_t0 = time.perf_counter()
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(cfg.seed * 1000 + t + 900)
+                    shadow = decide_reuse_search_grow(
+                        X, y, new_module_factory(parents), spec,
+                        concept_dim=cfg.concept_dim, n_parents=len(parents), device=device,
+                        n_epochs=cfg.gate_epochs, lr=cfg.gate_lr, eps_grow=cfg.eps_rel,
+                        eps_search=cfg.eps_search, search_budget=cfg.search_budget,
+                        search_rank=cfg.search_rank, search_skip=cfg.search_skip,
+                        reducible_mode=cfg.reducible_mode, estimator="select-score",
+                        split_generator=torch.Generator().manual_seed(cfg.seed * 1000 + t + 900),
+                        evalue_bits=math.log2(max(task["n_classes"], 2)),
+                        evalue_alpha=cfg.provisional_alpha,
+                        **raw_kwargs,
+                    )
+                sm = shadow.estimator_meta or {}
+                ev = dict(sm.get("evalue") or {})
+                ev["shadow_decision"] = shadow.decision
+                ev["se_search_minus_grow"] = sm.get("se_search_minus_grow")
+                ev["se_reuse_minus_grow"] = sm.get("se_reuse_minus_grow")
+                # The cheap rule, recorded for the necessity arm: is the live margin inside z SEs?
+                alt_is_search = ev.get("alt_rung") == "search"
+                se_alt = (sm.get("se_search_minus_grow") if alt_is_search
+                          else sm.get("se_reuse_minus_grow")) or 0.0
+                live_margin = abs((rec.L_search_bits if alt_is_search else rec.L_reuse_bits)
+                                  - rec.L_grow_bits)
+                ev["se_proxy_margin"] = live_margin
+                ev["se_proxy_se"] = se_alt
+                ev["se_proxy_fires"] = bool(se_alt > 0 and live_margin <= cfg.provisional_z * se_alt)
+                shadow_seconds = time.perf_counter() - sh_t0
+            _flush(device)
+
             if force:
                 # Merge stress-test: skip the gate and grow unconditionally, so a redundant
                 # concept exists for the consolidation pass to detect and merge. NOT a claim
@@ -973,6 +1055,31 @@ def run_exp3a_kan(
             # Wall time of the ladder itself (probe training + scoring) — the cost axis a token
             # root moves most, since every rung's grow probe now reads 1 + T tokens per sample.
             d["gate_seconds"] = gate_seconds
+            if ev is not None:
+                d["evalue"] = ev
+                d["shadow_seconds"] = shadow_seconds
+            # Which trigger, if any, defers this decision into a provisional root. `shadow`
+            # computes everything and acts on nothing, which is what makes P0b a null check.
+            provisional_here = False
+            if ev is not None and not force:
+                if cfg.provisional == "evalue":
+                    provisional_here = (ev.get("state") == "undetermined")
+                elif cfg.provisional == "se_proxy":
+                    provisional_here = bool(ev.get("se_proxy_fires"))
+                elif cfg.provisional == "always":
+                    provisional_here = (gate_cache_n <= cfg.always_n_max)
+            if provisional_here:
+                # Defer: the ladder's chosen rung is replaced by a freshly grown ROOT, flagged.
+                # Where the ladder already grows, the deferral is a no-op on the DAG and only the
+                # flag is set, so a trigger never *removes* a root the gate wanted. The ladder's
+                # own verdict is kept as `ladder_decision` so P3 can compare decided positions.
+                d["ladder_decision"] = rec.decision
+                rec.decision = "grow"
+                d["decision"] = "grow"
+            if cfg.provisional != "off":
+                # Only when the feature is on, so `--provisional off` leaves the decision records
+                # byte-identical to the published ones (P0a is a check on the JSON itself).
+                d["provisional"] = bool(provisional_here)
             decisions.append(d)
 
             if rec.decision == "grow":
@@ -984,12 +1091,37 @@ def run_exp3a_kan(
                                n_mlp_layers=cfg.n_mlp_layers, parent_models=grow_parents,
                                soft_pca_k=cfg.soft_pca_k, use_cnn=use_cnn, feature_dim=cfg.feature_dim,
                                root_family=cfg.root_family)
+                # Loop 1 provisional roots are ordinary roots plus bookkeeping: no fast output
+                # map, no writes, no schedule (those are [[provisional-root-plasticity]]). With
+                # nothing plastic on the node, a provisional root cannot perturb a reader, which
+                # is what keeps P3's null check a null check rather than a confound.
+                node.provisional = bool(provisional_here)
+                node.minted_at = t
+                if provisional_here:
+                    provisional_log[t] = {
+                        "minted_at": t, "resolution": None, "resolved_at": None,
+                        "trigger": cfg.provisional,
+                        "e_state": (ev or {}).get("state"),
+                        "log2_e_plus": (ev or {}).get("log2_e_plus"),
+                        "log2_e_minus": (ev or {}).get("log2_e_minus"),
+                        "n_score": (ev or {}).get("n"),
+                        "n_needed_plus": (ev or {}).get("n_needed_plus"),
+                        "n_needed_minus": (ev or {}).get("n_needed_minus"),
+                        "ladder_decision": d.get("ladder_decision", rec.decision),
+                        "params_at_mint": None, "_node": node,
+                    }
+                node.evalue_state = dict(ev) if (provisional_here and ev) else None
                 train_node(node, head, task["train"], cfg.child_epochs, cfg.lr, device, cfg.log_every,
-                           name=f"t{t}-grow{'-root' if grow_as_root else ''}", orth_weight=cfg.orth_weight)
+                           name=f"t{t}-{'prov' if provisional_here else 'grow'}"
+                                f"{'-root' if grow_as_root else ''}", orth_weight=cfg.orth_weight)
                 node.compute_concept_subspace(task["train"], device, top_k=cfg.subspace_k,
                                               max_batches=cfg.routing_batches)
+                # A provisional root is frozen like any other in Loop 1 (nothing is plastic yet);
+                # the flag only tells consolidation it may be resolved.
                 node.freeze()
                 nodes.append(node)
+                if t in provisional_log:
+                    provisional_log[t]["params_at_mint"] = sum(p.numel() for p in node.parameters())
                 predictors.append(TaskPredictor("grow", head, node=node))
             elif rec.decision == "search":
                 # Search: keep the best bounded-search composition over frozen parents; add NO node.
@@ -1134,6 +1266,7 @@ def run_exp3a_kan(
                                      functional_threshold=(cfg.functional_threshold
                                                            if cfg.functional_redundancy else None))
             print(f"  [consolidate @ task {t}] saved {summ['params_saved']} params, {summ['n_ops']} ops")
+            _resolve_provisional(t)
         _flush(device)
 
     # Final consolidation.
@@ -1144,6 +1277,8 @@ def run_exp3a_kan(
                                       distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance,
                                       functional_threshold=(cfg.functional_threshold
                                                             if cfg.functional_redundancy else None))
+
+    _resolve_provisional(len(tasks) - 1, end_of_stream=True)
 
     n_grow = sum(1 for d in decisions if d["decision"] == "grow")
     n_search = sum(1 for d in decisions if d["decision"] == "search")
@@ -1163,6 +1298,9 @@ def run_exp3a_kan(
         "params_total_pre_consolidation": param_curve_total[-1] if param_curve_total else 0,
         "params_per_root": [sum(p.numel() for p in n.parameters()) for n in nodes if n.is_root],
         "consolidation": consolidation,
+        "provisional": cfg.provisional,
+        "provisional_roots": [{k: v for k, v in r.items() if k != "_node"}
+                              for r in provisional_log.values()],
         "root_family": cfg.root_family,
         "n_tokens": cfg.n_tokens,
         "feature_dim": cfg.feature_dim,
