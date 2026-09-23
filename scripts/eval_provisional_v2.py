@@ -1301,7 +1301,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     gates = evaluate(data, args)
 
     da = None
-    if args.da and os.path.isfile(args.da):
+    if args.da:
+        if not os.path.isfile(args.da):
+            # Silently ignoring it makes the two DA-dependent branches and
+            # VALID-AND-REPRODUCES quietly unreachable, with no message anywhere
+            # (v2 review, should-fix 13).
+            raise SystemExit(
+                f"--da {args.da!r} does not exist. It must be the Track A desk script's JSON "
+                f"({{'verdict': ..., 'transfers': bool}}); without it the DA-dependent branches "
+                f"cannot fire. Omit --da to run with DA deferred.")
         da = h8._read_json(args.da)
 
     out: Dict = {**gates}

@@ -821,6 +821,21 @@ def test_preflight_on_the_ctrl_tree_alone_is_inconclusive_not_ok(tmp_path):
     assert {"stream": None, "seed": 42} in missing
 
 
+def test_a_missing_da_file_is_an_error_not_a_silent_deferral(tmp_path):
+    """Ignoring it makes the DA branches and VALID-AND-REPRODUCES unreachable with no message."""
+    proc = _cli("--da", str(tmp_path / "nope.json"), "--out", str(tmp_path / "g.json"))
+    assert proc.returncode != 0
+    assert "--da" in proc.stderr and "does not exist" in proc.stderr
+
+    # A real file is read as before.
+    da = tmp_path / "da.json"
+    da.write_text(json.dumps({"verdict": "underpowered"}))
+    proc2 = _cli("--da", str(da), "--out", str(tmp_path / "g2.json"))
+    assert proc2.returncode in (0, 2), proc2.stderr[-2000:]
+    assert json.loads(open(str(tmp_path / "g2.json")).read())["da_input"]["verdict"] == \
+        "underpowered"
+
+
 def test_preflight_on_an_empty_tree_is_inconclusive_not_a_pass(tmp_path):
     proc = _cli("--preflight", "--out", str(tmp_path / "p.json"))
     assert proc.returncode == 2, proc.stdout[-2000:]
