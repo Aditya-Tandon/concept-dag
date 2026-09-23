@@ -340,3 +340,54 @@ def test_update_commit_contributes_reader_audit_entry(tmp_path):
     assert e["tolerance"] == cfg.update_tolerance
     assert e["reader_deltas_val"] == d1["update"]["backward_deltas_val"]
     assert e["reader_deltas_test"] == d1["update"]["backward_deltas_test"]
+
+
+# ===========================================================================
+# 6. The truncate PROBE must not consume the run's RNG (review blocker 1)
+# ===========================================================================
+#
+# The probe runs `low_rank_factorize_final_layer` on a `copy.deepcopy` to learn whether a
+# truncation would apply at all, so a node that does not truncate pays nothing. But an APPLIED
+# factorisation builds two fresh `nn.Linear`s, whose default init draws from the CPU generator —
+# so on a node that DOES truncate the probe used to pay that init once for the throwaway copy and
+# once again for the real call, and every later draw in the run shifted by a probe that is
+# supposed to be a dry run. Zero runs in the H8 archive truncate, which is why the identity
+# fixtures never saw it.
+
+
+def test_truncate_probe_costs_the_run_nothing(monkeypatch):
+    """A pass whose probe is a free oracle must leave the SAME RNG state and the same weights."""
+    from concept_dag.experiments import kan_exp
+
+    real = kan_exp.low_rank_factorize_final_layer
+
+    def _pass(free_probe: bool):
+        node, head, loader = _make_low_rank_root(signal_at=1, kept=True)
+        calls = {"n": 0}
+
+        def maybe_free(module, **kw):
+            calls["n"] += 1
+            if free_probe and calls["n"] == 1:
+                # A probe that answers "yes, it applies" while drawing nothing whatsoever — the
+                # reference the real, forked probe has to be indistinguishable from.
+                return {"applied": True}
+            return real(module, **kw)
+
+        monkeypatch.setattr(kan_exp, "low_rank_factorize_final_layer", maybe_free)
+        torch.manual_seed(20260923)
+        summ, _, _ = _consolidate_single_node(node, head, loader, reader_tolerance=0.05)
+        assert calls["n"] == 2, "expected exactly one probe and one real factorisation"
+        return summ, node, torch.get_rng_state().clone()
+
+    summ_real, node_real, rng_real = _pass(free_probe=False)
+    summ_free, node_free, rng_free = _pass(free_probe=True)
+
+    assert any(op["op"] == "truncate" for op in summ_real["ops"]), (
+        "this test only says something when the truncation actually applies")
+    assert torch.equal(rng_real, rng_free), (
+        "the truncate probe consumed RNG — an applied factorisation builds two fresh nn.Linears "
+        "and their init draws, so without a fork a kept truncation pays that init twice and "
+        "every later draw in the run shifts")
+    for (ka, va), (kb, vb) in zip(sorted(node_real.concept_module.state_dict().items()),
+                                  sorted(node_free.concept_module.state_dict().items())):
+        assert ka == kb and torch.equal(va, vb), f"{ka} differs"

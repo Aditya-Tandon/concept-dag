@@ -328,9 +328,15 @@ def consolidate_nodes(
     # would apply; only when it would do we pay for reader accuracies and the real (mutating) call.
     if truncate_energy is not None:
         for n in nodes:
-            probe_rec = low_rank_factorize_final_layer(
-                copy.deepcopy(n.concept_module),
-                energy=truncate_energy, max_rel_error=truncate_max_rel_error)
+            # The probe is a dry run and must cost the run nothing but time. An APPLIED
+            # factorisation builds two fresh `nn.Linear`s, and their default init draws from the
+            # CPU generator — so without this fork a node that truncates pays that init TWICE
+            # (once for the throwaway deepcopy, once for real) and every later draw in the run
+            # shifts. Zero runs in the H8 archive truncate, which is exactly why it went unseen.
+            with fork_rng_all_devices():
+                probe_rec = low_rank_factorize_final_layer(
+                    copy.deepcopy(n.concept_module),
+                    energy=truncate_energy, max_rel_error=truncate_max_rel_error)
             if not probe_rec.get("applied"):
                 continue
 
