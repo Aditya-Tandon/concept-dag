@@ -366,3 +366,39 @@ def test_the_off_arm_never_reaches_the_resolution_path(tmp_path):
 
     assert "provisional_roots" not in res or res["provisional_roots"] == []
     assert all("provisional" not in d for d in res["decisions"])
+
+
+# ===========================================================================
+# 7. --provisional is refused on MPS, for every caller (review should-fix 6)
+# ===========================================================================
+#
+# Every arm but `off` rests on a forked block being a no-op on the RNG stream, and on MPS that is
+# unattainable: torch's MPS rng_state omits the philox offset, so `set_rng_state` rewinds the seed
+# but not the position in the stream. A `--provisional` run on MPS is not a null and cannot be
+# certified as one. This used to be a `warnings.warn` in `run_experiment.py`, which covered the
+# CLI and nothing else — not the tests, not the sweep scripts, not any other caller.
+
+
+@pytest.mark.parametrize("arm", ["shadow", "evalue", "se_proxy", "always"])
+def test_provisional_on_mps_is_refused(tmp_path, arm):
+    cfg = _base_cfg(tmp_path, provisional=arm, enable_search=True, search_skip=True)
+    cfg.device = "mps"
+    with pytest.raises(ValueError) as excinfo:
+        run_exp3a_kan(cfg, _make_feature_tasks(n_tasks=2, seed=1))
+    msg = str(excinfo.value)
+    assert "mps" in msg and "philox" in msg and "P0b" in msg
+    # It must refuse BEFORE doing any work — the task list is never touched.
+
+
+def test_provisional_off_on_mps_is_allowed_through_the_guard(tmp_path):
+    """The guard is about the arm, not about MPS: an `off` run is refused by nothing here."""
+    cfg = _base_cfg(tmp_path, provisional="off", enable_search=True, search_skip=True)
+    cfg.device = "mps"
+    # It will fail later for want of an actual MPS device on this machine, but NOT with the
+    # provisional refusal — which is the whole claim.
+    try:
+        run_exp3a_kan(cfg, _make_feature_tasks(n_tasks=2, seed=1))
+    except ValueError as e:                      # pragma: no cover - machine dependent
+        assert "--provisional" not in str(e)
+    except Exception:                            # pragma: no cover - no MPS on this machine
+        pass

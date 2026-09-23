@@ -1130,6 +1130,22 @@ def run_exp3a_kan(
     gate_batches = math.ceil(cfg.gate_cache_max / cfg.batch_size) if cfg.gate_cache_max else 0
     use_cnn = (cfg.backbone == "smallcnn")
 
+    # --- decision-timing preconditions ---------------------------------------------------
+    if cfg.provisional != "off" and str(cfg.device).startswith("mps"):
+        # Every arm but `off` rests on a forked block being a no-op on the RNG stream: the
+        # shadow refit computes and acts on nothing, and P0b is the check that it really did.
+        # On MPS that block cannot be made a no-op at all — torch's MPS rng_state omits the
+        # philox offset, so `set_rng_state` rewinds the seed but not the position in the stream
+        # (see concept_dag/utils/rng.py). A `--provisional` run on MPS is therefore not a null
+        # and cannot be certified as one, whatever its numbers say. Raised here rather than in
+        # run_experiment.py so it covers every caller (PR #8 review, should-fix 6).
+        raise ValueError(
+            f"--provisional {cfg.provisional} is refused on device 'mps': the MPS generator "
+            f"cannot be forked (its rng_state omits the philox offset), so the shadow refit "
+            f"perturbs every later dropout mask and the arm is not a null — P0b cannot be "
+            f"certified on this backend. Run the arm on cuda or cpu, or use --provisional off."
+        )
+
     # --- token-mode preconditions -------------------------------------------------------
     if cfg.root_family == "attn_pool":
         if use_cnn:

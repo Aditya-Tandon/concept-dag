@@ -17,8 +17,21 @@ sees a different mask stream — an arm that is supposed to compute-and-not-act
 which is why a CPU-only suite passes while a GPU run diverges.
 
 ``fork_rng_all_devices`` saves and restores the CPU generator plus every
-initialised CUDA device and the MPS generator, so a block wrapped in it is a
-true no-op on the RNG stream on every backend this project runs on.
+initialised CUDA device and the MPS generator.
+
+**MPS is not covered in the sense that matters.** On torch 2.0 the MPS
+generator's ``get_rng_state`` / ``set_rng_state`` round-trip the 36-byte seed
+state WITHOUT the philox offset, so restoring it rewinds the seed but not the
+position in the stream. A block that draws on MPS therefore cannot be made a
+no-op by this helper (or by any other), and a forked block on MPS is only
+approximately neutral. That is why ``tests/test_shadow_refit_null.py``
+deliberately uses a stand-in ``torch.Generator`` rather than ``torch.mps`` as
+its device: an MPS run cannot certify the fork contract, so it cannot be used
+to certify a null either. ``run_exp3a_kan`` refuses ``--provisional != off`` on
+MPS for exactly this reason.
+
+On CPU and CUDA a block wrapped in this helper IS a true no-op on the RNG
+stream, which is what every identity/null claim in this project rests on.
 """
 
 from __future__ import annotations
