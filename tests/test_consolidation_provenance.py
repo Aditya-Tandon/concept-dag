@@ -167,7 +167,7 @@ def _legacy_json_mismatched():
     dropped the minted_at=3 provisional root, but the archived JSON's `consolidation` field is
     the FINAL pass only — 3 ops, all `merge_rejected` — so the accepted merge is not recoverable
     from this JSON. `resolved_by_merge` (from provisional_roots) and the ops-derived cross-check
-    must disagree, and that disagreement must be reported, not hidden."""
+    therefore disagree for a reason that is about the archive's FORMAT, not its content."""
     return {
         "provisional_roots": [
             {"minted_at": 3, "resolution": "merge", "resolved_at": 4},
@@ -208,17 +208,39 @@ def test_p6_legacy_json_falls_back_to_final_pass_and_says_so():
     assert "legacy JSON: final pass only" in gate["note"]
 
 
-def test_p6_legacy_json_cross_check_mismatch_is_reported_not_hidden():
+def test_p6_legacy_json_cross_check_is_not_evaluated_at_all():
+    """A legacy JSON cannot be cross-checked, so it must not be reported as a mismatch.
+
+    This reverses an earlier reading (PR #8 review, should-fix 10). The counts are still shown,
+    and they still disagree — `resolved_by_merge` 1 against 0 accepted merge ops — but the
+    disagreement is the guaranteed consequence of the archive recording only the FINAL pass, so
+    calling it a mismatch flags the format of every 2026-09-09 run rather than anything about
+    its content. The legacy note carries the explanation instead.
+    """
     gate = eval_provisional.gate_p6({49: _legacy_json_mismatched()}, {})
     s = gate["value"]["s_interleave"]
     assert s["legacy"] is True
     assert s["resolved_by_merge"] == 1          # provisional_roots says minted_at=3 merged
     assert s["merge_accepted"] == 0             # but the final pass alone has no accepted merge
     assert s["resolved_by_merge_cross_check"] == 0
+    assert s["cross_check_mismatch"] is False   # ... and that is expected, not a finding
+    assert gate["value"]["cross_check_mismatch"] is False
+    assert "[CROSS-CHECK-MISMATCH]" not in gate["headline"]
+    assert "legacy JSON: final pass only" in gate["note"]
+    assert not s["mismatched_runs"]
+
+
+def test_p6_new_format_json_cross_check_mismatch_is_still_reported():
+    """The cross-check is a real check on an archive that CAN answer it."""
+    run = {"provisional_roots": [{"minted_at": 3, "resolution": "merge", "resolved_at": 4}],
+           "consolidation_passes": [{"ops": [{"op": "merge_rejected", "keep": 0, "drop": 3}],
+                                     "merge_attempted": 1}],
+           "decisions": [{"task": 3, "decision": "reuse"}]}
+    gate = eval_provisional.gate_p6({49: run}, {})
+    s = gate["value"]["s_interleave"]
+    assert s["legacy"] is False
     assert s["cross_check_mismatch"] is True
-    assert gate["value"]["cross_check_mismatch"] is True
     assert "[CROSS-CHECK-MISMATCH]" in gate["headline"]
-    assert "mismatch" in gate["note"].lower()
     assert s["mismatched_runs"] and s["mismatched_runs"][0]["seed"] == 49
 
 

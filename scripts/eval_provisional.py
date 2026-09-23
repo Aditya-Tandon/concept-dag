@@ -53,10 +53,13 @@ comments at each site for the reasoning):
     seed at t3 (n=5), per run at t4 (n=20)" phrasing. The 5-Datasets shadow arm is reported
     descriptively alongside (n=1 seed: no stability label is meaningful, so it is not pooled into
     the pass/fail fractions).
-  * P2(a)'s "end-of-stream t3 regret": the JSON schema has no post-consolidation re-evaluation of
-    task 3 (test_accs[3] is captured once, at the time task 3 is processed, before any later
-    consolidation event that might resolve a root minted there) — the literal ``test_accs[T3]``
-    value is used, as it is the only accuracy this schema records for that position.
+  * P2(a)'s "end-of-stream t3 regret" and P5's collateral check read ``test_accs_final`` /
+    ``average_accuracy_final`` — the DAG re-priced after the run's LAST consolidation pass, which
+    is what "end of stream" means. ``test_accs[t]`` is appended inside the task loop, ahead of
+    that iteration's consolidation, so it prices the DAG BEFORE the pass that may have resolved
+    the very root the gate is about. Runs predating those fields (the whole 2026-09-09 archive)
+    fall back to ``test_accs`` / ``average_accuracy`` and the gate record says so in
+    ``legacy_accs``; the fallback is never silent.
   * P2(b)'s accuracy-per-parameter is computed by first averaging AA and
     params_total_pre_consolidation over the (seed, stream) pairs common to arm off/evalue/always,
     then taking one ratio per arm — not a per-run ratio then averaged — since the denominator can
@@ -209,17 +212,51 @@ def dec_at(results: Optional[Dict], task: int) -> Optional[Dict]:
     return None
 
 
-def regret_at(results: Optional[Dict], task: int) -> Optional[float]:
-    """max(oracle_accs) - chosen (test_accs[task]) accuracy; skipped (None) when the decision
-    carries no oracle_accs, per the note's definition."""
+# `test_accs[t]` is appended inside the task loop, BEFORE that iteration's consolidation pass, so
+# it prices the DAG before the pass that may have resolved the very root a gate is about.
+# `test_accs_final` / `average_accuracy_final` re-price every task after the run's LAST pass —
+# the "end of stream, after all consolidation" quantity P2 and P5 are defined on. Archives that
+# predate those fields fall back, and every gate that falls back says so.
+LEGACY_ACCS_NOTE = ("legacy: pre-consolidation accs — this archive predates test_accs_final / "
+                    "average_accuracy_final, so the DAG is priced BEFORE its last consolidation "
+                    "pass")
+
+
+def final_accs(results: Optional[Dict]) -> Tuple[Optional[List[float]], bool]:
+    """(per-task accuracies after the run's last consolidation, is_legacy_fallback)."""
+    if not results:
+        return None, False
+    accs = results.get("test_accs_final")
+    if accs:
+        return accs, False
+    return results.get("test_accs"), True
+
+
+def final_aa(results: Optional[Dict]) -> Tuple[Optional[float], bool]:
+    """(average accuracy after the run's last consolidation, is_legacy_fallback)."""
+    if not results:
+        return None, False
+    aa = results.get("average_accuracy_final")
+    if aa is not None:
+        return aa, False
+    return results.get("average_accuracy"), True
+
+
+def regret_at(results: Optional[Dict], task: int,
+              use_final: bool = False) -> Tuple[Optional[float], bool]:
+    """(max(oracle_accs) - the chosen rung's accuracy at `task`, is_legacy_fallback).
+
+    None when the decision carries no oracle_accs, per the note's definition. With
+    `use_final`, the chosen accuracy is the post-consolidation one (P2's "end of stream").
+    """
     d = dec_at(results, task)
     oracle = d.get("oracle_accs") if d else None
     if not oracle:
-        return None
-    accs = (results or {}).get("test_accs")
+        return None, False
+    accs, legacy = final_accs(results) if use_final else ((results or {}).get("test_accs"), False)
     if not accs or len(accs) <= task:
-        return None
-    return max(oracle.values()) - accs[task]
+        return None, legacy
+    return max(oracle.values()) - accs[task], legacy
 
 
 def ev_at(results: Optional[Dict], task: int) -> Optional[Dict]:
@@ -348,7 +385,12 @@ def _p6_row_stats(seed: int, stream: Optional[str], r: Dict) -> Dict:
             "merge_attempted": _consolidation_attempted_total(r),
             "merge_accepted": merge_accepted, "merge_rejected": merge_rejected,
             "accepted_merge_ops_dropping_a_provisional_root": accepted_drop_is_provisional,
-            "cross_check_mismatch": resolved_by_merge != accepted_drop_is_provisional}
+            # A legacy JSON records only the FINAL pass, so an accepted merge from an
+            # intermediate pass is simply not in `ops` — the two bookkeeping paths are then
+            # expected to disagree and the cross-check cannot say anything. Reporting
+            # CROSS-CHECK-MISMATCH there would flag the archive's format, not its content.
+            "cross_check_mismatch": (not legacy) and
+                                    resolved_by_merge != accepted_drop_is_provisional}
 
 
 def _p6_aggregate(rows: List[Dict]) -> Dict:
@@ -377,7 +419,8 @@ def _p6_aggregate(rows: List[Dict]) -> Dict:
             "merge_attempted": attempted, "merge_accepted": merge_accepted,
             "merge_rejected": merge_rejected,
             "resolved_by_merge_cross_check": cross_check,
-            "cross_check_mismatch": resolved_by_merge != cross_check,
+            # Row-wise, so a legacy row (which cannot be cross-checked at all) never contributes.
+            "cross_check_mismatch": any(r["cross_check_mismatch"] for r in rows),
             "mismatched_runs": mismatched, "legacy": any_legacy}
 
 
@@ -452,6 +495,12 @@ def gate_d2(desk_path: Optional[str] = None, alpha: float = 0.05) -> Dict:
 # ---------------------------------------------------------------------------
 
 _L_FIELDS = ("L_null_bits", "L_reuse_bits", "L_search_bits", "L_grow_bits")
+# Run-level sequences that must match element for element on a bit-identical pair. `test_accs`
+# and `param_curve` are on every archive; `test_accs_final` only on post-P5 runs, so it is
+# compared when BOTH sides carry it. A null check that only looked at decisions, AA and the L_*
+# would pass a run whose per-task accuracies or parameter curve had moved underneath an
+# unchanged mean — which is exactly the kind of drift these gates exist to catch.
+_SEQUENCE_FIELDS = ("test_accs", "test_accs_final", "param_curve")
 
 
 def _compare_runs(a: Optional[Dict], b: Optional[Dict], seed: int, stream: Optional[str],
@@ -464,6 +513,19 @@ def _compare_runs(a: Optional[Dict], b: Optional[Dict], seed: int, stream: Optio
     if aa_a is not None and aa_b is not None and aa_a != aa_b:
         mismatches.append({"seed": seed, "stream": stream, "task": None,
                             "field": "average_accuracy", label_a: aa_a, label_b: aa_b})
+    for f in _SEQUENCE_FIELDS:
+        va, vb = a.get(f), b.get(f)
+        if va is None or vb is None:
+            continue
+        if len(va) != len(vb):
+            mismatches.append({"seed": seed, "stream": stream, "task": None, "field": f,
+                                label_a: va, label_b: vb, "detail": "length differs"})
+            continue
+        for i, (x, y) in enumerate(zip(va, vb)):
+            if x != y:                       # exact equality: these must be bit-identical
+                mismatches.append({"seed": seed, "stream": stream, "task": i, "field": f,
+                                    label_a: x, label_b: y})
+                break                        # first mismatching element of this field
     for da in a.get("decisions", []):
         t = da.get("task")
         db = dec_at(b, t)
@@ -484,8 +546,8 @@ def _p0_gate(gate_id: str, ref_ctrl: Dict[int, Dict[str, Dict]], ref_5ds: Dict[i
              other_ctrl: Dict[int, Dict[str, Dict]], other_5ds: Dict[int, Dict],
              ref_label: str, other_label: str, observable: str) -> Dict:
     gate = {"gate": gate_id, "observable": observable,
-            "threshold": f"decisions, average_accuracy and every L_* bit-identical between "
-                         f"{ref_label} and {other_label}",
+            "threshold": f"decisions, average_accuracy, test_accs, test_accs_final, param_curve "
+                         f"and every L_* bit-identical between {ref_label} and {other_label}",
             "value": None, "verdict": "not-run"}
     if not (ref_ctrl or ref_5ds) or not (other_ctrl or other_5ds):
         gate["note"] = f"{ref_label} and/or {other_label} data missing (CTrL and 5-Datasets)"
@@ -677,8 +739,13 @@ def gate_p2(off_ctrl, evalue_ctrl, se_proxy_ctrl, always_ctrl) -> Dict:
     # (a) paired t3 regret improvement = regret_off - regret_evalue, must be >= 0.03
     pairs_oe = paired_ctrl(off_ctrl, evalue_ctrl)
     rows_a, diffs_a = [], []
+    legacy_a = False
     for seed, stream, off_r, ev_r in pairs_oe:
-        r_off, r_ev = regret_at(off_r, T3), regret_at(ev_r, T3)
+        # "End-of-stream t3 regret": after ALL consolidation, so the accuracy must be the
+        # re-priced one. A pre-`test_accs_final` archive falls back and says so.
+        (r_off, leg_off), (r_ev, leg_ev) = (regret_at(off_r, T3, use_final=True),
+                                            regret_at(ev_r, T3, use_final=True))
+        legacy_a = legacy_a or leg_off or leg_ev
         if r_off is None or r_ev is None:
             continue
         improve = r_off - r_ev
@@ -691,6 +758,8 @@ def gate_p2(off_ctrl, evalue_ctrl, se_proxy_ctrl, always_ctrl) -> Dict:
         "pass" if mean_improve >= P2A_MIN_IMPROVE else "fail")
     a = {"rows": rows_a, "mean_improvement": mean_improve, "seed_level": seed_level_a,
          "verdict": a_verdict}
+    if legacy_a:
+        a["legacy_accs"] = LEGACY_ACCS_NOTE
 
     # (b) accuracy-per-parameter, evalue vs always, both paired against off over the COMMON
     # (seed, stream) set present in all three (aggregate AA/params first, then one ratio per arm —
@@ -770,6 +839,8 @@ def gate_p2(off_ctrl, evalue_ctrl, se_proxy_ctrl, always_ctrl) -> Dict:
         overall = "not-run"
     gate["value"] = {"a_regret_improvement": a, "b_accuracy_per_parameter": b,
                       "c_decision_disagreement": c, "proxy_suffices": proxy_suffices}
+    if legacy_a:
+        gate["legacy_accs"] = LEGACY_ACCS_NOTE
     gate["verdict"] = overall
     gate["headline"] = (f"a={a['verdict']}(Δ={mean_improve if mean_improve is not None else 'n/a'})"
                         f", b={b['verdict']}, c={c['verdict']}"
@@ -986,14 +1057,20 @@ def gate_p5(off_ctrl, evalue_ctrl, off_5ds, evalue_5ds) -> Dict:
         return gate
     pairs = paired_ctrl(off_ctrl, evalue_ctrl)
     rows, diffs, collateral = [], [], []
+    legacy = False
     for seed, stream, off_r, ev_r in pairs:
-        aa_off, aa_ev = off_r.get("average_accuracy"), ev_r.get("average_accuracy")
+        # Collateral damage is a claim about the DAG the run ENDS with, so both the mean and the
+        # per-task accuracies are the post-consolidation ones where the archive has them.
+        (aa_off, leg_o), (aa_ev, leg_e) = final_aa(off_r), final_aa(ev_r)
+        legacy = legacy or leg_o or leg_e
         if aa_off is None or aa_ev is None:
             continue
         diff = aa_ev - aa_off
         diffs.append(diff)
         task_deltas = []
-        off_accs, ev_accs = off_r.get("test_accs", []), ev_r.get("test_accs", [])
+        (off_accs, lo), (ev_accs, le) = final_accs(off_r), final_accs(ev_r)
+        off_accs, ev_accs = off_accs or [], ev_accs or []
+        legacy = legacy or lo or le
         for i, (oa, ea) in enumerate(zip(off_accs, ev_accs)):
             if i == T3:
                 continue
@@ -1020,7 +1097,8 @@ def gate_p5(off_ctrl, evalue_ctrl, off_5ds, evalue_5ds) -> Dict:
         fds_rows = []
         for seed in common:
             ob, eb = off_5ds[seed], evalue_5ds[seed]
-            aa_o, aa_e = ob.get("average_accuracy"), eb.get("average_accuracy")
+            (aa_o, leg_o5), (aa_e, leg_e5) = final_aa(ob), final_aa(eb)
+            legacy = legacy or leg_o5 or leg_e5
             aa_delta = (aa_e - aa_o) if (aa_o is not None and aa_e is not None) else None
             aa_ok = aa_delta is not None and abs(aa_delta) <= P5_FDS_AA_TOL
             counts_ok = (eb.get("n_grow") == 4 and eb.get("n_search") == 0 and eb.get("n_reuse") == 1)
@@ -1039,6 +1117,8 @@ def gate_p5(off_ctrl, evalue_ctrl, off_5ds, evalue_5ds) -> Dict:
                               "collateral_violations": collateral, "rows": rows},
                       "fivedatasets": fds}
     gate["verdict"] = "pass" if pass_ else "fail"
+    if legacy:
+        gate["legacy_accs"] = LEGACY_ACCS_NOTE
     gate["headline"] = (f"CTrL AA diff={mean_diff:.4f}, collateral={len(collateral)}"
                         + (f", 5ds ok={fds['ok']}" if fds else ", 5ds not-run"))
     if fds is None and off_5ds is not None and evalue_5ds is not None and not (off_5ds and evalue_5ds):
@@ -1088,7 +1168,8 @@ def gate_p6(int_evalue: Dict[int, Dict], ctrl_evalue: Dict[int, Dict[str, Dict]]
                         + (" [CROSS-CHECK-MISMATCH]" if any_cross_check_mismatch else ""))
     note = None
     if int_stats["legacy"] or ctrl_stats["legacy"]:
-        note = "legacy JSON: final pass only"
+        note = ("legacy JSON: final pass only — intermediate passes' accepted merges are not in "
+                "`ops`, so the resolved_by_merge cross-check is not evaluated on these runs")
     if any_cross_check_mismatch:
         mismatch_note = ("resolved_by_merge != accepted merge ops dropping a provisional root "
                          f"— s_interleave mismatched={int_stats['mismatched_runs']}, "
