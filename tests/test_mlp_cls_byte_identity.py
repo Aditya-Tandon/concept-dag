@@ -16,6 +16,12 @@ Two checks:
   point), produced `tests/fixtures/mlp_cls_baseline.json`. The current code must reproduce it
   exactly, float for float: decisions, code lengths, rel_* margins, accuracies, parameter curve
   and the consolidation record.
+* **Pre-change fixture, consolidation ON** — `tests/fixtures/mlp_cls_consolidating_baseline.json`,
+  from a stream with a deliberate duplicate task and `consolidate_every=2`, so the identity check
+  also covers `consolidate_nodes`, `_functional_similarity`, `distill_merge` (which *trains*
+  weights) and the backward-safety accept. The plain stream never gets a merge past the detector,
+  so without this case the whole merge path was outside the identity guarantee (PR #7 review,
+  should-fix 3). The recorded run accepts 2 merges and saves 1,408 parameters.
 
 Regenerate the fixture (only when a deliberate change to the CLS path is being made, and then say
 so in the commit message):
@@ -35,9 +41,13 @@ from __future__ import annotations
 import json
 import os
 
-from tests.fixtures.cls_identity_stream import comparable, run_reference
+from tests.fixtures.cls_identity_stream import (
+    comparable, run_reference, run_reference_consolidating,
+)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "mlp_cls_baseline.json")
+FIXTURE_CONSOL = os.path.join(os.path.dirname(__file__), "fixtures",
+                              "mlp_cls_consolidating_baseline.json")
 
 
 def _json_roundtrip(obj):
@@ -61,6 +71,23 @@ def test_mlp_cls_path_reproduces_the_pre_change_fixture(tmp_path):
     for key in sorted(set(expected) | set(got)):
         assert expected.get(key) == got.get(key), (
             f"mlp_cls path changed at results['{key}']:\n"
+            f"  pre-change (e258d96): {expected.get(key)!r}\n"
+            f"  current:              {got.get(key)!r}"
+        )
+    assert expected == got
+
+
+def test_mlp_cls_consolidating_path_reproduces_the_pre_change_fixture(tmp_path):
+    """As above, but on the stream that actually merges — so `distill_merge` is covered."""
+    with open(FIXTURE_CONSOL) as f:
+        expected = json.load(f)
+    got = _json_roundtrip(comparable(run_reference_consolidating(str(tmp_path / "consol"))))
+    # The point of this fixture: it must contain accepted merges, or it is not testing the path.
+    assert expected["consolidation"]["params_saved"] > 0
+    assert any(op["op"] == "merge" for op in expected["consolidation"]["ops"])
+    for key in sorted(set(expected) | set(got)):
+        assert expected.get(key) == got.get(key), (
+            f"mlp_cls consolidation path changed at results['{key}']:\n"
             f"  pre-change (e258d96): {expected.get(key)!r}\n"
             f"  current:              {got.get(key)!r}"
         )
