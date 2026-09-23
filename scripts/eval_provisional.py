@@ -291,6 +291,97 @@ def _resolution_stats(roots: List[Dict]) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# [[consolidation-provenance]] (P6): a run's intermediate consolidation passes (one per
+# `cfg.consolidate_every` tasks) were, before this fix, thrown away except for `results
+# ["consolidation"]` (the FINAL pass only) — so an accepted merge that happened mid-stream, and
+# any consolidate pass that never reached the end, was invisible to every reader of the JSON.
+# `consolidation_passes` (new field) carries every pass; a JSON without it is "legacy" (the whole
+# 2026-09-09 archive is legacy) and falls back to `[consolidation]`, i.e. the final pass only —
+# real but incomplete, so callers must surface that fallback rather than hide it.
+# ---------------------------------------------------------------------------
+
+def _consolidation_ops(r: Dict) -> Tuple[List[Dict], bool]:
+    """Concatenated ``ops`` of every consolidation pass a run recorded, oldest first, and
+    whether this JSON is legacy (no ``consolidation_passes`` -> only the final pass is visible)."""
+    passes = r.get("consolidation_passes")
+    if passes:
+        return [op for p in passes for op in (p.get("ops") or [])], False
+    legacy = r.get("consolidation") or {}
+    return list(legacy.get("ops") or []), True
+
+
+def _consolidation_attempted_total(r: Dict) -> Optional[int]:
+    """Sum of ``merge_attempted`` over every pass a run recorded; ``None`` (unknown, not 0) for a
+    legacy JSON, which predates the counter and cannot supply it even for its one visible pass."""
+    passes = r.get("consolidation_passes")
+    if not passes:
+        return None
+    total = 0
+    for p in passes:
+        v = p.get("merge_attempted")
+        if v is None:
+            return None
+        total += v
+    return total
+
+
+def _p6_row_stats(seed: int, stream: Optional[str], r: Dict) -> Dict:
+    """One run's P6 numbers, plus the resolved_by_merge / ops cross-check ([[consolidation-
+    provenance]]): `resolved_by_merge` (from `provisional_roots[*].resolution`) must equal the
+    count of accepted merge ops whose `drop` names a provisional root's `task_id` (its
+    `minted_at`, the same identity P4 already keys on) — two independent bookkeeping paths that
+    should never disagree. A mismatch is reported, not silently resolved in favor of one side."""
+    proots = r.get("provisional_roots", []) or []
+    prov_ids = {p.get("minted_at") for p in proots}
+    ops, legacy = _consolidation_ops(r)
+    merge_accepted = sum(1 for op in ops if op.get("op") == "merge")
+    merge_rejected = sum(1 for op in ops if op.get("op") == "merge_rejected")
+    accepted_drop_is_provisional = sum(
+        1 for op in ops if op.get("op") == "merge" and op.get("drop") in prov_ids)
+    resolved_by_merge = sum(1 for p in proots if p.get("resolution") == "merge")
+    resolved_by_timeout = sum(1 for p in proots if p.get("resolution") == "timeout")
+    resolved_unexplained = sum(1 for p in proots if p.get("resolution") == "removed_unexplained")
+    return {"seed": seed, "stream": stream, "legacy": legacy,
+            "n_provisional_roots": len(proots),
+            "resolved_by_merge": resolved_by_merge, "resolved_by_timeout": resolved_by_timeout,
+            "resolved_unexplained": resolved_unexplained,
+            "merge_attempted": _consolidation_attempted_total(r),
+            "merge_accepted": merge_accepted, "merge_rejected": merge_rejected,
+            "accepted_merge_ops_dropping_a_provisional_root": accepted_drop_is_provisional,
+            "cross_check_mismatch": resolved_by_merge != accepted_drop_is_provisional}
+
+
+def _p6_aggregate(rows: List[Dict]) -> Dict:
+    """Sum `_p6_row_stats` rows into one experiment's P6 numbers. `merge_attempted` is the sum
+    ONLY when every row can supply it (no legacy row in the group); otherwise `None`, since 0
+    would misreport "never attempted" as a real count."""
+    total = sum(r["n_provisional_roots"] for r in rows)
+    resolved_by_merge = sum(r["resolved_by_merge"] for r in rows)
+    resolved_by_timeout = sum(r["resolved_by_timeout"] for r in rows)
+    resolved_unexplained = sum(r["resolved_unexplained"] for r in rows)
+    merge_accepted = sum(r["merge_accepted"] for r in rows)
+    merge_rejected = sum(r["merge_rejected"] for r in rows)
+    cross_check = sum(r["accepted_merge_ops_dropping_a_provisional_root"] for r in rows)
+    any_legacy = any(r["legacy"] for r in rows)
+    attempted = (sum(r["merge_attempted"] for r in rows)
+                if rows and all(r["merge_attempted"] is not None for r in rows) else None)
+    mismatched = [{"seed": r["seed"], "stream": r["stream"],
+                   "resolved_by_merge": r["resolved_by_merge"],
+                   "accepted_merge_ops_dropping_a_provisional_root":
+                       r["accepted_merge_ops_dropping_a_provisional_root"]}
+                  for r in rows if r["cross_check_mismatch"]]
+    return {"total": total, "n_merge": resolved_by_merge, "n_timeout": resolved_by_timeout,
+            "resolved_by_merge": resolved_by_merge, "resolved_by_timeout": resolved_by_timeout,
+            "resolved_unexplained": resolved_unexplained,
+            "frac_merge": (resolved_by_merge / total) if total else None,
+            "merge_attempted": attempted, "merge_accepted": merge_accepted,
+            "merge_rejected": merge_rejected,
+            "resolved_by_merge_cross_check": cross_check,
+            "cross_check_mismatch": resolved_by_merge != cross_check,
+            "mismatched_runs": mismatched, "legacy": any_legacy}
+
+
+# ---------------------------------------------------------------------------
 # D2 — desk-stage stub (branch precedence step 2 only; not a required gate here)
 # ---------------------------------------------------------------------------
 
@@ -777,6 +868,7 @@ def gate_p4(int_evalue: Dict[int, Dict]) -> Dict:
         gate["note"] = "arm evalue s_interleave data missing"
         return gate
     rows = []
+    any_legacy = False
     for seed in INT_SEEDS:
         r = int_evalue.get(seed)
         if r is None:
@@ -785,7 +877,9 @@ def gate_p4(int_evalue: Dict[int, Dict]) -> Dict:
         root_a = next((p for p in proots if p.get("minted_at") == 1), None)
         resolved_merge = bool(root_a and root_a.get("resolution") == "merge")
         wrong_merge = False
-        for op in ((r.get("consolidation") or {}).get("ops", []) or []):
+        ops, legacy = _consolidation_ops(r)   # every pass, not just the final one (P6 fix)
+        any_legacy = any_legacy or legacy
+        for op in ops:
             if op.get("op") == "merge":
                 pair = {op.get("keep"), op.get("drop")}
                 if pair == {1, 2} or pair == {2, 3}:
@@ -810,8 +904,14 @@ def gate_p4(int_evalue: Dict[int, Dict]) -> Dict:
     gate["verdict"] = "pass" if pass_ else "fail"
     gate["headline"] = (f"{n_merge}/{n} merged (t3 reuse fraction={t3_reuse_fraction:.2f})"
                         + (" — WRONG-MERGE" if any_wrong_merge else ""))
+    note = None
     if n < len(INT_SEEDS):
-        gate["note"] = f"partial: {n}/{len(INT_SEEDS)} seeds present so far"
+        note = f"partial: {n}/{len(INT_SEEDS)} seeds present so far"
+    if any_legacy:
+        legacy_note = "legacy JSON: final pass only"
+        note = f"{note}; {legacy_note}" if note else legacy_note
+    if note:
+        gate["note"] = note
     return gate
 
 
@@ -901,29 +1001,27 @@ def gate_p5(off_ctrl, evalue_ctrl, off_5ds, evalue_5ds) -> Dict:
 def gate_p6(int_evalue: Dict[int, Dict], ctrl_evalue: Dict[int, Dict[str, Dict]]) -> Dict:
     gate = {"gate": "P6",
             "observable": "fraction of provisional_roots resolved by merge, s_interleave (arm "
-                          "evalue) and CTrL (arm evalue), pooled across runs",
+                          "evalue) and CTrL (arm evalue), pooled across runs, cross-checked "
+                          "against accepted merge ops over every consolidation pass "
+                          "([[consolidation-provenance]])",
             "threshold": f">= {P6_INT_MIN_MERGE_FRAC:.0%} on s_interleave; no threshold on CTrL",
             "value": None, "verdict": "not-run"}
-    int_roots: List[Dict] = []
-    for seed in INT_SEEDS:
-        r = int_evalue.get(seed)
-        if r is not None:
-            int_roots.extend(r.get("provisional_roots", []) or [])
-    ctrl_roots: List[Dict] = []
-    for seed in CTRL_SEEDS:
-        for stream in CTRL_STREAMS:
-            r = ctrl_evalue.get(seed, {}).get(stream)
-            if r is not None:
-                ctrl_roots.extend(r.get("provisional_roots", []) or [])
-    if not int_roots and not ctrl_roots:
+    int_rows = [_p6_row_stats(seed, "s_interleave", int_evalue[seed])
+               for seed in INT_SEEDS if int_evalue.get(seed) is not None]
+    ctrl_rows = [_p6_row_stats(seed, stream, ctrl_evalue[seed][stream])
+                for seed in CTRL_SEEDS for stream in CTRL_STREAMS
+                if ctrl_evalue.get(seed, {}).get(stream) is not None]
+    if not int_rows and not ctrl_rows:
         gate["note"] = "no provisional_roots found for arm evalue on s_interleave or CTrL"
         return gate
-    int_stats = _resolution_stats(int_roots)
-    ctrl_stats = _resolution_stats(ctrl_roots)
+    int_stats = _p6_aggregate(int_rows)
+    ctrl_stats = _p6_aggregate(ctrl_rows)
     total_roots = int_stats["total"] + ctrl_stats["total"]
-    total_merge = int_stats["n_merge"] + ctrl_stats["n_merge"]
+    total_merge = int_stats["resolved_by_merge"] + ctrl_stats["resolved_by_merge"]
     all_timeout = total_roots > 0 and total_merge == 0
-    gate["value"] = {"s_interleave": int_stats, "ctrl": ctrl_stats, "all_timeout": all_timeout}
+    any_cross_check_mismatch = int_stats["cross_check_mismatch"] or ctrl_stats["cross_check_mismatch"]
+    gate["value"] = {"s_interleave": int_stats, "ctrl": ctrl_stats, "all_timeout": all_timeout,
+                      "cross_check_mismatch": any_cross_check_mismatch}
     if int_stats["total"] == 0:
         gate["verdict"] = "not-run"
         gate["note"] = "no s_interleave provisional_roots to gate on (CTrL reported descriptively)"
@@ -931,7 +1029,18 @@ def gate_p6(int_evalue: Dict[int, Dict], ctrl_evalue: Dict[int, Dict[str, Dict]]
         gate["verdict"] = "pass" if int_stats["frac_merge"] >= P6_INT_MIN_MERGE_FRAC else "fail"
     gate["headline"] = (f"s_interleave merge frac={int_stats['frac_merge']}, "
                         f"CTrL merge frac={ctrl_stats['frac_merge']}"
-                        + (" [TIMING-IS-JUST-GROW]" if all_timeout else ""))
+                        + (" [TIMING-IS-JUST-GROW]" if all_timeout else "")
+                        + (" [CROSS-CHECK-MISMATCH]" if any_cross_check_mismatch else ""))
+    note = None
+    if int_stats["legacy"] or ctrl_stats["legacy"]:
+        note = "legacy JSON: final pass only"
+    if any_cross_check_mismatch:
+        mismatch_note = ("resolved_by_merge != accepted merge ops dropping a provisional root "
+                         f"— s_interleave mismatched={int_stats['mismatched_runs']}, "
+                         f"CTrL mismatched={ctrl_stats['mismatched_runs']}")
+        note = f"{note}; {mismatch_note}" if note else mismatch_note
+    if note:
+        gate["note"] = note
     return gate
 
 

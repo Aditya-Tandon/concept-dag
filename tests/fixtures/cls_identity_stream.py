@@ -28,7 +28,15 @@ NEW_OR_NONDETERMINISTIC_KEYS = {
     # The PER-DECISION H8 fields are emitted only when `provisional != "off"`, so they need no
     # exclusion — that is what makes the identity check cover the decision records themselves.
     "provisional", "provisional_roots",
+    # [[consolidation-provenance]] P6: every intermediate consolidation pass, previously thrown
+    # away. New top-level key, so a plain top-level filter is enough.
+    "consolidation_passes",
 }
+# [[consolidation-provenance]] P6: fields `consolidate_nodes` / `run_exp3a_kan` now add to the
+# (still-present) `consolidation` key itself — attempt/accept/reject counters and pass position —
+# stripped from the nested dict rather than the whole key, so the merge/params numbers it already
+# carried stay covered by the identity check.
+NEW_CONSOLIDATION_KEYS = {"merge_attempted", "merge_accepted", "merge_rejected", "at_task", "final"}
 DECISION_KEYS_TO_IGNORE = {"gate_seconds"}
 
 
@@ -88,6 +96,9 @@ def comparable(results: dict) -> dict:
         {k: v for k, v in d.items() if k not in DECISION_KEYS_TO_IGNORE}
         for d in results["decisions"]
     ]
+    if "consolidation" in out:
+        out["consolidation"] = {k: v for k, v in out["consolidation"].items()
+                                if k not in NEW_CONSOLIDATION_KEYS}
     return out
 
 

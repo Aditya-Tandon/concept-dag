@@ -284,6 +284,7 @@ def consolidate_nodes(
 
     params_before = pcount()
     ops: List[dict] = []
+    merge_attempted = 0
 
     # (1) Low-rank re-crystallisation.
     if truncate_energy is not None:
@@ -334,6 +335,7 @@ def consolidate_nodes(
                     if sim < similarity_threshold:
                         continue
                 affected = affected_task_ids(a) | affected_task_ids(b)
+                merge_attempted += 1
 
                 if not distill:
                     # Structural merge (safe only for near-identical subspaces); gate decides.
@@ -377,7 +379,10 @@ def consolidate_nodes(
                 break
 
     return {"params_before": params_before, "params_after": pcount(),
-            "params_saved": params_before - pcount(), "n_ops": len(ops), "ops": ops}
+            "params_saved": params_before - pcount(), "n_ops": len(ops), "ops": ops,
+            "merge_attempted": merge_attempted,
+            "merge_accepted": sum(1 for op in ops if op["op"] == "merge"),
+            "merge_rejected": sum(1 for op in ops if op["op"] == "merge_rejected")}
 
 
 def _is_ancestor(anc: DAGNode, desc: DAGNode) -> bool:
@@ -862,22 +867,39 @@ def run_exp3a_kan(
     # loop turns on: a mechanism whose roots are ALL resolved by timeout is delayed unconditional
     # growth, not decision timing ([[provisional-growth-undetermined-gate]] P6).
     provisional_log: Dict[int, dict] = {}
+    # Every consolidation pass's summary dict, in call order (see `consolidation_passes` in
+    # `results`); `consolidate_every` intermediate passes are otherwise thrown away except for a
+    # one-line print, which hid every accepted merge on `s_interleave`
+    # ([[consolidation-provenance]] P6).
+    consolidation_passes: List[dict] = []
 
-    def _resolve_provisional(current_t: int, end_of_stream: bool = False) -> None:
+    def _resolve_provisional(current_t: int, end_of_stream: bool = False,
+                             pass_result: Optional[dict] = None) -> None:
         """Mark merged provisional roots, and crystallise the ones that have run out of time.
 
         A provisional root that consolidation merged away is no longer in `nodes` (`_merge_nodes`
-        removes it), which is the merge signal. Anything still standing after
-        `cfg.crystallise_after` further tasks, or at the end of the stream, is frozen and loses
-        the flag: no provisional root may survive the run.
+        removes it), which is the merge signal that it resolved by merge — but WHICH merge, and
+        into what, has to come from `pass_result["ops"]` (the pass that just ran), not inference:
+        map the vanished node's `task_id` to the accepted `{"op": "merge", ...}` whose `drop`
+        names it. If no such op exists, the node vanished for an unexplained reason — a bug
+        signal, not a merge — and is recorded as `"removed_unexplained"` rather than silently
+        called a merge.
         """
         live = {id(n): n for n in nodes}
+        merge_by_drop = {op["drop"]: op for op in (pass_result or {}).get("ops", [])
+                         if op["op"] == "merge"}
         for task_id, rec_p in provisional_log.items():
             if rec_p["resolution"] is not None:
                 continue
             node = rec_p["_node"]
             if id(node) not in live:
-                rec_p["resolution"] = "merge"
+                merge_op = merge_by_drop.get(task_id)
+                if merge_op is not None:
+                    rec_p["resolution"] = "merge"
+                    rec_p["merged_into"] = merge_op["keep"]
+                    rec_p["merge_pass_at_task"] = current_t
+                else:
+                    rec_p["resolution"] = "removed_unexplained"
                 rec_p["resolved_at"] = current_t
                 continue
             aged_out = (current_t - rec_p["minted_at"]) >= cfg.crystallise_after
@@ -1277,7 +1299,10 @@ def run_exp3a_kan(
                                      functional_threshold=(cfg.functional_threshold
                                                            if cfg.functional_redundancy else None))
             print(f"  [consolidate @ task {t}] saved {summ['params_saved']} params, {summ['n_ops']} ops")
-            _resolve_provisional(t)
+            summ["at_task"] = t
+            summ["final"] = False
+            consolidation_passes.append(summ)
+            _resolve_provisional(t, pass_result=summ)
         _flush(device)
 
     # Final consolidation.
@@ -1288,8 +1313,11 @@ def run_exp3a_kan(
                                       distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance,
                                       functional_threshold=(cfg.functional_threshold
                                                             if cfg.functional_redundancy else None))
+    consolidation["at_task"] = len(tasks) - 1
+    consolidation["final"] = True
+    consolidation_passes.append(consolidation)
 
-    _resolve_provisional(len(tasks) - 1, end_of_stream=True)
+    _resolve_provisional(len(tasks) - 1, end_of_stream=True, pass_result=consolidation)
 
     n_grow = sum(1 for d in decisions if d["decision"] == "grow")
     n_search = sum(1 for d in decisions if d["decision"] == "search")
@@ -1309,6 +1337,7 @@ def run_exp3a_kan(
         "params_total_pre_consolidation": param_curve_total[-1] if param_curve_total else 0,
         "params_per_root": [sum(p.numel() for p in n.parameters()) for n in nodes if n.is_root],
         "consolidation": consolidation,
+        "consolidation_passes": consolidation_passes,
         "provisional": cfg.provisional,
         "provisional_roots": [{k: v for k, v in r.items() if k != "_node"}
                               for r in provisional_log.values()],
