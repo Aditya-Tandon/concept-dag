@@ -598,8 +598,9 @@ def _first_deferral(run: Dict) -> Optional[int]:
 def gate_v5(pairs: List[Tuple[int, Optional[str], Dict, Dict]]) -> Dict:
     """`pairs` is (seed, stream, off_run, evalue_run) over CTrL + s_interleave."""
     gate = {"gate": "V5",
-            "observable": "(a) per-task test_accs_final deltas, split at the run's FIRST "
-                          "deferral: exact identity before it, seed-mean threshold after it; "
+            "observable": "(a) per-task deltas, split at the run's FIRST deferral: EXACT "
+                          "identity on `test_accs` before it, seed-mean on `test_accs_final` "
+                          "after it; "
                           "(b) the deferred reuse-must-win revisit (CTrL t4, revisit_of == 0); "
                           "(c) rolled-back reader_audit entries, counted",
             "threshold": f"(a) before: exact; after: seed-mean >= {V5A_POST_TOL}; "
@@ -617,19 +618,37 @@ def gate_v5(pairs: List[Tuple[int, Optional[str], Dict, Dict]]) -> Dict:
         (off_accs, lo), (ev_accs, le) = h8.final_accs(off_r), h8.final_accs(ev_r)
         legacy = legacy or lo or le
         off_accs, ev_accs = off_accs or [], ev_accs or []
+        # The EXACT-identity clause is read on `test_accs`, not `test_accs_final`. Its whole
+        # justification is "the arms share every RNG draw until the first deferral", which is an
+        # argument about the accuracy captured inside the task loop — the final consolidation
+        # pass runs afterwards and may legitimately move `test_accs_final` on one arm and not the
+        # other, so demanding exact equality there reports a correct run as a leak and fires
+        # DEFERRAL-COSTS (v2 review, should-fix 4; the note is amended to match). The
+        # post-deferral clause stays on `test_accs_final`, which is the DAG the run ends with.
+        off_pre = off_r.get("test_accs") or []
+        ev_pre = ev_r.get("test_accs") or []
         first = _first_deferral(ev_r)
         deferred = set(_deferred_tasks(ev_r))
-        for t, (oa, ea) in enumerate(zip(off_accs, ev_accs)):
+        n_tasks = max(len(off_accs), len(ev_accs), len(off_pre), len(ev_pre))
+        for t in range(n_tasks):
             if t in deferred:
                 continue                       # a deferred position is not "collateral"
             if first is None or t < first:
+                if t >= len(off_pre) or t >= len(ev_pre):
+                    continue
+                oa, ea = off_pre[t], ev_pre[t]
                 # Before the first deferral the two arms share every RNG draw, so a nonzero
                 # delta is a LEAK, not a cost — reported as such.
                 if oa != ea:
                     before_violations.append({"seed": seed, "stream": stream, "task": t,
+                                              "field": "test_accs",
                                               "off": oa, "evalue": ea, "delta": ea - oa})
             else:
+                if t >= len(off_accs) or t >= len(ev_accs):
+                    continue
+                oa, ea = off_accs[t], ev_accs[t]
                 after_rows.append({"seed": seed, "stream": stream, "task": t,
+                                   "field": "test_accs_final",
                                    "off": oa, "evalue": ea, "diff": ea - oa})
 
         # (b) the deferred revisit: CTrL t4 with ctrl.revisit_of == 0, and only runs that defer

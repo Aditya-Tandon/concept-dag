@@ -386,11 +386,16 @@ def test_v4_checks_both_curves(ev):
 _REVISIT_GT = [None, None, None, None, {"revisit_of": 0}]
 
 
-def _v5_pair(off_accs, ev_accs, deferred=(3,), ctrl_gt=None):
+def _v5_pair(off_accs, ev_accs, deferred=(3,), ctrl_gt=None,
+             off_pre=None, ev_pre=None):
+    """`*_accs` are `test_accs_final`; `*_pre` override `test_accs` where a test needs the two
+    to differ (the before-first-deferral clause reads the pre-consolidation field)."""
     decisions = [{"task": t, "decision": "grow",
                   **({"provisional": True} if t in deferred else {})} for t in range(5)]
-    off = run(accs_final=list(off_accs))
-    evr = run(decisions=decisions, accs_final=list(ev_accs), ctrl_gt=ctrl_gt)
+    off = run(accs=list(off_pre if off_pre is not None else off_accs),
+              accs_final=list(off_accs))
+    evr = run(decisions=decisions, accs=list(ev_pre if ev_pre is not None else ev_accs),
+              accs_final=list(ev_accs), ctrl_gt=ctrl_gt)
     return off, evr
 
 
@@ -408,6 +413,34 @@ def test_v5a_fails_on_a_leak_before_the_first_deferral(ev):
     assert a["verdict"] == "fail"
     assert a["before_first_deferral_violations"][0]["task"] == 1
     assert g["verdict"] == "fail"
+
+
+def test_v5a_before_split_reads_test_accs_not_test_accs_final(ev):
+    """The final pass may legitimately move `test_accs_final` on one arm and not the other."""
+    # Identical pre-consolidation accuracies; the final pass moves t1 on the evalue arm only.
+    off, evr = _v5_pair([0.9] * 5, [0.9, 0.7, 0.9, 0.5, 0.9],
+                        off_pre=[0.9] * 5, ev_pre=[0.9] * 5, deferred=(3,))
+    g = ev.gate_v5([(42, "s_minus", off, evr)])
+    assert g["value"]["a_non_deferred_positions"]["before_first_deferral_violations"] == [], (
+        "a pre-first-deferral position must be compared on test_accs, where the arms really do "
+        "share every draw")
+
+    # ... and a genuine pre-consolidation difference there is still caught.
+    off2, evr2 = _v5_pair([0.9] * 5, [0.9] * 5,
+                          off_pre=[0.9] * 5, ev_pre=[0.9, 0.8, 0.9, 0.9, 0.9], deferred=(3,))
+    g2 = ev.gate_v5([(42, "s_minus", off2, evr2)])
+    viol = g2["value"]["a_non_deferred_positions"]["before_first_deferral_violations"]
+    assert viol and viol[0]["task"] == 1 and viol[0]["field"] == "test_accs"
+
+
+def test_v5a_after_split_reads_test_accs_final(ev):
+    """After the first deferral the DAG the run ENDS with is the subject."""
+    off, evr = _v5_pair([0.9] * 5, [0.9, 0.9, 0.9, 0.5, 0.85],
+                        off_pre=[0.9] * 5, ev_pre=[0.9] * 5, deferred=(3,))
+    g = ev.gate_v5([(42, "s_minus", off, evr)])
+    a = g["value"]["a_non_deferred_positions"]
+    assert a["after_first_deferral"][0]["rows"][0]["field"] == "test_accs_final"
+    assert a["after_violations"][0]["task"] == 4
 
 
 def test_v5a_fails_on_a_post_deferral_seed_mean_below_tolerance(ev):
