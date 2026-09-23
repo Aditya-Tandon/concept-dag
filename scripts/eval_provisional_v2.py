@@ -91,6 +91,20 @@ V1_CKA_THRESHOLD = 0.55           # the pre-filter threshold under counterfactua
 V1_MIN_REMOVED_FRAC = 0.70        # >= 70 % of backward-vetoed pairs removed
 R1_PROXY_SUFFICES_FRAC = 0.20     # < 20 % differing positions = the proxy suffices
 
+# --- the pre-registered run table, as PAIR EXPECTATIONS -------------------------------------
+# A null gate that compares only the pairs that happen to be on disk certifies nothing: a
+# missing run is not a mismatch, so the gate passes on a subset and --preflight exits 0 without
+# ever having looked at the pairs it exists for (v2 review, blocker 3). Every identity gate is
+# therefore told what it MUST compare, and is short-changed, not satisfied, when a pair is absent.
+V0B_CTRL_SEEDS = (42, 43, 44, 45, 46)          # x 4 streams = 20 pairs
+V0B_5DS_SEEDS = (42, 43, 44)                   # 3 pairs
+V0B_INT_SEEDS = (42,)                          # 1 pair  -> 24 in total
+#: The V0 pre-flight (judge change 1): 8 runs = 5-Datasets off+shadow seeds 42-44 and
+#: s_interleave off+shadow seed 42, i.e. 4 shadow-vs-off pairs, plus whatever V0a references
+#: exist for those same runs. Pod A is not created until these pass.
+PREFLIGHT_5DS_SEEDS = V0B_5DS_SEEDS
+PREFLIGHT_INT_SEEDS = V0B_INT_SEEDS
+
 #: The note's "Bit-identity, operationally" field list. Present-on-one-side-only is a failure.
 BIT_IDENTITY_FIELDS = ("average_accuracy", "test_accs", "param_curve", "param_curve_total")
 BIT_IDENTITY_OPTIONAL = ("test_accs_final", "average_accuracy_final")
@@ -174,23 +188,47 @@ def compare_runs(a: Optional[Dict], b: Optional[Dict], seed: int, stream: Option
 
 
 def _identity_gate(gate_id: str, observable: str, pairs: Sequence[Tuple],
-                   label_a: str, label_b: str) -> Dict:
-    """`pairs` is a sequence of (seed, stream, run_a, run_b)."""
+                   label_a: str, label_b: str,
+                   expected: Optional[Set[Tuple[Optional[str], int]]] = None) -> Dict:
+    """`pairs` is a sequence of (seed, stream, run_a, run_b).
+
+    `expected` is the set of (stream, seed) keys this gate MUST compare. A key with no usable
+    pair is `incomplete`, which fails the gate and makes the run INCONCLUSIVE: a null gate that
+    silently narrows to whatever is on disk can certify a null it never checked.
+    """
     gate = {"gate": gate_id, "observable": observable,
             "threshold": ("decisions, average_accuracy, every L_*, test_accs, param_curve, "
                           "param_curve_total (+ the *_final fields when both carry them) "
-                          f"bit-identical between {label_a} and {label_b}"),
+                          f"bit-identical between {label_a} and {label_b}"
+                          + (f", over all {len(expected)} pre-registered pairs"
+                             if expected else "")),
             "value": None, "verdict": "not-run"}
     usable = [(s, st, ra, rb) for (s, st, ra, rb) in pairs if ra is not None and rb is not None]
-    if not usable:
-        gate["note"] = f"no matched runs between {label_a} and {label_b}"
-        return gate
+    compared = {(st, s) for (s, st, _a, _b) in usable}
+    missing = sorted(((st or "", s) for (st, s) in (set(expected or ()) - compared)))
+    missing_rows = [{"stream": st or None, "seed": s} for st, s in missing]
+
     mismatches: List[Dict] = []
     for seed, stream, ra, rb in usable:
         mismatches.extend(compare_runs(ra, rb, seed, stream, label_a, label_b))
-    gate["value"] = {"n_runs_compared": len(usable), "n_mismatches": len(mismatches),
+    gate["value"] = {"n_runs_compared": len(usable),
+                     "n_expected": (len(expected) if expected is not None else None),
+                     "missing_pairs": missing_rows,
+                     "n_mismatches": len(mismatches),
                      "first_mismatch": mismatches[0] if mismatches else None,
                      "all_mismatches": mismatches}
+    if not usable and not expected:
+        gate["value"] = None
+        gate["note"] = f"no matched runs between {label_a} and {label_b}"
+        return gate
+    if missing_rows:
+        gate["incomplete"] = True
+        gate["verdict"] = "fail"
+        gate["note"] = (f"INCOMPLETE: {len(missing_rows)} of {len(expected)} pre-registered "
+                        f"pairs absent — this gate cannot certify a null it never compared")
+        gate["headline"] = (f"{len(usable)}/{len(expected)} pairs compared, "
+                            f"{len(mismatches)} mismatches; missing {missing_rows}")
+        return gate
     gate["verdict"] = "pass" if not mismatches else "fail"
     gate["headline"] = (f"{len(usable)} runs bit-identical" if not mismatches else
                         f"{len(mismatches)} mismatches over {len(usable)} runs "
@@ -212,15 +250,25 @@ def _single_pairs(a: Dict[int, Dict], b: Dict[int, Dict], stream: Optional[str])
     return [(seed, stream, a[seed], b[seed]) for seed in sorted(set(a) & set(b))]
 
 
-def gate_v0a_i(off_ctrl, off_5ds, base_ctrl, base_5ds) -> Dict:
+def reference_keys_ctrl(tree: Dict[int, Dict[str, Dict]]) -> Set[Tuple[Optional[str], int]]:
+    """Every (stream, seed) a REFERENCE tree carries — what a V0a gate must reproduce."""
+    return {(st, s) for s in tree for st in CTRL_STREAMS if tree[s].get(st) is not None}
+
+
+def reference_keys_single(tree: Dict[int, Dict],
+                          stream: Optional[str]) -> Set[Tuple[Optional[str], int]]:
+    return {(stream, s) for s in tree}
+
+
+def gate_v0a_i(off_ctrl, off_5ds, base_ctrl, base_5ds, expected=None) -> Dict:
     return _identity_gate(
         "V0a-i",
         "arm off on CTrL + 5-Datasets vs the attn-root adoption baseline",
         _ctrl_pairs(base_ctrl, off_ctrl) + _single_pairs(base_5ds, off_5ds, None),
-        "baseline(attn_pool adoption run)", "arm off")
+        "baseline(attn_pool adoption run)", "arm off", expected=expected)
 
 
-def gate_v0a_ii(off_ctrl, off_int, off_5ds, h8_ctrl, h8_int, h8_5ds) -> Dict:
+def gate_v0a_ii(off_ctrl, off_int, off_5ds, h8_ctrl, h8_int, h8_5ds, expected=None) -> Dict:
     return _identity_gate(
         "V0a-ii",
         "arm off on ALL THREE streams (s_interleave included) vs the archived H8 off arms — "
@@ -228,11 +276,11 @@ def gate_v0a_ii(off_ctrl, off_int, off_5ds, h8_ctrl, h8_int, h8_5ds) -> Dict:
         (_ctrl_pairs(h8_ctrl, off_ctrl)
          + _single_pairs(h8_int, off_int, "s_interleave")
          + _single_pairs(h8_5ds, off_5ds, None)),
-        "H8 archive arm off", "arm off")
+        "H8 archive arm off", "arm off", expected=expected)
 
 
-def gate_v0b(off_ctrl, off_int, off_5ds, sh_ctrl, sh_int, sh_5ds) -> Dict:
-    gate = _identity_gate(
+def gate_v0b(off_ctrl, off_int, off_5ds, sh_ctrl, sh_int, sh_5ds, expected=None) -> Dict:
+    return _identity_gate(
         "V0b",
         "arm shadow vs arm off — CTrL (20 pairs), 5-Datasets seeds 42-44 (3), s_interleave "
         "seed 42 (1): the shadow refit computes the third state and must act on nothing, "
@@ -240,11 +288,7 @@ def gate_v0b(off_ctrl, off_int, off_5ds, sh_ctrl, sh_int, sh_5ds) -> Dict:
         (_ctrl_pairs(off_ctrl, sh_ctrl)
          + _single_pairs(off_int, sh_int, "s_interleave")
          + _single_pairs(off_5ds, sh_5ds, None)),
-        "arm off", "arm shadow")
-    if gate["value"] and gate["value"]["n_runs_compared"] < 24:
-        n = gate["value"]["n_runs_compared"]
-        gate["note"] = f"partial: {n}/24 pre-registered pairs present"
-    return gate
+        "arm off", "arm shadow", expected=expected)
 
 
 # ---------------------------------------------------------------------------
@@ -1062,14 +1106,57 @@ def load_all(args) -> Dict:
     }
 
 
+def expected_pairs(data: Dict, preflight: bool) -> Dict[str, Set[Tuple[Optional[str], int]]]:
+    """What each identity gate MUST compare (v2 review, blocker 3).
+
+    V0b's expectation is the pre-registered run table, so a missing run is short-changed rather
+    than quietly excused. V0a's expectations are the REFERENCES' own keys — every archived run
+    the new `off` arm has to reproduce — since the references are the authority on what exists.
+    In pre-flight mode all three are narrowed to the 8 pre-flight runs (5-Datasets off+shadow
+    seeds 42-44, s_interleave off+shadow seed 42), which is exactly the point of judge change 1:
+    NULL-STILL-BROKEN must cost 8 runs, not 129, and must not be skippable by an empty directory.
+    """
+    if preflight:
+        v0b = ({(None, s) for s in PREFLIGHT_5DS_SEEDS}
+               | {("s_interleave", s) for s in PREFLIGHT_INT_SEEDS})
+        ref_i = reference_keys_single(data["baseline_5ds"], None)
+        ref_ii = (reference_keys_single(data["h8_5ds"], None)
+                  | reference_keys_single(data["h8_int"], "s_interleave"))
+        keep = {(None, s) for s in PREFLIGHT_5DS_SEEDS} | {
+            ("s_interleave", s) for s in PREFLIGHT_INT_SEEDS}
+        return {"V0b": v0b, "V0a-i": ref_i & keep, "V0a-ii": ref_ii & keep}
+    return {
+        "V0b": ({(st, s) for s in V0B_CTRL_SEEDS for st in CTRL_STREAMS}
+                | {(None, s) for s in V0B_5DS_SEEDS}
+                | {("s_interleave", s) for s in V0B_INT_SEEDS}),
+        "V0a-i": (reference_keys_ctrl(data["baseline_ctrl"])
+                  | reference_keys_single(data["baseline_5ds"], None)),
+        "V0a-ii": (reference_keys_ctrl(data["h8_ctrl"])
+                   | reference_keys_single(data["h8_int"], "s_interleave")
+                   | reference_keys_single(data["h8_5ds"], None)),
+    }
+
+
 def evaluate(data: Dict, args) -> Dict:
     gates: Dict[str, Dict] = {}
+    exp = expected_pairs(data, args.preflight)
+    if args.preflight:
+        # Pod B runs first and the pre-flight is about ITS 8 runs; CTrL does not exist yet, and
+        # comparing whatever CTrL happens to be on disk would only pad the headline with runs the
+        # pre-flight makes no claim about.
+        data = dict(data)
+        data["ctrl"] = {arm: {} for arm in data["ctrl"]}
+        data["baseline_ctrl"] = {}
+        data["h8_ctrl"] = {}
     gates["V0a-i"] = gate_v0a_i(data["ctrl"]["off"], data["5ds"]["off"],
-                                data["baseline_ctrl"], data["baseline_5ds"])
+                                data["baseline_ctrl"], data["baseline_5ds"],
+                                expected=exp["V0a-i"])
     gates["V0a-ii"] = gate_v0a_ii(data["ctrl"]["off"], data["int"]["off"], data["5ds"]["off"],
-                                  data["h8_ctrl"], data["h8_int"], data["h8_5ds"])
+                                  data["h8_ctrl"], data["h8_int"], data["h8_5ds"],
+                                  expected=exp["V0a-ii"])
     gates["V0b"] = gate_v0b(data["ctrl"]["off"], data["int"]["off"], data["5ds"]["off"],
-                            data["ctrl"]["shadow"], data["int"]["shadow"], data["5ds"]["shadow"])
+                            data["ctrl"]["shadow"], data["int"]["shadow"], data["5ds"]["shadow"],
+                            expected=exp["V0b"])
     if args.preflight:
         return gates
 
@@ -1156,21 +1243,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         da = h8._read_json(args.da)
 
     out: Dict = {**gates}
+    incomplete = {k: (g.get("value") or {}).get("missing_pairs")
+                  for k, g in gates.items() if g.get("incomplete")}
+    # A detected mismatch outranks incompleteness: a gate that is BOTH short-changed and
+    # already disagreeing has still found a real leak, and the pre-flight must say "failed,
+    # do not create pod A" rather than the softer "inconclusive".
+    mismatching = [k for k, g in gates.items()
+                   if (g.get("value") or {}).get("n_mismatches")]
+
     if args.preflight:
-        failed = [k for k, g in gates.items() if g.get("verdict") == "fail"]
         checked = sum((g.get("value") or {}).get("n_runs_compared", 0) for g in gates.values())
-        out["preflight"] = {"failed_gates": failed, "n_runs_compared": checked}
+        out["preflight"] = {"failed_gates": mismatching, "incomplete_gates": incomplete,
+                            "n_runs_compared": checked}
         _print_table(gates)
         with open(args.out, "w") as f:
             json.dump(out, f, indent=2)
         print(f"\nWrote {args.out}")
-        if failed:
-            print(f"\n=== PREFLIGHT FAILED: {failed} — do not create pod A ===")
+        if mismatching:
+            print(f"\n=== PREFLIGHT FAILED: {mismatching} — do not create pod A ===")
             return 1
-        if checked == 0:
-            # A preflight that compared nothing has certified nothing; saying "pass" here would
-            # licence the 129-run sweep on the strength of an empty directory.
-            print("\n=== PREFLIGHT INCONCLUSIVE: no runs were compared ===")
+        if incomplete:
+            # A pre-flight that narrowed itself to whatever was on disk has certified nothing.
+            # Saying "OK" here would licence the 129-run sweep on the strength of the runs that
+            # happen to exist — including, in the reviewer's case, a ctrl/ tree alone, with the
+            # 5-Datasets and s_interleave pairs the pre-flight EXISTS for never compared.
+            print(f"\n=== PREFLIGHT INCONCLUSIVE: pre-registered pairs missing: {incomplete} ===")
             return 2
         print(f"\n=== PREFLIGHT OK: {checked} run comparisons, no mismatches ===")
         return 0
@@ -1179,11 +1276,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     out["branch"] = branch["branch"]
     out["branch_detail"] = branch
     out["da_input"] = da
+    out["incomplete_gates"] = incomplete
     _print_table(gates)
     print(f"\n=== branch: {branch['branch']} ===\n  reason: {branch['reason']}")
     with open(args.out, "w") as f:
         json.dump(out, f, indent=2)
     print(f"\nWrote {args.out}")
+    if incomplete:
+        print(f"\n=== INCONCLUSIVE: pre-registered pairs missing: {incomplete} ===")
+        return 2
     return 0
 
 

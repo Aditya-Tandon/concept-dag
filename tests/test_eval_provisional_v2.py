@@ -139,6 +139,43 @@ def test_missing_reference_is_not_run_not_pass(ev):
     assert ev.gate_v0a_i(tree(s_minus=run()), {}, {}, {})["verdict"] == "not-run"
 
 
+# --- expected pair counts (v2 review, blocker 3) --------------------------------------------
+
+
+def test_an_identity_gate_is_short_changed_not_satisfied_by_a_missing_pair(ev):
+    """Comparing only the pairs that happen to exist certifies a null that was never checked."""
+    off, shadow = tree(s_minus=run(), s_plus=run()), tree(s_minus=run())
+    expected = {("s_minus", 42), ("s_plus", 42)}
+    g = ev.gate_v0b(off, {}, {}, shadow, {}, {}, expected=expected)
+    assert g["verdict"] == "fail" and g["incomplete"] is True
+    assert g["value"]["n_runs_compared"] == 1 and g["value"]["n_expected"] == 2
+    assert g["value"]["missing_pairs"] == [{"stream": "s_plus", "seed": 42}]
+    assert "INCOMPLETE" in g["note"]
+
+    # ... and with every expected pair present it passes as before.
+    g2 = ev.gate_v0b(off, {}, {}, tree(s_minus=run(), s_plus=run()), {}, {}, expected=expected)
+    assert g2["verdict"] == "pass" and not g2.get("incomplete")
+
+
+def test_the_preregistered_expectations_are_the_run_table(ev):
+    data = {"baseline_ctrl": {}, "baseline_5ds": {}, "h8_ctrl": {}, "h8_int": {}, "h8_5ds": {}}
+    full = ev.expected_pairs(data, preflight=False)
+    assert len(full["V0b"]) == 24                       # 20 CTrL + 3 5ds + 1 s_interleave
+    assert (None, 44) in full["V0b"] and ("s_interleave", 42) in full["V0b"]
+
+    pre = ev.expected_pairs(data, preflight=True)
+    assert pre["V0b"] == {(None, 42), (None, 43), (None, 44), ("s_interleave", 42)}
+
+
+def test_v0a_expectations_come_from_the_references_own_keys(ev):
+    data = {"baseline_ctrl": tree(s_minus=run(), s_plus=run()),
+            "baseline_5ds": {42: run(), 43: run()},
+            "h8_ctrl": {}, "h8_int": {44: run()}, "h8_5ds": {}}
+    full = ev.expected_pairs(data, preflight=False)
+    assert full["V0a-i"] == {("s_minus", 42), ("s_plus", 42), (None, 42), (None, 43)}
+    assert full["V0a-ii"] == {("s_interleave", 44)}
+
+
 # ---------------------------------------------------------------------------
 # V2
 # ---------------------------------------------------------------------------
@@ -644,7 +681,9 @@ def test_evaluator_names_null_still_broken_on_the_h8_archive(tmp_path):
     proc = _cli("--ctrl", os.path.join(ARCHIVE, "ctrl"), "--interleave", ARCHIVE,
                 "--fivedatasets", ARCHIVE, "--baseline", BASELINE, "--h8", ARCHIVE,
                 "--out", out)
-    assert proc.returncode == 0, proc.stderr[-3000:]
+    # 2 = INCONCLUSIVE: the H8 archive is not the H9 run table (it has one 5-Datasets seed, no
+    # s_interleave shadow), so pre-registered pairs are missing. The branch is still named.
+    assert proc.returncode == 2, proc.stderr[-3000:]
     gates = json.loads(open(out).read())
 
     assert gates["branch"] == "NULL-STILL-BROKEN"
@@ -664,11 +703,30 @@ def test_preflight_exits_non_zero_when_the_null_is_broken(tmp_path):
     proc = _cli("--preflight", "--ctrl", os.path.join(ARCHIVE, "ctrl"), "--interleave", ARCHIVE,
                 "--fivedatasets", ARCHIVE, "--baseline", BASELINE, "--h8", ARCHIVE,
                 "--out", out)
+    # A detected mismatch outranks incompleteness: exit 1, "do not create pod A".
     assert proc.returncode == 1, proc.stdout[-2000:]
     gates = json.loads(open(out).read())
     assert gates["preflight"]["failed_gates"] == ["V0b"]
     # Preflight stops at V0: nothing expensive is computed before the null is certified.
     assert set(gates) == {"V0a-i", "V0a-ii", "V0b", "preflight"}
+
+
+@pytest.mark.skipif(not os.path.isdir(ARCHIVE), reason="H8 archive not parked beside this tree")
+def test_preflight_on_the_ctrl_tree_alone_is_inconclusive_not_ok(tmp_path):
+    """The reviewer's case: CTrL alone must not licence the sweep.
+
+    The pre-flight exists for the 5-Datasets and s_interleave shadow pairs — the ones that
+    actually fail. Comparing 20 CTrL pairs and printing OK is exactly the failure mode.
+    """
+    out = str(tmp_path / "pf.json")
+    proc = _cli("--preflight", "--ctrl", os.path.join(ARCHIVE, "ctrl"), "--out", out)
+    assert proc.returncode == 2, proc.stdout[-2000:]
+    assert "PREFLIGHT OK" not in proc.stdout
+    assert "INCONCLUSIVE" in proc.stdout
+    gates = json.loads(open(out).read())
+    missing = gates["preflight"]["incomplete_gates"]["V0b"]
+    assert {"stream": "s_interleave", "seed": 42} in missing
+    assert {"stream": None, "seed": 42} in missing
 
 
 def test_preflight_on_an_empty_tree_is_inconclusive_not_a_pass(tmp_path):
