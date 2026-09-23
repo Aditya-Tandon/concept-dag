@@ -38,6 +38,7 @@ from ..training.kan_gate import (
 )
 from ..training.consolidate import low_rank_factorize_final_layer
 from ..utils.metrics import principal_angles_between
+from ..utils.rng import fork_rng_all_devices
 from .exp3_growing_dag import (
     Exp3Config, DAGNode, forward_dag_memoized, train_node, eval_node, route_for_task, _flush,
 )
@@ -992,11 +993,21 @@ def run_exp3a_kan(
             # estimator inside a forked RNG, purely to obtain per-example score bits whose set
             # never selected an epoch. The shadow's own decision is discarded; only its
             # `estimator_meta["evalue"]` and paired SEs are read. Cost: one extra ladder fit.
+            #
+            # The fork must cover the DEVICE generator, not just the CPU one (P0b). Dropout masks
+            # are drawn on the training device, and `torch.manual_seed` below re-seeds every
+            # device generator; `torch.random.fork_rng(devices=[])` puts back only the CPU half,
+            # so the shadow used to leave the device generator wherever its own refit ended.
+            # Whether that showed up depended on arithmetic: the live rung's split ('single',
+            # val_fraction 0.3) and the shadow's ('select-score', ss_fracs 0.65/0.15/0.20) give
+            # the same minibatch count per epoch at CTrL's n (200 -> 2/2, 2,000 -> 11/11) and a
+            # different one at the 16,384-row 5-Datasets gate cache (90 vs 84), so the arm that
+            # computes and acts on nothing changed the 5-Datasets run and not the CTrL ones.
             ev = None
             shadow_seconds = 0.0
             if cfg.provisional != "off" and cfg.enable_search and not force:
                 sh_t0 = time.perf_counter()
-                with torch.random.fork_rng(devices=[]):
+                with fork_rng_all_devices():
                     torch.manual_seed(cfg.seed * 1000 + t + 900)
                     shadow = decide_reuse_search_grow(
                         X, y, new_module_factory(parents), spec,

@@ -273,6 +273,17 @@ def main():
             f"computes the third gate state runs the three-way reuse/search/grow ladder, and "
             f"without it there is nothing for --provisional to act on."
         )
+    if args.provisional != "off" and device.startswith("mps"):
+        # The shadow refit restores every RNG it can (concept_dag/utils/rng.py), but torch's MPS
+        # generator state does not carry the philox offset, so `set_rng_state` cannot put an
+        # advanced MPS stream back. On MPS the `shadow` arm is therefore NOT a strict null and
+        # P0b cannot be certified — fine for a smoke run, not for a recorded arm.
+        warnings.warn(
+            "--provisional on MPS: the MPS generator cannot be forked (its rng_state omits the "
+            "philox offset), so the shadow refit perturbs later dropout masks and the arm is not "
+            "a null. Use cuda or cpu for any run whose numbers are recorded.",
+            RuntimeWarning, stacklevel=2,
+        )
 
     # Token-mode preconditions, checked before anything expensive is built.
     token_mode = (args.root_family == "attn_pool")
