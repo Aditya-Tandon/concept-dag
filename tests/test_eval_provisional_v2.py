@@ -610,6 +610,36 @@ def test_v1_is_pooled_not_per_run(ev):
     assert g["value"]["frac_backward_rejected_removed"] == pytest.approx(1.0)
 
 
+def test_a_zero_over_zero_denominator_is_not_decidable_not_a_failure(ev):
+    """`fail` here reads as "the pre-filter is not free", which would be a fabrication."""
+    ops = [{"op": "merge", "keep": 0, "drop": 1, "cka": 0.9, "cca_topk": 0.99},
+           {"op": "trigger_rejected", "keep": 0, "drop": 2, "cka": 0.1, "cca_topk": 0.4}]
+    g = ev.gate_v1([(42, "s_minus", _pairs_run(ops))])
+    assert g["value"]["n_backward_rejected"] == 0
+    assert g["value"]["is_free"] is True
+    assert g["verdict"] == "not-decidable" and "0/0" in g["note"]
+
+
+def test_a_skipped_accepted_merge_still_fails_with_a_zero_denominator(ev):
+    """Not-free is demonstrated on the pairs that DO carry the statistic."""
+    ops = [{"op": "merge", "keep": 0, "drop": 1, "cka": 0.2, "cca_topk": 0.99}]
+    g = ev.gate_v1([(42, "s_minus", _pairs_run(ops))])
+    assert g["verdict"] == "fail" and g["value"]["n_accepted_merges_skipped"] == 1
+
+
+def test_a_partial_cka_pool_is_reported_not_silently_narrowed(ev):
+    ops = [{"op": "merge_rejected", "keep": 0, "drop": 1, "cka": 0.1, "cca_topk": 0.9},
+           {"op": "merge_rejected", "keep": 0, "drop": 2, "similarity": 0.9}]   # no `cka`
+    g = ev.gate_v1([(42, "s_minus", _pairs_run(ops))])
+    assert g["value"]["n_missing_cka"] == 1
+    assert g["verdict"] == "not-decidable" and "partial denominator" in g["note"]
+
+
+def test_v1_is_not_run_when_no_pair_was_examined(ev):
+    g = ev.gate_v1([(42, "s_minus", _pairs_run([]))])
+    assert g["verdict"] == "not-run" and "no pair" in g["note"]
+
+
 def test_v1_is_not_run_on_an_archive_with_no_cka(ev):
     ops = [{"op": "merge", "keep": 0, "drop": 1, "similarity": 0.99}]
     g = ev.gate_v1([(42, "s_minus", _pairs_run(ops))])

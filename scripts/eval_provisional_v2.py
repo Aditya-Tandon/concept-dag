@@ -876,14 +876,6 @@ def gate_v1(cca_runs: List[Tuple[int, Optional[str], Dict]]) -> Dict:
                         "n_backward_rejected_removed": r_rej_removed})
 
     frac_removed = (rejected_removed / rejected_total) if rejected_total else None
-    if missing_cka == examined and examined:
-        gate["verdict"] = "not-run"
-        gate["note"] = ("no examined pair carries a `cka` field: these runs predate the CKA "
-                        "pre-filter, so the counterfactual has no denominator")
-        gate["value"] = {"n_runs": len(cca_runs), "n_examined_pairs": examined,
-                         "n_missing_cka": missing_cka, "per_run": per_run}
-        return gate
-
     free = not skipped_accepted
     removes_enough = frac_removed is not None and frac_removed >= V1_MIN_REMOVED_FRAC
     gate["value"] = {"n_runs": len(cca_runs), "n_examined_pairs": examined,
@@ -894,11 +886,42 @@ def gate_v1(cca_runs: List[Tuple[int, Optional[str], Dict]]) -> Dict:
                      "n_backward_rejected_removed": rejected_removed,
                      "frac_backward_rejected_removed": frac_removed,
                      "is_free": free, "removes_enough": removes_enough, "per_run": per_run}
-    gate["verdict"] = ("not-run" if frac_removed is None and not examined else
-                       "pass" if (free and removes_enough) else "fail")
     gate["headline"] = (f"{examined} pairs examined; {len(skipped_accepted)} accepted merges "
                         f"would be skipped; {rejected_removed}/{rejected_total} backward-vetoed "
-                        f"pairs removed (frac={frac_removed})")
+                        f"pairs removed (frac={frac_removed}); {missing_cka} pairs without `cka`")
+
+    # A missing denominator is a fact about the archive, never a verdict about the pre-filter.
+    # `fail` on this gate reads as "the pre-filter is not free", which is a finding; saying it
+    # because nothing was vetoed, or because the runs predate the field, would be a fabrication
+    # (v2 review, should-fixes 7 and 8).
+    if not examined:
+        gate["verdict"] = "not-run"
+        gate["note"] = "the consolidation loop examined no pair in these runs"
+        return gate
+    if missing_cka == examined:
+        gate["verdict"] = "not-run"
+        gate["note"] = ("no examined pair carries a `cka` field: these runs predate the CKA "
+                        "pre-filter, so the counterfactual has no denominator")
+        return gate
+    if missing_cka:
+        # A pool mixing legacy and post-pre-filter runs computes the ratio on a partial
+        # denominator; the number that comes out is not the pre-registered quantity.
+        gate["verdict"] = "not-decidable"
+        gate["note"] = (f"{missing_cka} of {examined} examined pairs carry no `cka` field "
+                        f"(a pool mixing pre- and post-pre-filter runs): the counterfactual "
+                        f"would be computed on a partial denominator")
+        return gate
+    if not free:
+        # Demonstrated on the pairs that DO carry the statistic: the filter is not free.
+        gate["verdict"] = "fail"
+        return gate
+    if rejected_total == 0:
+        gate["verdict"] = "not-decidable"
+        gate["note"] = ("no examined pair reached distill_merge and was then vetoed, so the "
+                        "removal ratio is 0/0 — the filter skipped no accepted merge, but "
+                        "there is nothing for it to have removed")
+        return gate
+    gate["verdict"] = "pass" if removes_enough else "fail"
     return gate
 
 
