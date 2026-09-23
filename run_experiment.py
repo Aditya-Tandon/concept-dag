@@ -146,8 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "(1 + T) patch-token set, then the same MLP (module-family-ablation "
                              "arm C). 'attn_pool' switches the whole data path to token mode: the "
                              "feature cache stores (N, 1 + T, 384) fp16, the gate's raw-root grow "
-                             "probe and the oracle grow rung use the same family, and the update "
-                             "rung and --dump_gate_tensors are unavailable.")
+                             "probe and the oracle grow rung use the same family, "
+                             "--dump_gate_tensors writes a bounded token dump (see "
+                             "--dump_max_per_split) and the update rung is unavailable.")
     parser.add_argument("--token_pool", type=int, default=2,
                         help="[--root_family attn_pool] average-pool factor on DINOv2's 16x16 patch "
                              "grid: 1 -> 256 tokens, 2 -> 64 (default, the ablation's best), 4 -> 16. "
@@ -209,6 +210,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "rungs' predictors and record test accuracy")
     parser.add_argument("--dump_gate_tensors", action="store_true",
                         help="[5ds-kan/3a-kan/ctrl] write gate_dump.pt (feature mode only)")
+    parser.add_argument("--dump_max_per_split", type=int, default=512,
+                        help="[--dump_gate_tensors, token mode] examples per split the dump keeps "
+                             "(the FIRST n in loader order; train and test only, val is omitted). "
+                             "A (1 + T, D) token set is ~100 kB an image, so the CLS dump's "
+                             "'every split in full' would be tens of GB.")
+    parser.add_argument("--dump_max_bytes", type=float, default=2e9,
+                        help="[--dump_gate_tensors] refuse to write a gate_dump.pt whose tensor "
+                             "payload is estimated above this many bytes (the run still finishes "
+                             "and its results JSON is still written)")
     parser.add_argument("--enable_update", action="store_true",
                         help="[5ds-kan/3a-kan/ctrl] enable the update rung (refinement placement)")
     parser.add_argument("--update_lr", type=float, default=1e-4,
@@ -501,6 +511,9 @@ def main():
             provisional = args.provisional,
             provisional_alpha = args.provisional_alpha,
             provisional_z = args.provisional_z,
+            dump_max_per_split = args.dump_max_per_split,
+            dump_max_bytes = args.dump_max_bytes,
+            token_pool  = (args.token_pool if token_mode else None),
             merge_trigger = args.merge_trigger,
             merge_cka_threshold = args.merge_cka_threshold,
             always_n_max = args.always_n_max,
@@ -572,6 +585,9 @@ def main():
             provisional = args.provisional,
             provisional_alpha = args.provisional_alpha,
             provisional_z = args.provisional_z,
+            dump_max_per_split = args.dump_max_per_split,
+            dump_max_bytes = args.dump_max_bytes,
+            token_pool  = (args.token_pool if token_mode else None),
             merge_trigger = args.merge_trigger,
             merge_cka_threshold = args.merge_cka_threshold,
             always_n_max = args.always_n_max,

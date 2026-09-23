@@ -769,6 +769,13 @@ class KanExpConfig(Exp3Config):
     dump_gate_tensors:   bool  = False    # write gate_dump.pt (feature mode only) — raw per-task
                                           # tensors + node/predictor state, for offline desk-stage
                                           # re-analysis without re-running training.
+    dump_max_per_split:  int   = 512      # token mode only: examples per split the dump keeps
+                                          # (the FIRST n in loader order). A token set is ~100 kB
+                                          # an image, so the CLS dump's "everything" is tens of GB.
+    dump_max_bytes:      float = 2e9      # refuse to write a gate_dump.pt bigger than this
+    token_pool:          Optional[int] = None   # patch-grid average-pool factor the token cache
+                                          # was built with; recorded in the dump so a desk script
+                                          # can tell a 64-token run from a 256-token one.
     enable_update:       bool  = False    # the "update" rung: refine an existing root parent's
                                           # concept in place instead of reuse/search/grow, gated by
                                           # backward safety on earlier tasks.
@@ -879,33 +886,98 @@ def _cache_raw_full(loader) -> Tuple[torch.Tensor, torch.Tensor]:
     return _cache_raw_capped(loader, max_batches=0)
 
 
+def _cache_raw_first_n(loader, n_max: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The FIRST `n_max` examples in loader order (0 = all).
+
+    Deterministic by construction: it selects a prefix rather than drawing a subset, so the token
+    dump owes the run no RNG state. The loader's own shuffling still decides which examples a
+    prefix contains, which is why the caller forks around the iteration.
+    """
+    xs, ys = [], []
+    got = 0
+    for x, y in loader:
+        take = len(y) if not n_max else min(len(y), n_max - got)
+        xs.append(x[:take].cpu())
+        ys.append(y[:take].cpu())
+        got += take
+        if n_max and got >= n_max:
+            break
+    if not xs:
+        return torch.empty(0), torch.empty(0, dtype=torch.long)
+    return torch.cat(xs, 0), torch.cat(ys, 0)
+
+
+def _root_mint_snapshot(node: DAGNode, t: int) -> dict:
+    """A CPU float32 copy of a root's FULL state the moment it finished training.
+
+    Consolidation merges roots away and rolls truncations back, so the end-of-run `nodes` list is
+    not enough to recover what any given task actually minted — the merged ones are simply gone.
+    Plain tensor copies, taken outside anything that draws: the snapshot cannot move the run.
+    """
+    return {"task_id": t, "_node": node,
+            "state_dict": {k: v.detach().cpu().float().clone()
+                           for k, v in node.state_dict().items()}}
+
+
+def _dump_nbytes(obj) -> int:
+    """Bytes of tensor payload in a (nested) dump structure — the size guard's estimate."""
+    if torch.is_tensor(obj):
+        return obj.numel() * obj.element_size()
+    if isinstance(obj, dict):
+        return sum(_dump_nbytes(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_dump_nbytes(v) for v in obj)
+    return 0
+
+
 def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode],
                      predictors: List[TaskPredictor], decisions: List[dict],
-                     gate_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]]) -> dict:
+                     gate_cache: Dict[int, Tuple[Optional[torch.Tensor], torch.Tensor]],
+                     roots_at_mint: Optional[List[dict]] = None) -> dict:
+    # Token mode keeps a bounded PREFIX of train and test only; the CLS dump below is unchanged,
+    # field for field, because every desk script that reads a published dump depends on it.
+    token_mode = (cfg.root_family == "attn_pool")
     # Same GATE cache sizing as run_exp3a_kan's live decisions — separate from `routing_batches`.
     gate_batches = math.ceil(cfg.gate_cache_max / cfg.batch_size) if cfg.gate_cache_max else 0
     gate_dump_tasks = []
-    for t, task in enumerate(tasks):
-        if t in gate_cache:
-            # SAME cap/order as the (Xraw, y) that fed this task's live gate decision
-            # (INTERFACE_SPEC.md §6) — captured once at decision time in the main loop, not
-            # re-sampled here (re-sampling from the shuffled loader after the run would draw a
-            # different `gate_cache_max`-sized subset than `_cache_parent_stack` used).
-            train_raw, train_y = gate_cache[t]
-        else:
-            # No gate decision was made for this task (root: growth forced, nothing to
-            # reproduce) — re-sampling here is harmless, but fork the RNG so it doesn't perturb
-            # the main stream that later tasks' training/decisions already consumed.
-            with torch.random.fork_rng(devices=[]):
-                train_raw, train_y = _cache_raw_capped(task["train"], gate_batches)
-        val_raw, val_y = _cache_raw_full(task.get("val", task["test"]))
-        test_raw, test_y = _cache_raw_full(task["test"])
-        gate_dump_tasks.append({
-            "task": t, "n_classes": task["n_classes"], "ctrl": task.get("ctrl"),
-            "train_raw": train_raw.float(), "train_y": train_y.long(),
-            "val_raw": val_raw.float(), "val_y": val_y.long(),
-            "test_raw": test_raw.float(), "test_y": test_y.long(),
-        })
+    if token_mode:
+        # A (1 + T, D) token set is ~100 kB an image, so "every split in full" is tens of GB on a
+        # 5-Datasets stream. Keep a bounded PREFIX of train and test, in fp16 (the cache's own
+        # storage dtype — see test_token_feature_cache_stays_half_in_memory). Val is dropped
+        # outright: the desk analyses this dump exists for score train-fit against test, and the
+        # `meta` block below says so rather than leaving a reader to infer it from a missing key.
+        for t, task in enumerate(tasks):
+            entry = {"task": t, "n_classes": task["n_classes"], "ctrl": task.get("ctrl")}
+            for split in ("train", "test"):
+                # `_cache_raw_first_n` draws nothing itself, but iterating a shuffled train loader
+                # does; fork so a dump can never move a stream the run has already been scored on.
+                with fork_rng_all_devices():
+                    raw, y = _cache_raw_first_n(task[split], cfg.dump_max_per_split)
+                entry[f"{split}_raw"] = raw.half()
+                entry[f"{split}_y"] = y.long()
+            gate_dump_tasks.append(entry)
+    else:
+        for t, task in enumerate(tasks):
+            if t in gate_cache:
+                # SAME cap/order as the (Xraw, y) that fed this task's live gate decision
+                # (INTERFACE_SPEC.md §6) — captured once at decision time in the main loop, not
+                # re-sampled here (re-sampling from the shuffled loader after the run would draw a
+                # different `gate_cache_max`-sized subset than `_cache_parent_stack` used).
+                train_raw, train_y = gate_cache[t]
+            else:
+                # No gate decision was made for this task (root: growth forced, nothing to
+                # reproduce) — re-sampling here is harmless, but fork the RNG so it doesn't perturb
+                # the main stream that later tasks' training/decisions already consumed.
+                with torch.random.fork_rng(devices=[]):
+                    train_raw, train_y = _cache_raw_capped(task["train"], gate_batches)
+            val_raw, val_y = _cache_raw_full(task.get("val", task["test"]))
+            test_raw, test_y = _cache_raw_full(task["test"])
+            gate_dump_tasks.append({
+                "task": t, "n_classes": task["n_classes"], "ctrl": task.get("ctrl"),
+                "train_raw": train_raw.float(), "train_y": train_y.long(),
+                "val_raw": val_raw.float(), "val_y": val_y.long(),
+                "test_raw": test_raw.float(), "test_y": test_y.long(),
+            })
 
     node_index = {id(n): i for i, n in enumerate(nodes)}
     gate_dump_nodes = []
@@ -944,7 +1016,7 @@ def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode
                 "search_meta": search_meta,
             })
 
-    return {
+    dump = {
         "feature_mode": True,
         "concept_dim": cfg.concept_dim,
         "feature_dim": cfg.feature_dim,
@@ -961,6 +1033,41 @@ def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode
         "predictors": gate_dump_preds,
         "decisions": decisions,
     }
+    if not token_mode:
+        # A published CLS dump is what every existing desk script reads; it gains nothing here.
+        return dump
+
+    # `nodes` holds each node's CONCEPT MODULE only, which in token mode leaves the root's
+    # AttentionPool — the thing the whole family ablation is about — out of the dump entirely.
+    dump["mode"] = "token"
+    dump["token_pool"] = cfg.token_pool
+    dump["roots"] = [
+        {"index": i, "task_id": n.task_id,
+         "state_dict": {k: v.detach().cpu().float() for k, v in n.state_dict().items()}}
+        for i, n in enumerate(nodes) if n.is_root
+    ]
+    # ... and consolidation merges roots away, so the end-of-run list cannot answer "what did
+    # task t actually mint?" for a root that was later dropped. `node_id` is the index into
+    # `nodes`/`roots` if the snapshotted root survived to the end of the run, and None if a
+    # merge took it.
+    dump["roots_at_mint"] = [
+        {"task_id": r["task_id"], "node_id": node_index.get(id(r["_node"])),
+         "state_dict": r["state_dict"]}
+        for r in (roots_at_mint or [])
+    ]
+    dump["meta"] = {
+        "splits": ["train", "test"],
+        "val_omitted": True,
+        "val_omitted_reason": (
+            "token mode keeps a bounded prefix per split; val is dropped because the desk "
+            "analyses this dump exists for fit on train and score on test"),
+        "max_per_split": cfg.dump_max_per_split,
+        "selection": "first n examples in loader order (no RNG draw of its own)",
+        "raw_dtype": "float16",
+        "raw_shape": "(n, 1 + T, feature_dim)",
+        "n_tokens": cfg.n_tokens,
+    }
+    return dump
 
 
 def run_exp3a_kan(
@@ -994,16 +1101,11 @@ def run_exp3a_kan(
                 "a (N, 1 + T, D) token set has no 2-D form for. Run the update rung under "
                 "root_family='mlp_cls', or extend _UpdateModel to carry a token root."
             )
+    # `--dump_gate_tensors` used to be refused in token mode, because the CLS dump keeps every
+    # split of every task in full and a token set is ~100 kB an image (65 x 384 float32) — tens of
+    # GB for a 5-Datasets stream. The token dump instead keeps the FIRST `dump_max_per_split`
+    # examples of train and test only, and is guarded by `dump_max_bytes` at write time.
     dump_gate_tensors = cfg.dump_gate_tensors
-    if dump_gate_tensors and cfg.root_family == "attn_pool":
-        # gate_dump.pt stores every task's train/val/test raw inputs; in token mode that is
-        # ~100 kB/image (65 x 384 float32) — tens of GB for a 5-Datasets stream — and the desk
-        # scripts that read it all assume a 2-D feature matrix. Disabled loudly rather than
-        # silently writing something unusable.
-        print("[kan_exp] --dump_gate_tensors is disabled in token mode (root_family='attn_pool'): "
-              "the dump would hold (N, 1+T, D) token sets and the desk scripts expect (N, D). "
-              "Re-run with --root_family mlp_cls to produce a dump.")
-        dump_gate_tensors = False
 
     nodes: List[DAGNode] = []
     predictors: List[TaskPredictor] = []
@@ -1013,7 +1115,10 @@ def run_exp3a_kan(
     test_accs: List[float] = []
     # (Xraw, y) actually fed to each gated task's live decision, captured at decision time so
     # `_build_gate_dump` can dump the SAME rows/order instead of re-sampling post hoc (§6).
-    gate_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+    gate_cache: Dict[int, Tuple[Optional[torch.Tensor], torch.Tensor]] = {}
+    # Every ROOT's full state the moment it finished training, before any consolidation pass could
+    # merge or truncate it (token-mode dump only — see `_root_mint_snapshot`).
+    roots_at_mint: List[dict] = []
     # One record per provisional root, from mint to resolution. `resolution` is the quantity the
     # loop turns on: a mechanism whose roots are ALL resolved by timeout is delayed unconditional
     # growth, not decision timing ([[provisional-growth-undetermined-gate]] P6).
@@ -1112,6 +1217,8 @@ def run_exp3a_kan(
                                           max_batches=cfg.routing_batches)
             node.freeze()
             nodes.append(node)
+            if dump_gate_tensors and node.is_root:
+                roots_at_mint.append(_root_mint_snapshot(node, t))
             predictors.append(TaskPredictor("grow", head, node=node))
             decisions.append({"task": t, "decision": "grow", "reason": "root"})
         else:
@@ -1128,7 +1235,9 @@ def run_exp3a_kan(
                 # Only retained when a dump will be written: Xraw is the full gate cache
                 # (16,384 x 1+T x D in token mode ≈ 1.6 GB float32) and holding one per task
                 # would carry the whole stream's caches to the end of the run for nothing.
-                gate_cache[t] = (Xraw, y)  # exact rows/order the live decision below sees
+                # The token dump reads a bounded prefix straight off the loaders and never looks
+                # at this cache, so there it keeps the labels alone (`results["_gate_cache_y"]`).
+                gate_cache[t] = (None if token_root_mode else Xraw, y)
             raw_kwargs = ({"raw_stack": Xraw, "root_module_factory": root_module_factory}
                           if use_raw_probe else {})
             # Prequential-estimator kwargs are passed ONLY when selected, so the call signature
@@ -1308,6 +1417,10 @@ def run_exp3a_kan(
                 # the flag only tells consolidation it may be resolved.
                 node.freeze()
                 nodes.append(node)
+                if dump_gate_tensors and node.is_root:
+                    # Provisional or not: a provisional root is an ordinary root plus a flag, and
+                    # it is precisely the one consolidation is allowed to drop.
+                    roots_at_mint.append(_root_mint_snapshot(node, t))
                 if t in provisional_log:
                     provisional_log[t]["params_at_mint"] = sum(p.numel() for p in node.parameters())
                 predictors.append(TaskPredictor("grow", head, node=node))
@@ -1559,9 +1672,20 @@ def run_exp3a_kan(
         results["_gate_cache_y"] = {t: yv for t, (_, yv) in gate_cache.items()}
 
     if dump_gate_tensors and not use_cnn:
-        dump = _build_gate_dump(cfg, tasks, nodes, predictors, decisions, gate_cache)
+        dump = _build_gate_dump(cfg, tasks, nodes, predictors, decisions, gate_cache, roots_at_mint)
         dump_path = os.path.join(cfg.results_dir, "gate_dump.pt")
-        torch.save(dump, dump_path)
-        print(f"Gate tensor dump saved to {dump_path}")
+        # Estimated BEFORE writing: a dump that only reveals its size once it is on disk has
+        # already cost the disk. Refusing is not fatal — the run's results are written above.
+        est_bytes = _dump_nbytes(dump)
+        print(f"[kan_exp] gate_dump.pt estimated tensor payload: {est_bytes / 1e9:.3f} GB "
+              f"(limit --dump_max_bytes {cfg.dump_max_bytes / 1e9:.3f} GB)")
+        if est_bytes > cfg.dump_max_bytes:
+            print(f"[kan_exp] REFUSING to write {dump_path}: estimated {est_bytes / 1e9:.3f} GB "
+                  f"exceeds --dump_max_bytes {cfg.dump_max_bytes / 1e9:.3f} GB. Lower "
+                  f"--dump_max_per_split (currently {cfg.dump_max_per_split}) or raise the limit. "
+                  f"The run itself is complete and its results JSON is already written.")
+        else:
+            torch.save(dump, dump_path)
+            print(f"Gate tensor dump saved to {dump_path}")
 
     return results
