@@ -210,11 +210,14 @@ def build_parser() -> argparse.ArgumentParser:
                              "rungs' predictors and record test accuracy")
     parser.add_argument("--dump_gate_tensors", action="store_true",
                         help="[5ds-kan/3a-kan/ctrl] write gate_dump.pt (feature mode only)")
-    parser.add_argument("--dump_max_per_split", type=int, default=512,
+    parser.add_argument("--dump_max_per_split", type=int, default=1024,
                         help="[--dump_gate_tensors, token mode] examples per split the dump keeps "
                              "(the FIRST n in loader order; train and test only, val is omitted). "
-                             "A (1 + T, D) token set is ~100 kB an image, so the CLS dump's "
-                             "'every split in full' would be tens of GB.")
+                             "A split SHORTER than this is dumped whole, and the default is above "
+                             "--always_n_max (1000) so every data-poor gated position the "
+                             "provisional hypothesis is about is dumped COMPLETE. A (1 + T, D) "
+                             "token set is ~100 kB an image, so the CLS dump's 'every split in "
+                             "full' would be tens of GB.")
     parser.add_argument("--dump_max_bytes", type=float, default=2e9,
                         help="[--dump_gate_tensors] refuse to write a gate_dump.pt whose tensor "
                              "payload is estimated above this many bytes (the run still finishes "

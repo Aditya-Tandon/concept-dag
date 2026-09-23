@@ -773,9 +773,13 @@ class KanExpConfig(Exp3Config):
     dump_gate_tensors:   bool  = False    # write gate_dump.pt (feature mode only) — raw per-task
                                           # tensors + node/predictor state, for offline desk-stage
                                           # re-analysis without re-running training.
-    dump_max_per_split:  int   = 512      # token mode only: examples per split the dump keeps
-                                          # (the FIRST n in loader order). A token set is ~100 kB
-                                          # an image, so the CLS dump's "everything" is tens of GB.
+    dump_max_per_split:  int   = 1024     # token mode only: examples per split the dump keeps
+                                          # (the FIRST n in loader order; a split SHORTER than
+                                          # this is dumped whole). A token set is ~100 kB an
+                                          # image, so the CLS dump's "everything" is tens of GB.
+                                          # 1024 > `always_n_max` (1000) on purpose: every
+                                          # data-poor position the provisional hypothesis is
+                                          # about — CTrL t3's 400 — is dumped COMPLETE.
     dump_max_bytes:      float = 2e9      # refuse to write a gate_dump.pt bigger than this
     token_pool:          Optional[int] = None   # patch-grid average-pool factor the token cache
                                           # was built with; recorded in the dump so a desk script
@@ -911,16 +915,29 @@ def _cache_raw_first_n(loader, n_max: int) -> Tuple[torch.Tensor, torch.Tensor]:
     return torch.cat(xs, 0), torch.cat(ys, 0)
 
 
-def _root_mint_snapshot(node: DAGNode, t: int) -> dict:
-    """A CPU float32 copy of a root's FULL state the moment it finished training.
+def _root_mint_snapshot(node: DAGNode, predictor: TaskPredictor, t: int) -> dict:
+    """A CPU float32 copy of a root AND its reader, the moment the root finished training.
 
     Consolidation merges roots away and rolls truncations back, so the end-of-run `nodes` list is
     not enough to recover what any given task actually minted — the merged ones are simply gone.
-    Plain tensor copies, taken outside anything that draws: the snapshot cannot move the run.
+    The root alone is not enough either: re-scoring a dropped root's task off the dump needs the
+    head (and, for a non-grow reader, the composer) that read it, which is exactly what
+    `distill_merge`'s backward audit compares against. Plain tensor copies, taken outside anything
+    that draws: the snapshot cannot move the run.
     """
-    return {"task_id": t, "_node": node,
-            "state_dict": {k: v.detach().cpu().float().clone()
-                           for k, v in node.state_dict().items()}}
+    composer = getattr(predictor, "composer", None)
+    return {
+        "task_id": t, "_node": node,
+        "state_dict": {k: v.detach().cpu().float().clone()
+                       for k, v in node.state_dict().items()},
+        "predictor_kind": predictor.kind,
+        "head_state": {k: v.detach().cpu().float().clone()
+                       for k, v in predictor.head.state_dict().items()},
+        "composer_kind": (None if composer is None else type(composer).__name__),
+        "composer_state": (None if composer is None else
+                           {k: v.detach().cpu().float().clone()
+                            for k, v in composer.state_dict().items()}),
+    }
 
 
 def _dump_nbytes(obj) -> int:
@@ -1055,8 +1072,8 @@ def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode
     # `nodes`/`roots` if the snapshotted root survived to the end of the run, and None if a
     # merge took it.
     dump["roots_at_mint"] = [
-        {"task_id": r["task_id"], "node_id": node_index.get(id(r["_node"])),
-         "state_dict": r["state_dict"]}
+        {k: v for k, v in r.items() if k != "_node"}
+        | {"node_id": node_index.get(id(r["_node"]))}
         for r in (roots_at_mint or [])
     ]
     dump["meta"] = {
@@ -1066,10 +1083,23 @@ def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode
             "token mode keeps a bounded prefix per split; val is dropped because the desk "
             "analyses this dump exists for fit on train and score on test"),
         "max_per_split": cfg.dump_max_per_split,
-        "selection": "first n examples in loader order (no RNG draw of its own)",
+        "selection": ("first n examples in loader order (no RNG draw of its own); a split with "
+                      "fewer than max_per_split examples is dumped WHOLE, and the default 1024 "
+                      "is above always_n_max (1000) so every data-poor gated position is"
+                      " complete"),
         "raw_dtype": "float16",
         "raw_shape": "(n, 1 + T, feature_dim)",
         "n_tokens": cfg.n_tokens,
+        "roots_at_mint_keys": {
+            "task_id": "stream position that minted this root",
+            "node_id": "index into `nodes`/`roots` if it survived to the end of the run, else None"
+                       " (a consolidation merge dropped it)",
+            "state_dict": "the ROOT's full state at mint, CPU float32 (AttentionPool included)",
+            "predictor_kind": "the reader's rung at mint — 'grow' for every freshly minted root",
+            "head_state": "that task's reader head at mint, CPU float32",
+            "composer_kind": "class name of the reader's composer, or None for a grow reader",
+            "composer_state": "the composer's state at mint, CPU float32, or None",
+        },
     }
     return dump
 
@@ -1221,9 +1251,9 @@ def run_exp3a_kan(
                                           max_batches=cfg.routing_batches)
             node.freeze()
             nodes.append(node)
-            if dump_gate_tensors and node.is_root:
-                roots_at_mint.append(_root_mint_snapshot(node, t))
             predictors.append(TaskPredictor("grow", head, node=node))
+            if dump_gate_tensors and node.is_root:
+                roots_at_mint.append(_root_mint_snapshot(node, predictors[-1], t))
             decisions.append({"task": t, "decision": "grow", "reason": "root"})
         else:
             sel_idx, _scores = route_for_task(nodes, task["train"], n_par, cfg.subspace_k,
@@ -1421,13 +1451,13 @@ def run_exp3a_kan(
                 # the flag only tells consolidation it may be resolved.
                 node.freeze()
                 nodes.append(node)
-                if dump_gate_tensors and node.is_root:
-                    # Provisional or not: a provisional root is an ordinary root plus a flag, and
-                    # it is precisely the one consolidation is allowed to drop.
-                    roots_at_mint.append(_root_mint_snapshot(node, t))
                 if t in provisional_log:
                     provisional_log[t]["params_at_mint"] = sum(p.numel() for p in node.parameters())
                 predictors.append(TaskPredictor("grow", head, node=node))
+                if dump_gate_tensors and node.is_root:
+                    # Provisional or not: a provisional root is an ordinary root plus a flag, and
+                    # it is precisely the one consolidation is allowed to drop.
+                    roots_at_mint.append(_root_mint_snapshot(node, predictors[-1], t))
             elif rec.decision == "search":
                 # Search: keep the best bounded-search composition over frozen parents; add NO node.
                 meta = rec.search_meta or {}

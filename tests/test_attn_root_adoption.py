@@ -370,11 +370,34 @@ def test_token_mode_dump_is_written_and_bounded(tmp_path):
     assert n_minted >= 2
     assert len(dump["roots_at_mint"]) == n_minted
     for snap in dump["roots_at_mint"]:
-        assert set(snap) == {"task_id", "node_id", "state_dict"}
+        assert set(snap) == {"task_id", "node_id", "state_dict", "predictor_kind",
+                             "head_state", "composer_kind", "composer_state"}
         assert all(v.dtype == torch.float32 for v in snap["state_dict"].values())
         assert any(k.startswith("root_pool.") for k in snap["state_dict"])
+        # The reader that read this root at mint — what re-scoring a DROPPED root's task needs.
+        assert snap["predictor_kind"] == "grow"
+        assert snap["head_state"] and all(v.dtype == torch.float32
+                                          for v in snap["head_state"].values())
+        assert snap["composer_kind"] is None and snap["composer_state"] is None
+    assert set(dump["meta"]["roots_at_mint_keys"]) == set(dump["roots_at_mint"][0])
     assert [s["task_id"] for s in dump["roots_at_mint"]] == sorted(
         s["task_id"] for s in dump["roots_at_mint"]), "snapshots must be in mint order"
+
+
+def test_a_split_shorter_than_the_cap_is_dumped_whole(tmp_path):
+    """The data-poor positions the provisional hypothesis is about must be dumped COMPLETE."""
+    feature_dim, n_tokens, n_per_class = 24, 7, 25       # 4 x 25 = 100, 20 % test = 20 rows
+    tasks = _make_synthetic_token_tasks(n_tasks=2, n_classes=4, feature_dim=feature_dim,
+                                        n_tokens=n_tokens, n_per_class=n_per_class,
+                                        batch_size=16, seed=5)
+    cfg = _token_dump_cfg(tmp_path, feature_dim, n_tokens)   # default cap, far above the task
+    assert cfg.dump_max_per_split == 1024
+    run_exp3a_kan(cfg, tasks)
+
+    dump = torch.load(os.path.join(str(tmp_path), "gate_dump.pt"))
+    for entry, task in zip(dump["tasks"], tasks):
+        assert entry["train_raw"].shape[0] == len(task["train"].dataset)
+        assert entry["test_raw"].shape[0] == len(task["test"].dataset)
 
 
 def test_token_dump_prefix_is_deterministic_and_matches_loader_order(tmp_path):
