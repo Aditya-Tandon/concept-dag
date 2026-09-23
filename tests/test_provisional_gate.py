@@ -498,3 +498,32 @@ def test_a_root_merged_after_crystallisation_stays_reconcilable(tmp_path):
     assert (row["resolved_by_merge"] + row["merged_after_crystallisation"]
             == row["accepted_merge_ops_dropping_a_provisional_root"])
     assert row["cross_check_mismatch"] is False
+
+
+def test_crystallise_after_zero_means_never_time_out(tmp_path):
+    """0 is the no-timeout control arm, not "time out immediately" (v2 review, should-fix 12).
+
+    Read literally the clock is `0 >= 0`, which crystallised a root inside the very task that
+    minted it — a state that was unreachable before the per-task check landed. The end-of-stream
+    sweep still resolves everything, so P9 (no root survives a run) holds either way.
+    """
+    tasks = _make_feature_tasks(n_tasks=5, seed=7)
+    cfg = _base_cfg(tmp_path, provisional="always", enable_search=True, search_skip=True,
+                    always_n_max=1000)
+    cfg.consolidate_every = 0
+    cfg.crystallise_after = 0
+    res = run_exp3a_kan(cfg, tasks)
+
+    roots = res["provisional_roots"]
+    assert roots, "the 'always' arm must mint on this stream"
+    last = len(tasks) - 1
+    for rec in roots:
+        assert rec["resolution"] in {"merge", "timeout"}
+        assert rec["resolved_at"] is not None
+        if rec["resolution"] == "timeout":
+            assert rec["resolved_at"] == last, (
+                "with crystallise_after=0 nothing may time out before the end of the stream; "
+                f"root minted at {rec['minted_at']} timed out at {rec['resolved_at']}")
+        assert rec["resolved_at"] != rec["minted_at"] or rec["minted_at"] == last, (
+            "the per-task clock must never resolve a root inside the task that minted it; "
+            "only the end-of-stream sweep may, and only for a root minted at the last task")

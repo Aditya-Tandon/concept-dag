@@ -268,7 +268,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="[provisional] tasks after which a still-flagged provisional root is "
                              "frozen (crystallised) unresolved, so no provisional root can survive "
                              "a run indefinitely (P6/P9: every root must end resolved as merge or "
-                             "timeout).")
+                             "timeout). 0 means NEVER time out — only a merge, or the end of the "
+                             "stream, resolves a root; that is the control arm for whether the "
+                             "timeout does any work.")
     return parser
 
 

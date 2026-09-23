@@ -772,7 +772,9 @@ class KanExpConfig(Exp3Config):
     provisional_alpha:   float = 0.05     # the e-process level; decide at 1/alpha
     provisional_z:       float = 1.0      # se_proxy arm: margin band in paired SEs
     always_n_max:        int   = 1000     # "always" arm: only data-poor positions (CTrL t3 has 400)
-    crystallise_after:   int   = 3        # tasks after which a still-flagged provisional root freezes
+    crystallise_after:   int   = 3        # tasks after which a still-flagged provisional root
+                                          # freezes (crystallises). 0 = NEVER time out: only a
+                                          # merge, or the end of the stream, resolves a root.
     oracle_rungs:        bool  = False    # after the decision, ALSO train+eval the other rungs'
                                           # predictors (reuse/search/grow) on task["test"], without
                                           # altering the DAG — for post-hoc regret analysis.
@@ -1268,7 +1270,14 @@ def run_exp3a_kan(
                     rec_p["resolution"] = "removed_unexplained"
                 rec_p["resolved_at"] = current_t
                 continue
-            aged_out = (current_t - rec_p["minted_at"]) >= cfg.crystallise_after
+            # `crystallise_after = 0` means NEVER time out, not "time out immediately": a
+            # deferral whose clock is zero is a root that only merge (or the end of the stream)
+            # can resolve, which is the control arm for "does the timeout do any work?". Read
+            # literally, `0 >= 0` crystallised a root inside the very task that minted it — a
+            # state that was unreachable before the per-task clock landed (v2 review, sf 12).
+            # The `end_of_stream` call still resolves everything, so P9 holds either way.
+            aged_out = (cfg.crystallise_after > 0
+                        and (current_t - rec_p["minted_at"]) >= cfg.crystallise_after)
             if end_of_stream or aged_out:
                 node.provisional = False
                 node.freeze()
