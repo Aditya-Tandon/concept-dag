@@ -316,3 +316,53 @@ def test_provisional_evalue_without_enable_search_exits(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ===========================================================================
+# 6. The timeout clock runs on the STREAM, not on the consolidation schedule
+# ===========================================================================
+#
+# `_resolve_provisional` used to be called only inside the `consolidate_every` branch, so at the
+# default `consolidate_every=0` the crystallise_after clock could not fire until the final pass:
+# every root in every published run read "resolved at the last task", and the timeout mechanism
+# — the thing that makes "provisional" different from "delayed unconditional growth" — was never
+# exercised (PR #8 review, should-fix 7).
+
+
+def test_crystallisation_fires_mid_stream_without_a_consolidation_pass(tmp_path):
+    tasks = _make_feature_tasks(n_tasks=5, seed=7)
+    cfg = _base_cfg(tmp_path, provisional="always", enable_search=True, search_skip=True,
+                    always_n_max=1000)
+    cfg.consolidate_every = 0          # the published default: no mid-stream pass at all
+    cfg.crystallise_after = 2
+    res = run_exp3a_kan(cfg, tasks)
+
+    by_mint = {r["minted_at"]: r for r in res["provisional_roots"]}
+    assert 1 in by_mint, "the 'always' arm must mint at t1 on this stream"
+
+    # Minted at t1 with crystallise_after=2: it is out of time the moment t - 1 >= 2, i.e. at t3,
+    # which on a 5-task stream is BEFORE the end (t4) and before any consolidation pass exists.
+    root_t1 = by_mint[1]
+    assert root_t1["resolution"] == "timeout"
+    assert root_t1["resolved_at"] == 3
+
+    # ... and a root minted later is still in time at t3, so the clock is a clock and not a
+    # blanket "crystallise everything once".
+    if 3 in by_mint:
+        assert by_mint[3]["resolved_at"] > 3 or by_mint[3]["resolution"] == "merge"
+
+    for rec in res["provisional_roots"]:
+        assert rec["resolution"] in {"merge", "timeout"}
+        assert rec["resolved_at"] is not None
+
+
+def test_the_off_arm_never_reaches_the_resolution_path(tmp_path):
+    """`--provisional off` mints nothing and the new per-task call is guarded, not just empty."""
+    tasks = _make_feature_tasks(n_tasks=5, seed=7)
+    cfg = _base_cfg(tmp_path, provisional="off", enable_search=True, search_skip=True)
+    cfg.consolidate_every = 0
+    cfg.crystallise_after = 2
+    res = run_exp3a_kan(cfg, tasks)
+
+    assert "provisional_roots" not in res or res["provisional_roots"] == []
+    assert all("provisional" not in d for d in res["decisions"])

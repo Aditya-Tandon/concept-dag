@@ -1635,6 +1635,16 @@ def run_exp3a_kan(
             reader_audit.extend(summ["reader_audit"])
             consolidation_passes.append(summ)
             _resolve_provisional(t, pass_result=summ)
+        elif cfg.provisional != "off":
+            # Crystallisation is a property of the STREAM's clock — "a provisional root that is
+            # still flagged `crystallise_after` tasks later has run out of time" — not of the
+            # consolidation schedule. Running it only inside the `consolidate_every` branch meant
+            # that at the default `consolidate_every=0` NO root could time out until the final
+            # pass, so every run's P6 read "resolved at the last task" and the timeout clock was
+            # never actually exercised (PR #8 review, should-fix 7). A merge still resolves a root
+            # only in a consolidation pass, which is why no `pass_result` is passed here: with no
+            # pass, no node can have vanished, and the merge bookkeeping has nothing to do.
+            _resolve_provisional(t)
         _flush(device)
 
     # Final consolidation.
