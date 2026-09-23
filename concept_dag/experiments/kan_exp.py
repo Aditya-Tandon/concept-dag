@@ -946,8 +946,42 @@ def _root_mint_snapshot(node: DAGNode, predictor: TaskPredictor, t: int) -> dict
     }
 
 
+def _split_rows(loader, cap: int) -> int:
+    """How many rows the dump would take from `loader` (0 cap = all), without touching it."""
+    try:
+        n = len(loader.dataset)
+    except (TypeError, AttributeError):          # an iterable-style loader: assume the cap binds
+        return cap
+    return min(n, cap) if cap else n
+
+
+def _estimate_gate_dump_bytes(cfg: "KanExpConfig", tasks: List[Dict], token_mode: bool,
+                              model_bytes: int = 0) -> int:
+    """The dump's tensor payload, computed from SHAPES before anything is materialised.
+
+    The size guard exists to refuse a dump that will not fit; estimating it from the finished
+    dump means the 13 GB token dump OOMs while being built, which is the one outcome the guard
+    was written to prevent (v2 review, should-fix 9). Row counts come from `len(loader.dataset)`,
+    which reads a length and no data.
+    """
+    total = int(model_bytes)
+    label_bytes = 8                               # int64 labels, one per row
+    if token_mode:
+        per_row = (cfg.n_tokens or 1) * (cfg.feature_dim or 0) * 2      # fp16 token sets
+        for task in tasks:
+            for split in ("train", "test"):       # val is not dumped in token mode
+                total += _split_rows(task[split], cfg.dump_max_per_split) * (per_row + label_bytes)
+        return total
+    per_row = (cfg.feature_dim or cfg.cnn_out_dim or 0) * 4             # float32 CLS features
+    for task in tasks:
+        total += _split_rows(task["train"], cfg.gate_cache_max) * (per_row + label_bytes)
+        total += _split_rows(task.get("val", task["test"]), 0) * (per_row + label_bytes)
+        total += _split_rows(task["test"], 0) * (per_row + label_bytes)
+    return total
+
+
 def _dump_nbytes(obj) -> int:
-    """Bytes of tensor payload in a (nested) dump structure — the size guard's estimate."""
+    """Bytes of tensor payload in a (nested) dump structure — the post-build cross-check."""
     if torch.is_tensor(obj):
         return obj.numel() * obj.element_size()
     if isinstance(obj, dict):
@@ -1762,20 +1796,33 @@ def run_exp3a_kan(
         results["_gate_cache_y"] = {t: yv for t, (_, yv) in gate_cache.items()}
 
     if dump_gate_tensors and not use_cnn:
-        dump = _build_gate_dump(cfg, tasks, nodes, predictors, decisions, gate_cache, roots_at_mint)
         dump_path = os.path.join(cfg.results_dir, "gate_dump.pt")
-        # Estimated BEFORE writing: a dump that only reveals its size once it is on disk has
-        # already cost the disk. Refusing is not fatal — the run's results are written above.
-        est_bytes = _dump_nbytes(dump)
-        print(f"[kan_exp] gate_dump.pt estimated tensor payload: {est_bytes / 1e9:.3f} GB "
-              f"(limit --dump_max_bytes {cfg.dump_max_bytes / 1e9:.3f} GB)")
-        if est_bytes > cfg.dump_max_bytes:
-            print(f"[kan_exp] REFUSING to write {dump_path}: estimated {est_bytes / 1e9:.3f} GB "
+
+        def _refuse(n_bytes: int, stage: str) -> None:
+            print(f"[kan_exp] REFUSING to write {dump_path}: {stage} {n_bytes / 1e9:.3f} GB "
                   f"exceeds --dump_max_bytes {cfg.dump_max_bytes / 1e9:.3f} GB. Lower "
                   f"--dump_max_per_split (currently {cfg.dump_max_per_split}) or raise the limit. "
                   f"The run itself is complete and its results JSON is already written.")
+
+        # Estimated from SHAPES, before a single tensor is collected: a guard that measures the
+        # finished dump lets the dump it exists to refuse OOM while being built.
+        model_bytes = 2 * sum(p.numel() for n in nodes for p in n.parameters()) * 4
+        est_bytes = _estimate_gate_dump_bytes(cfg, tasks, token_root_mode, model_bytes)
+        print(f"[kan_exp] gate_dump.pt estimated tensor payload: {est_bytes / 1e9:.3f} GB "
+              f"(limit --dump_max_bytes {cfg.dump_max_bytes / 1e9:.3f} GB)")
+        if est_bytes > cfg.dump_max_bytes:
+            _refuse(est_bytes, "estimated")
         else:
-            torch.save(dump, dump_path)
-            print(f"Gate tensor dump saved to {dump_path}")
+            dump = _build_gate_dump(cfg, tasks, nodes, predictors, decisions, gate_cache,
+                                    roots_at_mint)
+            # Cross-check the estimate against what was actually collected, so an optimistic
+            # estimate cannot smuggle an over-size dump onto the disk.
+            actual = _dump_nbytes(dump)
+            if actual > cfg.dump_max_bytes:
+                _refuse(actual, f"actual (estimate said {est_bytes / 1e9:.3f} GB);")
+            else:
+                torch.save(dump, dump_path)
+                print(f"Gate tensor dump saved to {dump_path} "
+                      f"({actual / 1e9:.3f} GB tensor payload)")
 
     return results

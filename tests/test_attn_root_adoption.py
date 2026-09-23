@@ -416,6 +416,41 @@ def test_token_dump_prefix_is_deterministic_and_matches_loader_order(tmp_path):
         assert torch.equal(ea["test_y"], eb["test_y"])
 
 
+def test_dump_size_guard_estimates_from_shapes_before_materialising(tmp_path, monkeypatch):
+    """The guard must refuse BEFORE the dump is built, or the dump it refuses OOMs first."""
+    from concept_dag.experiments import kan_exp
+
+    feature_dim, n_tokens = 24, 7
+    tasks = _make_synthetic_token_tasks(n_tasks=2, n_classes=4, feature_dim=feature_dim,
+                                        n_tokens=n_tokens, n_per_class=48, batch_size=16, seed=1)
+    built = []
+    real_build = kan_exp._build_gate_dump
+    monkeypatch.setattr(kan_exp, "_build_gate_dump",
+                        lambda *a, **kw: (built.append(1), real_build(*a, **kw))[1])
+
+    cfg = _token_dump_cfg(tmp_path, feature_dim, n_tokens, dump_max_per_split=8,
+                          dump_max_bytes=1.0)
+    run_exp3a_kan(cfg, tasks)
+    assert not built, "the dump was materialised before the size guard could refuse it"
+
+    # The estimate itself is shape arithmetic and touches no data: 8 rows x 7 tokens x 24 dims
+    # x 2 bytes + 8 label bytes, per split, for 2 splits and 2 tasks.
+    est = kan_exp._estimate_gate_dump_bytes(cfg, tasks, token_mode=True)
+    assert est == 2 * 2 * 8 * (n_tokens * feature_dim * 2 + 8)
+
+
+def test_dump_size_estimate_uses_the_real_row_count_when_a_split_is_short(tmp_path):
+    from concept_dag.experiments import kan_exp
+
+    feature_dim, n_tokens = 24, 7
+    tasks = _make_synthetic_token_tasks(n_tasks=1, n_classes=4, feature_dim=feature_dim,
+                                        n_tokens=n_tokens, n_per_class=25, batch_size=16, seed=5)
+    cfg = _token_dump_cfg(tmp_path, feature_dim, n_tokens)      # default cap 1024, far above
+    est = kan_exp._estimate_gate_dump_bytes(cfg, tasks, token_mode=True)
+    rows = len(tasks[0]["train"].dataset) + len(tasks[0]["test"].dataset)
+    assert est == rows * (n_tokens * feature_dim * 2 + 8)
+
+
 def test_dump_size_guard_refuses_and_lets_the_run_finish(tmp_path, capsys):
     feature_dim, n_tokens = 24, 7
     tasks = _make_synthetic_token_tasks(n_tasks=2, n_classes=4, feature_dim=feature_dim,
