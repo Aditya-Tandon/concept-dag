@@ -402,3 +402,53 @@ def test_provisional_off_on_mps_is_allowed_through_the_guard(tmp_path):
         assert "--provisional" not in str(e)
     except Exception:                            # pragma: no cover - no MPS on this machine
         pass
+
+
+def test_a_root_ageing_out_at_the_last_task_is_left_to_the_final_pass(tmp_path):
+    """The clock must not pre-empt the final consolidation pass (v2 review, blocker 1).
+
+    The per-task check runs BEFORE the final pass. A root that ages out exactly at the last task
+    would be stamped `timeout` there, and `_resolve_provisional` skips any record that already
+    carries a resolution — so the final pass's merge of that very root is never recorded, and the
+    resolution histogram (V4/V6's input, and the observable that separates provisional growth
+    from delayed unconditional growth) is biased toward `timeout` on a run whose merges fired.
+    """
+    from tests.fixtures.cls_identity_stream import make_duplicate_cls_tasks
+
+    def _run(crystallise_after: int):
+        tasks = make_duplicate_cls_tasks()
+        cfg = KanExpConfig(
+            results_dir=str(tmp_path / f"ca{crystallise_after}"), device="cpu",
+            backbone="dinov2_vits14", feature_dim=24, concept_dim=16, seed=42,
+            root_epochs=12, child_epochs=12, gate_epochs=6,
+            n_tasks=len(tasks), n_parents=2, routing_batches=4, gate_cache_max=256,
+            subspace_k=3, batch_size=16, raw_grow_probe=True, enable_search=True,
+            search_skip=True, consolidate_every=0, distill=True, distill_epochs=4,
+            log_every=100000, provisional="always", always_n_max=100000,
+            crystallise_after=crystallise_after)
+        return run_exp3a_kan(cfg, tasks)
+
+    last = 4                                     # 5 tasks: t0..t4
+    slow = _run(5)                               # nothing ages out: the final pass decides all
+    fast = _run(2)                               # the t2 root ages out exactly AT the last task
+
+    slow_by_mint = {r["minted_at"]: r for r in slow["provisional_roots"]}
+    fast_by_mint = {r["minted_at"]: r for r in fast["provisional_roots"]}
+
+    # The two runs' final passes are identical — the clock does not change what merges.
+    def _ops(res):
+        return [(o["op"], o.get("keep"), o.get("drop")) for o in res["consolidation"]["ops"]]
+    assert _ops(slow) == _ops(fast)
+    assert slow["consolidation"]["params_saved"] == fast["consolidation"]["params_saved"]
+
+    # The t2 root ages out at t4 == the last task, and the final pass merges it into root 0.
+    assert 2 in fast_by_mint and slow_by_mint[2]["resolution"] == "merge"
+    assert fast_by_mint[2]["resolution"] == "merge", (
+        "a root ageing out at the last task was stamped `timeout` before the final pass could "
+        "record its merge")
+    assert fast_by_mint[2]["resolved_at"] == last
+    assert fast_by_mint[2]["merged_into"] == slow_by_mint[2]["merged_into"]
+
+    # ... while a root that ages out genuinely mid-stream still times out, on its own task.
+    assert fast_by_mint[1]["resolution"] == "timeout"
+    assert fast_by_mint[1]["resolved_at"] == 3 < last

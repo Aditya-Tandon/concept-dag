@@ -1651,7 +1651,7 @@ def run_exp3a_kan(
             reader_audit.extend(summ["reader_audit"])
             consolidation_passes.append(summ)
             _resolve_provisional(t, pass_result=summ)
-        elif cfg.provisional != "off":
+        elif cfg.provisional != "off" and t < len(tasks) - 1:
             # Crystallisation is a property of the STREAM's clock — "a provisional root that is
             # still flagged `crystallise_after` tasks later has run out of time" — not of the
             # consolidation schedule. Running it only inside the `consolidate_every` branch meant
@@ -1660,6 +1660,14 @@ def run_exp3a_kan(
             # never actually exercised (PR #8 review, should-fix 7). A merge still resolves a root
             # only in a consolidation pass, which is why no `pass_result` is passed here: with no
             # pass, no node can have vanished, and the merge bookkeeping has nothing to do.
+            #
+            # NOT at the last task: the final consolidation pass runs immediately after this loop
+            # and its `end_of_stream` call already covers every still-flagged root, WITH the
+            # pass's ops in hand. Crystallising here first would stamp `timeout` on a root the
+            # final pass then merges away — `_resolve_provisional` skips any record that already
+            # has a resolution — and bias the resolution histogram, the one observable that
+            # separates provisional growth from delayed unconditional growth, toward `timeout`.
+            # That is the exact opposite of what this change was for (v2 review, blocker 1).
             _resolve_provisional(t)
         _flush(device)
 
