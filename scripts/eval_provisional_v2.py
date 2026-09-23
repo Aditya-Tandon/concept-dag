@@ -538,6 +538,22 @@ def _v4_run(seed: int, stream: Optional[str], run: Dict) -> Dict:
         if _expects_an_op(r) and accepted_by_drop.get(r.get("minted_at"), 0) != 1
     ]
 
+    # ... and the other direction. Checking only resolution->op lets the opposite
+    # mis-attribution through: an accepted merge op that dropped a provisional root while that
+    # root's record says `timeout` (or nothing at all) is exactly the blocker-1 bug, and V4 has
+    # to be the gate that catches it rather than leaving it to H8's P6 cross-check
+    # (v2 review, should-fix 5).
+    record_by_mint = {r.get("minted_at"): r for r in roots}
+    orphan_ops = [
+        {"keep": op.get("keep"), "drop": op.get("drop"),
+         "resolution": record_by_mint[op.get("drop")].get("resolution"),
+         "merged_after_crystallisation":
+             record_by_mint[op.get("drop")].get("merged_after_crystallisation")}
+        for _at, op in ops
+        if op.get("op") == "merge" and op.get("drop") in record_by_mint
+        and not _expects_an_op(record_by_mint[op.get("drop")])
+    ]
+
     # Parameter curves: every FALL between consecutive tasks needs an accepted merge/truncate in
     # the pass recorded at the earlier task.
     accepted_at: Dict[Optional[int], int] = {}
@@ -558,14 +574,18 @@ def _v4_run(seed: int, stream: Optional[str], run: Dict) -> Dict:
             "n_provisional_roots": len(roots),
             "removed_unexplained": len(unexplained), "unresolved": len(unresolved),
             "merge_resolutions_without_exactly_one_op": bad_merge_map,
+            "accepted_ops_with_no_matching_resolution": orphan_ops,
             "curve_falls": curve_falls, "unexplained_curve_falls": unexplained_falls,
-            "ok": not (unexplained or unresolved or bad_merge_map or unexplained_falls)}
+            "ok": not (unexplained or unresolved or bad_merge_map or orphan_ops
+                       or unexplained_falls)}
 
 
 def gate_v4(all_runs: List[Tuple[int, Optional[str], Dict]]) -> Dict:
     gate = {"gate": "V4",
-            "observable": "every provisional root's 'merge' resolution maps to exactly one "
-                          "accepted op naming it as drop; zero removed_unexplained; every fall "
+            "observable": "every provisional root's merge resolution maps to exactly one "
+                          "accepted op naming it as drop AND every accepted op dropping a "
+                          "provisional root maps back to a recorded merge; zero "
+                          "removed_unexplained; every fall "
                           "in param_curve AND param_curve_total is covered by an accepted "
                           "merge/truncate in the pass recorded at the earlier task",
             "threshold": "zero violations of any clause", "value": None, "verdict": "not-run"}

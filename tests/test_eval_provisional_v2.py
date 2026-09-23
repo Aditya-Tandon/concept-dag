@@ -361,6 +361,35 @@ def test_v4_accepts_a_root_merged_after_crystallisation(ev):
         "merged_after_crystallisation"] == 0
 
 
+def test_v4_catches_the_opposite_mis_attribution(ev):
+    """An accepted merge dropping a provisional root whose record says `timeout` is blocker 1.
+
+    Checking only resolution->op lets that through: the record claims a timeout, so nothing
+    "expects an op", and V4 was silent on the very bug H8's P6 cross-check catches.
+    """
+    bad = run(roots=[{"minted_at": 1, "resolution": "timeout", "resolved_at": 4}],
+              param_curve=[100, 200, 300, 300, 200],
+              param_curve_total=[100, 200, 300, 300, 200],
+              passes=[{"at_task": 3, "ops": [{"op": "merge", "keep": 0, "drop": 1}]}])
+    g = ev.gate_v4([(42, None, bad)])
+    assert g["verdict"] == "fail"
+    orphans = g["value"]["violations"][0]["accepted_ops_with_no_matching_resolution"]
+    assert orphans == [{"keep": 0, "drop": 1, "resolution": "timeout",
+                        "merged_after_crystallisation": None}]
+
+    # Recording the post-crystallisation merge is what makes the same run clean.
+    fixed = json.loads(json.dumps(bad))
+    fixed["provisional_roots"][0]["merged_after_crystallisation"] = 0
+    assert ev.gate_v4([(42, None, fixed)])["verdict"] == "pass"
+
+
+def test_v4_ignores_ops_dropping_a_non_provisional_root(ev):
+    r = run(roots=[], param_curve=[100, 200, 300, 300, 200],
+            param_curve_total=[100, 200, 300, 300, 200],
+            passes=[{"at_task": 3, "ops": [{"op": "merge", "keep": 0, "drop": 1}]}])
+    assert ev.gate_v4([(42, None, r)])["verdict"] == "pass"
+
+
 def test_v4_fails_on_removed_unexplained_and_on_an_unresolved_root(ev):
     r1 = run(roots=[{"minted_at": 1, "resolution": "removed_unexplained", "resolved_at": 3}])
     r2 = run(roots=[{"minted_at": 1, "resolution": None, "resolved_at": None}])
