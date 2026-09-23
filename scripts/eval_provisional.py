@@ -376,6 +376,13 @@ def _p6_row_stats(seed: int, stream: Optional[str], r: Dict) -> Dict:
     accepted_drop_is_provisional = sum(
         1 for op in ops if op.get("op") == "merge" and op.get("drop") in prov_ids)
     resolved_by_merge = sum(1 for p in proots if p.get("resolution") == "merge")
+    # A root the crystallise clock resolved by TIMEOUT mid-stream is an ordinary root again, and
+    # a later pass may still merge it. Its resolution stays `timeout` — that is what happened to
+    # the provisional flag — but it does produce an accepted merge op naming it as `drop`, so it
+    # belongs on the ops side of the cross-check or the two paths disagree on a correct run
+    # ([[provisional-growth-code-review]] v2 blocker 2).
+    merged_after_crystallisation = sum(
+        1 for p in proots if p.get("merged_after_crystallisation") is not None)
     resolved_by_timeout = sum(1 for p in proots if p.get("resolution") == "timeout")
     resolved_unexplained = sum(1 for p in proots if p.get("resolution") == "removed_unexplained")
     return {"seed": seed, "stream": stream, "legacy": legacy,
@@ -384,13 +391,15 @@ def _p6_row_stats(seed: int, stream: Optional[str], r: Dict) -> Dict:
             "resolved_unexplained": resolved_unexplained,
             "merge_attempted": _consolidation_attempted_total(r),
             "merge_accepted": merge_accepted, "merge_rejected": merge_rejected,
+            "merged_after_crystallisation": merged_after_crystallisation,
             "accepted_merge_ops_dropping_a_provisional_root": accepted_drop_is_provisional,
             # A legacy JSON records only the FINAL pass, so an accepted merge from an
             # intermediate pass is simply not in `ops` — the two bookkeeping paths are then
             # expected to disagree and the cross-check cannot say anything. Reporting
             # CROSS-CHECK-MISMATCH there would flag the archive's format, not its content.
             "cross_check_mismatch": (not legacy) and
-                                    resolved_by_merge != accepted_drop_is_provisional}
+                                    (resolved_by_merge + merged_after_crystallisation)
+                                    != accepted_drop_is_provisional}
 
 
 def _p6_aggregate(rows: List[Dict]) -> Dict:
@@ -401,6 +410,7 @@ def _p6_aggregate(rows: List[Dict]) -> Dict:
     resolved_by_merge = sum(r["resolved_by_merge"] for r in rows)
     resolved_by_timeout = sum(r["resolved_by_timeout"] for r in rows)
     resolved_unexplained = sum(r["resolved_unexplained"] for r in rows)
+    merged_after_crystallisation = sum(r["merged_after_crystallisation"] for r in rows)
     merge_accepted = sum(r["merge_accepted"] for r in rows)
     merge_rejected = sum(r["merge_rejected"] for r in rows)
     cross_check = sum(r["accepted_merge_ops_dropping_a_provisional_root"] for r in rows)
@@ -409,12 +419,14 @@ def _p6_aggregate(rows: List[Dict]) -> Dict:
                 if rows and all(r["merge_attempted"] is not None for r in rows) else None)
     mismatched = [{"seed": r["seed"], "stream": r["stream"],
                    "resolved_by_merge": r["resolved_by_merge"],
+                   "merged_after_crystallisation": r["merged_after_crystallisation"],
                    "accepted_merge_ops_dropping_a_provisional_root":
                        r["accepted_merge_ops_dropping_a_provisional_root"]}
                   for r in rows if r["cross_check_mismatch"]]
     return {"total": total, "n_merge": resolved_by_merge, "n_timeout": resolved_by_timeout,
             "resolved_by_merge": resolved_by_merge, "resolved_by_timeout": resolved_by_timeout,
             "resolved_unexplained": resolved_unexplained,
+            "merged_after_crystallisation": merged_after_crystallisation,
             "frac_merge": (resolved_by_merge / total) if total else None,
             "merge_attempted": attempted, "merge_accepted": merge_accepted,
             "merge_rejected": merge_rejected,

@@ -32,7 +32,12 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
+import os
+
 from concept_dag.experiments.kan_exp import KanExpConfig, run_exp3a_kan
+
+#: `scripts/` is not a package; the evaluators are loaded by path where a test needs one.
+_SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 
 
 # ---------------------------------------------------------------------------
@@ -452,3 +457,44 @@ def test_a_root_ageing_out_at_the_last_task_is_left_to_the_final_pass(tmp_path):
     # ... while a root that ages out genuinely mid-stream still times out, on its own task.
     assert fast_by_mint[1]["resolution"] == "timeout"
     assert fast_by_mint[1]["resolved_at"] == 3 < last
+
+
+def test_a_root_merged_after_crystallisation_stays_reconcilable(tmp_path):
+    """The clock and the merge bookkeeping must not contradict each other (v2 review, blocker 2).
+
+    A root the clock crystallises MID-stream is an ordinary frozen root again, and a later
+    consolidation pass may still merge it away. Its resolution stays `timeout` — that is what
+    happened to the provisional flag — but it does produce an accepted merge op naming it as
+    `drop`. Without recording that, `resolved_by_merge` and "accepted ops dropping a provisional
+    root" disagree, and every evaluator's cross-check fires on a correct run.
+    """
+    import sys
+
+    from tests.fixtures.cls_identity_stream import make_duplicate_cls_tasks
+
+    sys.path.insert(0, str(_SCRIPTS))
+    import eval_provisional
+
+    tasks = make_duplicate_cls_tasks()
+    cfg = KanExpConfig(
+        results_dir=str(tmp_path), device="cpu", backbone="dinov2_vits14",
+        feature_dim=24, concept_dim=16, seed=42, root_epochs=12, child_epochs=12, gate_epochs=6,
+        n_tasks=len(tasks), n_parents=2, routing_batches=4, gate_cache_max=256, subspace_k=3,
+        batch_size=16, raw_grow_probe=True, enable_search=True, search_skip=True,
+        consolidate_every=0, distill=True, distill_epochs=4, log_every=100000,
+        provisional="always", always_n_max=100000, crystallise_after=2)
+    res = run_exp3a_kan(cfg, tasks)
+
+    by_mint = {r["minted_at"]: r for r in res["provisional_roots"]}
+    # The t1 root ages out at t3, mid-stream, and the final pass merges it into root 0.
+    t1 = by_mint[1]
+    assert t1["resolution"] == "timeout" and t1["resolved_at"] == 3
+    assert t1["merged_after_crystallisation"] == 0
+    assert t1["merged_after_crystallisation_at"] == len(tasks) - 1
+
+    # ... and the two bookkeeping paths reconcile, so the cross-check does not fire.
+    row = eval_provisional._p6_row_stats(42, "s_interleave", res)
+    assert row["merged_after_crystallisation"] == 1
+    assert (row["resolved_by_merge"] + row["merged_after_crystallisation"]
+            == row["accepted_merge_ops_dropping_a_provisional_root"])
+    assert row["cross_check_mismatch"] is False

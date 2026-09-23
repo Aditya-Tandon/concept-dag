@@ -28,6 +28,8 @@ Covers:
 
 from __future__ import annotations
 
+import json
+
 import importlib.util
 import os
 
@@ -242,6 +244,42 @@ def test_p6_new_format_json_cross_check_mismatch_is_still_reported():
     assert s["cross_check_mismatch"] is True
     assert "[CROSS-CHECK-MISMATCH]" in gate["headline"]
     assert s["mismatched_runs"] and s["mismatched_runs"][0]["seed"] == 49
+
+
+def test_p6_a_merge_after_crystallisation_is_not_a_mismatch():
+    """A root the clock crystallised mid-stream can still be merged by a later pass.
+
+    Its resolution stays `timeout` — that is what happened to the provisional FLAG — but it does
+    produce an accepted merge op naming it as `drop`, so the ops side counts one more than
+    `resolved_by_merge` does. Recording `merged_after_crystallisation` is what keeps the two
+    bookkeeping paths reconcilable ([[provisional-growth-code-review]] v2 blocker 2).
+    """
+    run = {
+        "provisional_roots": [
+            {"minted_at": 1, "resolution": "timeout", "resolved_at": 3,
+             "merged_after_crystallisation": 0, "merged_after_crystallisation_at": 4},
+            {"minted_at": 2, "resolution": "merge", "resolved_at": 4},
+        ],
+        "consolidation_passes": [
+            {"at_task": 4, "ops": [{"op": "merge", "keep": 0, "drop": 1},
+                                   {"op": "merge", "keep": 0, "drop": 2}],
+             "merge_attempted": 2},
+        ],
+        "decisions": [{"task": 3, "decision": "reuse"}],
+    }
+    gate = eval_provisional.gate_p6({42: run}, {})
+    s = gate["value"]["s_interleave"]
+    assert s["resolved_by_merge"] == 1
+    assert s["merged_after_crystallisation"] == 1
+    assert s["resolved_by_merge_cross_check"] == 2      # the ops side counts both
+    assert s["cross_check_mismatch"] is False
+    assert "[CROSS-CHECK-MISMATCH]" not in gate["headline"]
+
+    # Drop the record and the SAME run becomes a mismatch — the field is what reconciles it.
+    unrecorded = json.loads(json.dumps(run))
+    del unrecorded["provisional_roots"][0]["merged_after_crystallisation"]
+    gate2 = eval_provisional.gate_p6({42: unrecorded}, {})
+    assert gate2["value"]["s_interleave"]["cross_check_mismatch"] is True
 
 
 def test_p6_mixed_legacy_and_new_format_pools_correctly():

@@ -305,6 +305,25 @@ def test_v4_fails_when_a_merge_resolution_has_no_op(ev):
     assert g["value"]["violations"][0]["merge_resolutions_without_exactly_one_op"]
 
 
+def test_v4_accepts_a_root_merged_after_crystallisation(ev):
+    """Resolution `timeout` + `merged_after_crystallisation` still expects exactly one op."""
+    ok = run(roots=[{"minted_at": 1, "resolution": "timeout", "resolved_at": 3,
+                     "merged_after_crystallisation": 0}],
+             param_curve=[100, 200, 300, 300, 200],
+             param_curve_total=[100, 200, 300, 300, 200],
+             passes=[{"at_task": 3, "ops": [{"op": "merge", "keep": 0, "drop": 1}]}])
+    assert ev.gate_v4([(42, None, ok)])["verdict"] == "pass"
+
+    # ... and it is a violation when no accepted op names it, exactly as a `merge` resolution is.
+    bad = run(roots=[{"minted_at": 1, "resolution": "timeout", "resolved_at": 3,
+                      "merged_after_crystallisation": 0}],
+              passes=[{"at_task": 3, "ops": []}])
+    g = ev.gate_v4([(42, None, bad)])
+    assert g["verdict"] == "fail"
+    assert g["value"]["violations"][0]["merge_resolutions_without_exactly_one_op"][0][
+        "merged_after_crystallisation"] == 0
+
+
 def test_v4_fails_on_removed_unexplained_and_on_an_unresolved_root(ev):
     r1 = run(roots=[{"minted_at": 1, "resolution": "removed_unexplained", "resolved_at": 3}])
     r2 = run(roots=[{"minted_at": 1, "resolution": None, "resolved_at": None}])

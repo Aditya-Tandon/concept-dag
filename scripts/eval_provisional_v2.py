@@ -477,11 +477,21 @@ def _v4_run(seed: int, stream: Optional[str], run: Dict) -> Dict:
     roots = run.get("provisional_roots", []) or []
     unexplained = [r for r in roots if r.get("resolution") == "removed_unexplained"]
     unresolved = [r for r in roots if r.get("resolution") is None]
+    # A root the clock crystallised mid-stream is an ordinary root again and a LATER pass may
+    # still merge it: its resolution stays `timeout` (that is what happened to the provisional
+    # flag) but it DOES produce an accepted op naming it as `drop`, recorded on the record as
+    # `merged_after_crystallisation`. Both kinds must map to exactly one accepted op, or the two
+    # bookkeeping paths stop reconciling on a correct run (v2 review, blocker 2).
+    def _expects_an_op(r: Dict) -> bool:
+        return (r.get("resolution") == "merge"
+                or r.get("merged_after_crystallisation") is not None)
+
     bad_merge_map = [
-        {"minted_at": r.get("minted_at"), "n_accepted_ops_naming_it": accepted_by_drop.get(
-            r.get("minted_at"), 0)}
+        {"minted_at": r.get("minted_at"), "resolution": r.get("resolution"),
+         "merged_after_crystallisation": r.get("merged_after_crystallisation"),
+         "n_accepted_ops_naming_it": accepted_by_drop.get(r.get("minted_at"), 0)}
         for r in roots
-        if r.get("resolution") == "merge" and accepted_by_drop.get(r.get("minted_at"), 0) != 1
+        if _expects_an_op(r) and accepted_by_drop.get(r.get("minted_at"), 0) != 1
     ]
 
     # Parameter curves: every FALL between consecutive tasks needs an accepted merge/truncate in

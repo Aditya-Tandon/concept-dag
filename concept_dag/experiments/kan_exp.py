@@ -1206,6 +1206,22 @@ def run_exp3a_kan(
                          if op["op"] == "merge"}
         for task_id, rec_p in provisional_log.items():
             if rec_p["resolution"] is not None:
+                # A root the clock crystallised is an ordinary frozen root again, and a LATER
+                # pass may still merge it away. That is not a second resolution — the resolution
+                # stays `timeout`, which is what actually happened to the provisional FLAG — but
+                # it has to be recorded, or the two bookkeeping paths the evaluators reconcile
+                # (`provisional_roots[*].resolution` against accepted merge ops naming a
+                # provisional root as `drop`) disagree on a perfectly correct run and every
+                # cross-check fires (v2 review, blocker 2). Reachable in the pre-registered
+                # `always` arm: at crystallise_after 3 on CTrL's 6 positions the t1/t2 roots age
+                # out at t4/t5 and are then candidates for the final pass.
+                if (rec_p["resolution"] == "timeout"
+                        and rec_p.get("merged_after_crystallisation") is None
+                        and id(rec_p["_node"]) not in live):
+                    merge_op = merge_by_drop.get(task_id)
+                    if merge_op is not None:
+                        rec_p["merged_after_crystallisation"] = merge_op["keep"]
+                        rec_p["merged_after_crystallisation_at"] = current_t
                 continue
             node = rec_p["_node"]
             if id(node) not in live:
