@@ -396,25 +396,29 @@ def consolidate_nodes(
                 if functional_threshold is not None:
                     Fa, Fb = _paired_root_features(
                         a, b, _combined_loader(tasks, a.task_id, b.task_id), device)
+                    # BOTH statistics, off the one draw, in BOTH modes. The one the trigger did
+                    # not use is logging — and it is the logging that makes an offline
+                    # counterfactual ("what would the other trigger have merged?") possible at
+                    # all, which is the whole reason the pre-filter can be evaluated without
+                    # re-running the stream. Neither statistic draws RNG and neither builds a
+                    # loader of its own, so the default path's stream is untouched.
                     cca = _cca_topk(Fa, Fb, subspace_k)
+                    cka = _linear_cka(Fa, Fb)
+                    sim_extra = {"cka": cka, "cca_topk": cca}
                     if merge_trigger == "cka":
-                        cka = _linear_cka(Fa, Fb)
                         sim, sim_kind, thr = cka, "cka", merge_cka_threshold
-                        sim_extra = {"cka": cka, "cca_topk": cca}
                     else:
                         sim, sim_kind, thr = cca, "functional", functional_threshold
-                        # Logging only — one extra matmul on features already in hand. cca-mode
-                        # runs are what calibrate `merge_cka_threshold` offline, so the statistic
-                        # has to be recorded on the arm that does NOT act on it.
-                        sim_extra = {"cka": _linear_cka(Fa, Fb)}
                     if sim < thr:
-                        if merge_trigger == "cka":
-                            # A candidate the pre-filter STOPS is the whole point of the arm, and
-                            # a bare `continue` makes it indistinguishable from "no pair found".
-                            # Recorded in cka mode only, so the cca-mode op list is untouched.
-                            ops.append({"op": "merge_skipped", "keep": a.task_id, "drop": b.task_id,
-                                        "similarity": sim, "sim_kind": sim_kind, "threshold": thr,
-                                        **sim_extra})
+                        # A pair the trigger stops used to vanish: a bare `continue` is
+                        # indistinguishable from "no pair was ever considered", so the archive
+                        # could not say whether the merge rung was silent because nothing was
+                        # redundant or because the trigger was mis-set. Every EXAMINED pair now
+                        # leaves exactly one record per scan. Appended to the op list only — no
+                        # decision, no loader, no draw moves.
+                        ops.append({"op": "trigger_rejected", "keep": a.task_id, "drop": b.task_id,
+                                    "similarity": sim, "sim_kind": sim_kind, "threshold": thr,
+                                    **sim_extra})
                         continue
                 else:
                     sim = _subspace_similarity(a, b, subspace_k)

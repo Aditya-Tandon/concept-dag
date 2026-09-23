@@ -16,9 +16,13 @@ Four things have to hold:
    independent noise.
 2. Both statistics are read off ONE draw. `_combined_loader` shuffles, so a second pass would
    score the two triggers on different samples *and* advance the run's RNG stream.
-3. In `cka` mode the trigger really gates: an unreachable threshold stops every candidate, and
-   each stopped candidate is RECORDED (a bare `continue` is indistinguishable from "no pair").
-4. The default (`cca`) arm is untouched: same ops, same numbers, plus the logged `cka` field.
+3. The trigger really gates, in both modes: an unreachable threshold stops every candidate, and
+   every EXAMINED pair leaves exactly one record per scan — `trigger_rejected` where a bare
+   `continue` used to be, which is what makes "the merge rung was silent" distinguishable from
+   "no pair was ever considered", and what lets the other trigger's counterfactual be read off
+   the archive without re-running the stream.
+4. The default (`cca`) arm is untouched: same merges, same `similarity`, same numbers; it only
+   gains the two logged statistics and the records for pairs it was already discarding.
 """
 
 from __future__ import annotations
@@ -132,7 +136,7 @@ def test_unreachable_cka_threshold_stops_every_candidate_and_records_it(tmp_path
     ops = [op for p in res["consolidation_passes"] for op in p["ops"]]
     assert not any(op["op"] in ("merge", "merge_rejected") for op in ops), (
         "CKA is at most 1, so a threshold of 1.1 must stop every candidate before distill_merge")
-    skipped = [op for op in ops if op["op"] == "merge_skipped"]
+    skipped = [op for op in ops if op["op"] == "trigger_rejected"]
     assert skipped, "the stream's duplicate pair must at least be CONSIDERED and recorded"
     for op in skipped:
         assert op["sim_kind"] == "cka"
@@ -142,6 +146,26 @@ def test_unreachable_cka_threshold_stops_every_candidate_and_records_it(tmp_path
         assert op["threshold"] == 1.1
     assert res["consolidation"]["merge_accepted"] == 0
     assert res["consolidation"]["params_saved"] == 0
+
+
+def test_every_examined_pair_leaves_exactly_one_record_in_cca_mode(tmp_path):
+    """The default arm records the pairs it stops too — the counterfactual depends on it."""
+    res = _consolidate(tmp_path, functional_threshold=0.999)   # nothing can clear this
+
+    final = res["consolidation"]
+    assert final["merge_attempted"] == 0
+    stopped = [op for op in final["ops"] if op["op"] == "trigger_rejected"]
+    assert stopped, "pairs were examined and left no trace"
+    for op in stopped:
+        assert op["sim_kind"] == "functional"
+        assert op["similarity"] == op["cca_topk"]     # the trigger used the CCA value
+        assert 0.0 <= op["cka"] <= 1.0                # ... and the CKA is recorded alongside
+        assert op["threshold"] == 0.999
+    # Exactly one record per examined pair: the final pass merges nothing, so it makes a single
+    # scan over every unordered pair of the DAG's nodes.
+    n_nodes = len(res["params_per_root"])
+    assert len(stopped) == n_nodes * (n_nodes - 1) // 2
+    assert len({(op["keep"], op["drop"]) for op in stopped}) == len(stopped)
 
 
 def test_cka_mode_at_a_reachable_threshold_merges_and_carries_both_statistics(tmp_path):
@@ -172,14 +196,22 @@ def test_default_trigger_ops_are_unchanged_apart_from_the_logged_cka(tmp_path):
         expected_ops = json.load(f)["consolidation"]["ops"]
 
     # Through JSON, as the fixture is: `backward_deltas` is keyed by int in memory.
-    got = json.loads(json.dumps(_consolidate(tmp_path / "cca")["consolidation"]["ops"]))
+    res = _consolidate(tmp_path / "cca")
+    all_ops = json.loads(json.dumps(res["consolidation"]["ops"]))
+    got = [op for op in all_ops if op["op"] != "trigger_rejected"]
     assert len(got) == len(expected_ops)
     for op, exp in zip(got, expected_ops):
-        cka = op.pop("cka", None)                    # the one added field
+        cka = op.pop("cka", None)                    # the two added fields
+        cca = op.pop("cca_topk", None)
         assert op == exp
         if exp["op"].startswith("merge"):
             assert cka is not None and 0.0 <= cka <= 1.0
+            assert cca is not None and op["similarity"] == cca
             assert exp["sim_kind"] == "functional"   # the trigger is still the CCA
+    # Every pair this particular stream examines is accepted, so it has no `trigger_rejected`
+    # record to show — which is the point: the new records appear exactly where a pair used to be
+    # discarded silently, and nowhere else.
+    assert all(op["op"] != "trigger_rejected" for op in all_ops)
 
 
 def test_consolidate_nodes_defaults_to_the_published_trigger():
