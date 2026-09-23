@@ -78,6 +78,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--consolidate_every", type=int, default=0,
                         help="[3a-kan] run the consolidation (reduction) pass every K tasks (0 = only "
                              "at the end)")
+    parser.add_argument("--merge_trigger", type=str, default="cca", choices=["cca", "cka"],
+                        help="[5ds-kan/3a-kan/ctrl] which redundancy statistic DECIDES a merge "
+                             "candidate: 'cca' (default, published) = mean top-k canonical "
+                             "correlation >= --functional_threshold; 'cka' = linear CKA >= "
+                             "--merge_cka_threshold (the merge pre-filter arm). Both statistics "
+                             "are recorded on every merge op record either way, so a cca-mode run "
+                             "is what calibrates the CKA threshold.")
+    parser.add_argument("--merge_cka_threshold", type=float, default=0.55,
+                        help="[--merge_trigger cka] linear CKA a candidate pair must reach before "
+                             "it is handed to distill_merge.")
     parser.add_argument("--device",   type=str,   default="auto",
                         help="Device: 'cpu', 'cuda', 'mps', or 'auto'")
     parser.add_argument("--epochs",   type=int,   default=30,
@@ -491,6 +501,8 @@ def main():
             provisional = args.provisional,
             provisional_alpha = args.provisional_alpha,
             provisional_z = args.provisional_z,
+            merge_trigger = args.merge_trigger,
+            merge_cka_threshold = args.merge_cka_threshold,
             always_n_max = args.always_n_max,
             crystallise_after = args.crystallise_after,
         )
@@ -560,6 +572,8 @@ def main():
             provisional = args.provisional,
             provisional_alpha = args.provisional_alpha,
             provisional_z = args.provisional_z,
+            merge_trigger = args.merge_trigger,
+            merge_cka_threshold = args.merge_cka_threshold,
             always_n_max = args.always_n_max,
             crystallise_after = args.crystallise_after,
         )

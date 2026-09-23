@@ -278,6 +278,8 @@ def consolidate_nodes(
     distill_epochs: int = 20,
     merge_tolerance: float = 0.01,
     functional_threshold: Optional[float] = None,
+    merge_trigger: str = "cca",
+    merge_cka_threshold: float = 0.55,
 ) -> Dict[str, object]:
     """
     One consolidation pass over the grown DAGNode list.
@@ -384,11 +386,35 @@ def consolidate_nodes(
                 # Redundancy trigger. Default (geometric) principal-angle overlap misses concepts
                 # that are functionally identical but sit in different bases; when a functional
                 # threshold is set, use mean canonical correlation instead (basis-invariant).
+                #
+                # `merge_trigger="cka"` swaps the DECIDING statistic for linear CKA (the merge
+                # pre-filter). Both statistics are read off ONE pass over ONE draw
+                # (`_paired_root_features`): `_combined_loader` shuffles and therefore consumes the
+                # global RNG, so scoring the two triggers on two passes would compare different
+                # samples AND move the run's stream.
+                sim_extra: Dict[str, float] = {}
                 if functional_threshold is not None:
-                    sim = _functional_similarity(
-                        a, b, _combined_loader(tasks, a.task_id, b.task_id), device, subspace_k)
-                    sim_kind = "functional"
-                    if sim < functional_threshold:
+                    Fa, Fb = _paired_root_features(
+                        a, b, _combined_loader(tasks, a.task_id, b.task_id), device)
+                    cca = _cca_topk(Fa, Fb, subspace_k)
+                    if merge_trigger == "cka":
+                        cka = _linear_cka(Fa, Fb)
+                        sim, sim_kind, thr = cka, "cka", merge_cka_threshold
+                        sim_extra = {"cka": cka, "cca_topk": cca}
+                    else:
+                        sim, sim_kind, thr = cca, "functional", functional_threshold
+                        # Logging only — one extra matmul on features already in hand. cca-mode
+                        # runs are what calibrate `merge_cka_threshold` offline, so the statistic
+                        # has to be recorded on the arm that does NOT act on it.
+                        sim_extra = {"cka": _linear_cka(Fa, Fb)}
+                    if sim < thr:
+                        if merge_trigger == "cka":
+                            # A candidate the pre-filter STOPS is the whole point of the arm, and
+                            # a bare `continue` makes it indistinguishable from "no pair found".
+                            # Recorded in cka mode only, so the cca-mode op list is untouched.
+                            ops.append({"op": "merge_skipped", "keep": a.task_id, "drop": b.task_id,
+                                        "similarity": sim, "sim_kind": sim_kind, "threshold": thr,
+                                        **sim_extra})
                         continue
                 else:
                     sim = _subspace_similarity(a, b, subspace_k)
@@ -404,7 +430,8 @@ def consolidate_nodes(
                         continue
                     _merge_nodes(nodes, predictors, keep=a, drop=b)
                     ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id,
-                                "similarity": sim, "sim_kind": sim_kind, "distilled": False})
+                                "similarity": sim, "sim_kind": sim_kind, "distilled": False,
+                                **sim_extra})
                     merged = True
                     break
 
@@ -436,7 +463,8 @@ def consolidate_nodes(
                 if ok:
                     ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id,
                                 "similarity": sim, "sim_kind": sim_kind, "distilled": True,
-                                "recon_loss": W["recon_loss"], "backward_deltas": deltas})
+                                "recon_loss": W["recon_loss"], "backward_deltas": deltas,
+                                **sim_extra})
                     audit_entry["verdict"] = "kept"
                     reader_audit.append(audit_entry)
                     merged = True
@@ -449,7 +477,7 @@ def consolidate_nodes(
                     ops.append({"op": "merge_rejected", "keep": a.task_id, "drop": b.task_id,
                                 "similarity": sim, "sim_kind": sim_kind, "recon_loss": W["recon_loss"],
                                 "backward_deltas": deltas, "worst_delta": min(deltas.values()),
-                                "merge_tolerance": merge_tolerance})
+                                "merge_tolerance": merge_tolerance, **sim_extra})
                     audit_entry["verdict"] = "rolled_back"
                     reader_audit.append(audit_entry)
             if merged:
@@ -491,6 +519,19 @@ def _functional_similarity(a: DAGNode, b: DAGNode, loader, device: str, top_k: i
     so this is the correct trigger for the distill+recovery-adapter merge (which linearly re-aligns
     the surviving concept anyway). See Central Library: five-datasets-kan-merge-detector.
     """
+    Fa, Fb = _paired_root_features(a, b, loader, device, max_batches)
+    return _cca_topk(Fa, Fb, top_k)
+
+
+def _paired_root_features(a: DAGNode, b: DAGNode, loader, device: str,
+                          max_batches: int = 8) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Both concepts' outputs over the SAME sample batch of `loader`, in the same order.
+
+    Factored out of `_functional_similarity` so every redundancy statistic is read off one pass
+    over one draw. That matters for more than cost: `_combined_loader` shuffles, so a second pass
+    would both score the two triggers on different samples and advance the run's RNG stream.
+    Returns raw (uncentred) CPU float32 (N, concept_dim) matrices.
+    """
     a_out, b_out = [], []
     a.eval(); b.eval()
     with torch.no_grad():
@@ -500,7 +541,12 @@ def _functional_similarity(a: DAGNode, b: DAGNode, loader, device: str, top_k: i
             x = batch[0].to(device)
             a_out.append(a(x).detach().cpu().float())
             b_out.append(b(x).detach().cpu().float())
-    Ha = torch.cat(a_out); Hb = torch.cat(b_out)
+    return torch.cat(a_out), torch.cat(b_out)
+
+
+def _cca_topk(Fa: torch.Tensor, Fb: torch.Tensor, top_k: int) -> float:
+    """Mean of the top-k canonical correlations between two feature matrices, in [0, 1]."""
+    Ha, Hb = Fa, Fb
     if Ha.shape[0] <= Ha.shape[1]:               # too few samples for a stable CCA
         return 0.0
     Ha = Ha - Ha.mean(0, keepdim=True)
@@ -510,6 +556,28 @@ def _functional_similarity(a: DAGNode, b: DAGNode, loader, device: str, top_k: i
     sv = torch.linalg.svdvals(qa.T @ qb).clamp(0.0, 1.0)
     k = min(top_k, sv.numel())
     return float(sv[:k].mean().item())
+
+
+def _linear_cka(Fa: torch.Tensor, Fb: torch.Tensor) -> float:
+    """Linear CKA between two column-centred feature matrices (Kornblith 2019), in [0, 1].
+
+    ``cka = ||Fa^T Fb||_F^2 / (||Fa^T Fa||_F ||Fb^T Fb||_F)`` — 1 exactly when the two
+    representations agree up to an orthogonal map (and any isotropic scale), so like CCA it is
+    basis-invariant, but unlike CCA it is NOT invariant to an arbitrary invertible map: it keeps
+    reading the variance each direction carries. That is what makes it usable as a merge
+    PRE-FILTER — the top-k CCA of two roots saturates near 1 on any pair whose class-carrying
+    directions happen to span, which is why the H8 archive's merge rung fires (or does not) almost
+    independently of how redundant the pair really is. Needs no QR/SVD, so it costs one matmul per
+    side on features `_paired_root_features` already collected.
+    """
+    Ha = Fa - Fa.mean(0, keepdim=True)
+    Hb = Fb - Fb.mean(0, keepdim=True)
+    cross = float((Ha.T @ Hb).pow(2).sum().item())
+    na = float((Ha.T @ Ha).norm().item())
+    nb = float((Hb.T @ Hb).norm().item())
+    if na <= 0.0 or nb <= 0.0:                   # a constant representation has no similarity
+        return 0.0
+    return cross / (na * nb)
 
 
 def _compose(existing: Optional[nn.Module], recovery: Optional[nn.Module]) -> Optional[nn.Module]:
@@ -635,6 +703,11 @@ class KanExpConfig(Exp3Config):
     functional_redundancy: bool = True    # detect merge candidates by canonical correlation (basis-
                                           # invariant), not principal-angle subspace overlap
     functional_threshold: float = 0.9     # mean top-k canonical correlation to trigger a merge
+    merge_trigger:       str   = "cca"    # "cca" | "cka" — which statistic DECIDES a merge
+                                          # candidate. "cca" is the published trigger; "cka" is the
+                                          # linear-CKA pre-filter (merge-detector separability).
+                                          # Both are always RECORDED on every merge op record.
+    merge_cka_threshold: float = 0.55     # linear CKA a pair must reach (merge_trigger == "cka")
     enable_search:       bool  = False    # three-way reuse/search/grow gate (test-time-compute rung)
     eps_search:          float = 0.05     # min reducible-info fraction bounded search must add over reuse
     search_budget:       int   = 6        # trained candidates the Search level may spend
@@ -1388,7 +1461,9 @@ def run_exp3a_kan(
                                      subspace_k=cfg.subspace_k, distill=cfg.distill,
                                      distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance,
                                      functional_threshold=(cfg.functional_threshold
-                                                           if cfg.functional_redundancy else None))
+                                                           if cfg.functional_redundancy else None),
+                                     merge_trigger=cfg.merge_trigger,
+                                     merge_cka_threshold=cfg.merge_cka_threshold)
             print(f"  [consolidate @ task {t}] saved {summ['params_saved']} params, {summ['n_ops']} ops")
             summ["at_task"] = t
             summ["final"] = False
@@ -1407,7 +1482,9 @@ def run_exp3a_kan(
                                       subspace_k=cfg.subspace_k, distill=cfg.distill,
                                       distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance,
                                       functional_threshold=(cfg.functional_threshold
-                                                            if cfg.functional_redundancy else None))
+                                                            if cfg.functional_redundancy else None),
+                                      merge_trigger=cfg.merge_trigger,
+                                      merge_cka_threshold=cfg.merge_cka_threshold)
     consolidation["at_task"] = len(tasks) - 1
     consolidation["final"] = True
     for e in consolidation["reader_audit"]:
