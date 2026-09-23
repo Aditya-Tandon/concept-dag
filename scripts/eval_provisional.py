@@ -857,12 +857,34 @@ def gate_p3(off_ctrl, evalue_ctrl) -> Dict:
 # P4 — merge fires, s_interleave (10 seeds), negative control on the (A, B) pair
 # ---------------------------------------------------------------------------
 
+def _target_pair(run: Dict) -> Tuple[int, int]:
+    """(target position, its partner) for the s_interleave merge, from the run's own ground truth.
+
+    `ctrl_ground_truth[i]["should"] == "merge"` marks the REVISIT (position 3), whose provisional
+    root is the one a merge removes; `revisit_of` names the original it should merge into
+    (position 1). The pre-2026-09-23 evaluator looked for a provisional root minted at position 1
+    instead — the original, which is grown as an ordinary root at a position the gate never
+    defers — so P4 counted 0/10 merges in every possible world.
+    """
+    gt = run.get("ctrl_ground_truth") or []
+    for i, entry in enumerate(gt):
+        if (entry or {}).get("should") == "merge":
+            partner = entry.get("revisit_of")
+            return i, (partner if partner is not None else 1)
+    return 3, 1
+
+
 def gate_p4(int_evalue: Dict[int, Dict]) -> Dict:
     gate = {"gate": "P4",
-            "observable": "the t1-minted provisional root's resolution, arm evalue, s_interleave, "
-                          "10 seeds; negative control: no merge op with keep/drop task ids {1,2} "
-                          "or {2,3}",
-            "threshold": f"merged in >= 7/10 seeds; negative control never fires",
+            "observable": "the TARGET provisional root's resolution, arm evalue, s_interleave, "
+                          "10 seeds; the target is the stream position the run's own "
+                          "`ctrl_ground_truth` marks `should == \"merge\"` (position 3, the "
+                          "revisit of position 1) — NOT position 1, which is the original and is "
+                          "grown as an ordinary root, so it can never be the provisional root "
+                          "that merges away; negative control: no merge op with keep/drop task "
+                          "ids {1,2} or {2,3}",
+            "threshold": f"merged in >= 7/10 seeds; negative control never fires; the accepted "
+                         f"op behind each merge must name the ground-truth pair",
             "value": None, "verdict": "not-run"}
     if not int_evalue:
         gate["note"] = "arm evalue s_interleave data missing"
@@ -874,20 +896,39 @@ def gate_p4(int_evalue: Dict[int, Dict]) -> Dict:
         if r is None:
             continue
         proots = r.get("provisional_roots", []) or []
-        root_a = next((p for p in proots if p.get("minted_at") == 1), None)
+        target_idx, partner_idx = _target_pair(r)
+        root_a = next((p for p in proots if p.get("minted_at") == target_idx), None)
         resolved_merge = bool(root_a and root_a.get("resolution") == "merge")
         wrong_merge = False
         ops, legacy = _consolidation_ops(r)   # every pass, not just the final one (P6 fix)
         any_legacy = any_legacy or legacy
+        accepted_for_target = None
         for op in ops:
             if op.get("op") == "merge":
                 pair = {op.get("keep"), op.get("drop")}
                 if pair == {1, 2} or pair == {2, 3}:
                     wrong_merge = True
+                if op.get("drop") == target_idx:
+                    accepted_for_target = op
+        # The op behind the resolution is only visible if the pass that ran it was recorded. On
+        # `s_interleave` it never is in the legacy archive (`--consolidate_every 2` fires after
+        # t3 and only the final pass was kept), so the `keep` side — and therefore whether the
+        # merge was the ground-truth pair or the negative control — is unrecoverable there.
+        pair_verified = None
+        if resolved_merge:
+            if accepted_for_target is not None:
+                pair_verified = ({accepted_for_target.get("keep"),
+                                  accepted_for_target.get("drop")} == {partner_idx, target_idx})
+            elif root_a and root_a.get("merged_into") is not None:
+                pair_verified = root_a["merged_into"] == partner_idx
+            else:
+                pair_verified = None          # unverifiable, not false
         t3_decision = (dec_at(r, 3) or {}).get("decision")
-        rows.append({"seed": seed, "root_a_present": root_a is not None,
+        rows.append({"seed": seed, "target_task": target_idx, "partner_task": partner_idx,
+                     "root_a_present": root_a is not None,
                      "root_a_resolution": root_a.get("resolution") if root_a else None,
-                     "resolved_merge": resolved_merge, "wrong_merge": wrong_merge,
+                     "resolved_merge": resolved_merge, "pair_verified": pair_verified,
+                     "wrong_merge": wrong_merge,
                      "t3_decision": t3_decision})
     if not rows:
         gate["note"] = "no matched seeds for arm evalue s_interleave"
@@ -896,14 +937,28 @@ def gate_p4(int_evalue: Dict[int, Dict]) -> Dict:
     n_merge = sum(1 for r in rows if r["resolved_merge"])
     frac_merge = n_merge / n
     any_wrong_merge = any(r["wrong_merge"] for r in rows)
+    n_unverified = sum(1 for r in rows if r["resolved_merge"] and r["pair_verified"] is None)
+    n_wrong_pair = sum(1 for r in rows if r["pair_verified"] is False)
     t3_reuse_fraction = _mean([1.0 if r["t3_decision"] == "reuse" else 0.0 for r in rows])
-    pass_ = (frac_merge >= P4_MIN_MERGE_FRAC) and not any_wrong_merge
+    rate_ok = frac_merge >= P4_MIN_MERGE_FRAC
     gate["value"] = {"n_seeds": n, "n_merge": n_merge, "frac_merge": frac_merge,
-                      "any_wrong_merge": any_wrong_merge, "t3_reuse_fraction": t3_reuse_fraction,
+                      "any_wrong_merge": any_wrong_merge, "n_pair_unverified": n_unverified,
+                      "n_wrong_pair": n_wrong_pair, "t3_reuse_fraction": t3_reuse_fraction,
                       "rows": rows}
-    gate["verdict"] = "pass" if pass_ else "fail"
-    gate["headline"] = (f"{n_merge}/{n} merged (t3 reuse fraction={t3_reuse_fraction:.2f})"
-                        + (" — WRONG-MERGE" if any_wrong_merge else ""))
+    if not rate_ok or any_wrong_merge or n_wrong_pair:
+        gate["verdict"] = "fail"
+    elif n_unverified:
+        # The rate clears the threshold but the archive cannot say WHICH pair merged. Calling
+        # that a pass would claim the ground-truth pair on no evidence; calling it a fail would
+        # claim MERGE-NEVER-FIRES against direct evidence that a root was removed mid-stream.
+        gate["verdict"] = "undetermined"
+    else:
+        gate["verdict"] = "pass"
+    gate["headline"] = (f"{n_merge}/{n} target roots merged (t3 reuse fraction="
+                        f"{t3_reuse_fraction:.2f})"
+                        + (" — WRONG-MERGE" if any_wrong_merge else "")
+                        + (f" — {n_unverified} pair(s) unverifiable from the archive"
+                           if n_unverified else ""))
     note = None
     if n < len(INT_SEEDS):
         note = f"partial: {n}/{len(INT_SEEDS)} seeds present so far"
@@ -1223,6 +1278,10 @@ def determine_branch(gates: Dict[str, Dict], p1_value: Optional[Dict], p2_value:
     if p4_value and p4_value.get("t3_reuse_fraction") is not None and \
             p4_value["t3_reuse_fraction"] >= NO_MERGE_OBJECT_MIN_FRAC:
         flags.append("NO-MERGE-OBJECT")
+    if v("P4") == "undetermined":
+        # Neither MERGE-NEVER-FIRES nor a clean P4: the rate clears, the pair identity does not
+        # survive the archive. Surfaced so no branch is read as if P4 had passed.
+        flags.append("P4-PAIR-UNVERIFIABLE")
 
     def missing(gid):
         return v(gid) in (None, "not-run")
