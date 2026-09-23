@@ -1347,8 +1347,18 @@ def run_exp3a_kan(
                     # into nor depends on the main run's RNG stream — otherwise every later task's
                     # init/batch order would differ from a control run with enable_update=False,
                     # and borderline decisions on later tasks would flip for an RNG reason rather
-                    # than because of the update rung. Matches _oracle_rungs' fork_rng usage above.
-                    with torch.random.fork_rng(devices=[]):
+                    # than because of the update rung.
+                    #
+                    # The fork must cover the DEVICE generator, not just the CPU one: this is the
+                    # P0b bug (commit 8d65718) at a second call site. `torch.manual_seed` below
+                    # re-seeds EVERY device generator (it fans out to `cuda.manual_seed_all` and
+                    # `mps.manual_seed`), while `torch.random.fork_rng(devices=[])` names no
+                    # device and puts back only the CPU half — so the probe used to leave the
+                    # device generator wherever its own training loop ended, and the dropout mask
+                    # stream of every later `train_node` in the run moved with it. Invisible on
+                    # CPU, which is why the suite said nothing; it makes `--enable_update` fail to
+                    # be a clean comparison against its own control on any GPU/MPS run.
+                    with fork_rng_all_devices():
                         torch.manual_seed(cfg.seed * 1000 + t + 500)
                         best = None
                         for i in root_parent_idxs:

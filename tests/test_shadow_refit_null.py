@@ -200,3 +200,68 @@ def test_shadow_refit_is_a_null_on_a_capped_cache_stream_cpu(tmp_path):
 def test_shadow_refit_is_a_null_on_a_capped_cache_stream_cuda(tmp_path):
     off, shadow = _run_both_arms(tmp_path, "cuda")
     assert _comparable(off) == _comparable(shadow)
+
+
+# ---------------------------------------------------------------------------
+# 3. The same bug at the UPDATE probe's fork (Track C item 2)
+# ---------------------------------------------------------------------------
+#
+# `--enable_update` wraps its probe in a fork for exactly the reason the shadow refit does: the
+# probe reseeds, trains a copy of a root's concept and must leave the run's RNG stream where it
+# found it, or every later task's init and batch order differs from the `enable_update=False`
+# control and a borderline decision flips for an RNG reason rather than a refinement one. It was
+# forking with `torch.random.fork_rng(devices=[])`, so — like the shadow refit before 8d65718 —
+# it restored the CPU generator and left the device generator wherever its own training loop
+# ended. The stand-in generator above makes that observable on CPU.
+
+
+def _update_cfg(results_dir, device: str) -> KanExpConfig:
+    cfg = _cfg(results_dir, "off", device)
+    cfg.enable_update = True
+    cfg.eps_update = 0.0          # the rung must be REACHED; whether it commits is not the point
+    return cfg
+
+
+def _run_with_a_device_drawing_update_probe(tmp_path, monkeypatch, draw, read_state, device: str):
+    """Run a gated stream whose update probe draws from `draw`; return (before, after) states."""
+    from concept_dag.experiments import kan_exp
+
+    real_update_probe = kan_exp.update_probe
+    calls = []
+
+    def spy(*args, **kwargs):
+        # Stands in for the probe's own device-side draws (dropout masks, shuffles), which are
+        # what the fork has to put back.
+        draw()
+        calls.append(1)
+        return real_update_probe(*args, **kwargs)
+
+    monkeypatch.setattr(kan_exp, "update_probe", spy)
+    before = read_state()
+    run_exp3a_kan(_update_cfg(tmp_path, device),
+                  make_cls_tasks(n_tasks=3, n_per_class=96, feature_dim=24,
+                                 batch_size=BATCH_SIZE, seed=11))
+    assert calls, "the update rung never ran, so this test proves nothing about its fork"
+    return before, read_state()
+
+
+def test_update_probe_fork_restores_the_device_generator(tmp_path, monkeypatch):
+    gen = _install_stand_in_device(monkeypatch)
+    before, after = _run_with_a_device_drawing_update_probe(
+        tmp_path, monkeypatch,
+        draw=lambda: torch.rand(7, generator=gen),
+        read_state=lambda: gen.get_state().clone(),
+        device="cpu")
+    assert torch.equal(after, before), (
+        "the update probe left the device generator shifted — the fork around it is not "
+        "covering devices (P0b at a second call site)")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="device-RNG leak needs a device")
+def test_update_probe_fork_restores_the_real_device_generator(tmp_path, monkeypatch):
+    before, after = _run_with_a_device_drawing_update_probe(
+        tmp_path, monkeypatch,
+        draw=lambda: torch.rand(7, device="cuda"),
+        read_state=lambda: torch.cuda.get_rng_state().clone(),
+        device="cuda")
+    assert torch.equal(after, before)
