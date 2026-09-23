@@ -17,6 +17,7 @@ classification, but any TaskSpec works — that is the answer to "the metric may
 
 from __future__ import annotations
 
+import copy
 import gc
 import json
 import math
@@ -215,6 +216,12 @@ def distill_merge(keep: DAGNode, drop: DAGNode, loader, device: str,
     return {"keep": W_keep, "drop": W_drop, "recon_loss": last}
 
 
+def _flat_theta(module: nn.Module) -> torch.Tensor:
+    """Every parameter of `module`, flattened and concatenated into one CPU vector — the
+    weight-space drift metric's raw material (reader-audit gate, [[post-mint-audit-gap]])."""
+    return torch.cat([p.detach().cpu().reshape(-1) for p in module.parameters()])
+
+
 def _combined_loader(tasks: List[Dict], ta: int, tb: int, batch_size: int = 128):
     ds = torch.utils.data.ConcatDataset([tasks[ta]["train"].dataset, tasks[tb]["train"].dataset])
     return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
@@ -263,6 +270,7 @@ def consolidate_nodes(
     *,
     accept_fn: Callable[[DAGNode, DAGNode, Set[int]], bool],
     similarity_threshold: float,
+    reader_tolerance: float,
     subspace_k: int = 8,
     truncate_energy: Optional[float] = 0.99,
     truncate_max_rel_error: float = 0.05,
@@ -278,25 +286,24 @@ def consolidate_nodes(
     are near-identical (principal-angle similarity ≥ threshold), re-pointing children's parent lists,
     each merge gated by ``accept_fn(keep, drop, affected_task_ids)`` which MUST re-evaluate the
     affected tasks (backward-interference check).
+
+    Every post-mint change this pass makes to a node — a truncation or an accepted/rejected merge —
+    is also appended, in order, to the returned ``reader_audit`` list (the caller adds an
+    ``update_commit`` entry of its own and stamps ``at_task`` on all of them): the audit gate that
+    covers every way a node can change after it was minted, not just the merge path's own forgetting
+    check ([[post-mint-audit-gap]]).
     """
     def pcount():
         return sum(p.numel() for n in nodes for p in n.concept_module.parameters())
 
     params_before = pcount()
     ops: List[dict] = []
+    reader_audit: List[dict] = []
     merge_attempted = 0
 
-    # (1) Low-rank re-crystallisation.
-    if truncate_energy is not None:
-        for n in nodes:
-            rec = low_rank_factorize_final_layer(
-                n.concept_module, energy=truncate_energy, max_rel_error=truncate_max_rel_error)
-            if rec.get("applied"):
-                ops.append({"op": "truncate", "task": n.task_id, **rec})
-
-    # (2) Subspace-redundancy merges (re-scan after each accepted merge).
+    # Task indices (predictor positions) whose predictor routes through `node`. Hoisted above step
+    # (1) so the truncation audit can use it too, rather than duplicating it.
     def affected_task_ids(node: DAGNode) -> Set[int]:
-        # task indices (predictor positions) whose predictor routes through `node`.
         ids: Set[int] = set()
         for ti, p in enumerate(predictors):
             chain = [p.node] if (p.kind == "grow" and p.node is not None) else list(p.parents or [])
@@ -311,6 +318,60 @@ def consolidate_nodes(
                 ids.add(ti)
         return ids
 
+    # (1) Low-rank re-crystallisation, audited: a truncation that hurts a reader is rolled back.
+    #
+    # A1: `low_rank_factorize_final_layer` applies zero times across the whole H8 archive, so a
+    # run in which nothing truncates must pay NOTHING extra (no reader forward passes, no RNG
+    # draws) versus today. We first probe on a `copy.deepcopy` of the module to learn whether it
+    # would apply; only when it would do we pay for reader accuracies and the real (mutating) call.
+    if truncate_energy is not None:
+        for n in nodes:
+            probe_rec = low_rank_factorize_final_layer(
+                copy.deepcopy(n.concept_module),
+                energy=truncate_energy, max_rel_error=truncate_max_rel_error)
+            if not probe_rec.get("applied"):
+                continue
+
+            readers = sorted(affected_task_ids(n))
+            before_val = {t: predictors[t].accuracy(tasks[t].get("val", tasks[t]["test"]), device)
+                          for t in readers}
+            before_test = {t: predictors[t].accuracy(tasks[t]["test"], device) for t in readers}
+            old_mlp = n.concept_module.mlp
+            old_final_weight = old_mlp[-1].weight.detach().clone()
+            was_frozen = n.concept_module.is_frozen
+
+            rec = low_rank_factorize_final_layer(
+                n.concept_module, energy=truncate_energy, max_rel_error=truncate_max_rel_error)
+
+            new_mlp = n.concept_module.mlp
+            lin1, lin2 = new_mlp[-2], new_mlp[-1]
+            recon = lin2.weight.detach().cpu() @ lin1.weight.detach().cpu()
+            drift = float((recon - old_final_weight.cpu()).norm().item())
+
+            after_val = {t: predictors[t].accuracy(tasks[t].get("val", tasks[t]["test"]), device)
+                         for t in readers}
+            after_test = {t: predictors[t].accuracy(tasks[t]["test"], device) for t in readers}
+            ok = all(after_val[t] >= before_val[t] - reader_tolerance for t in readers)
+
+            audit_entry = {
+                "at_task": None, "kind": "truncate", "node": n.task_id, "readers": readers,
+                "drift": drift, "rel_error": rec.get("rel_error"),
+                "reader_deltas_val": {str(t): round(after_val[t] - before_val[t], 4) for t in readers},
+                "reader_deltas_test": {str(t): round(after_test[t] - before_test[t], 4) for t in readers},
+                "tolerance": reader_tolerance,
+            }
+            if ok:
+                ops.append({"op": "truncate", "task": n.task_id, **rec})
+                audit_entry["verdict"] = "kept"
+            else:
+                n.concept_module.mlp = old_mlp
+                if was_frozen:
+                    n.concept_module.freeze()
+                ops.append({"op": "truncate_rejected", "task": n.task_id, **rec})
+                audit_entry["verdict"] = "rolled_back"
+            reader_audit.append(audit_entry)
+
+    # (2) Subspace-redundancy merges (re-scan after each accepted merge).
     merged = True
     while merged:
         merged = False
@@ -352,18 +413,32 @@ def consolidate_nodes(
                 base = {t: predictors[t].accuracy(tasks[t]["test"], device)
                         for t in affected if t < len(predictors)}
                 snap = _snapshot_topology(nodes, predictors, keep=a)
+                freeze_keep = functional_threshold is not None
+                # keep is provably untouched when freeze_keep=True (W_keep is the identity, fit
+                # entirely on the frozen keep output); only measure the weight-space drift when
+                # distill_merge actually retrains keep.concept_module in place.
+                theta_before = None if freeze_keep else _flat_theta(a.concept_module)
                 loader = _combined_loader(tasks, a.task_id, b.task_id)
-                W = distill_merge(a, b, loader, device, epochs=distill_epochs,
-                                  freeze_keep=(functional_threshold is not None))
+                W = distill_merge(a, b, loader, device, epochs=distill_epochs, freeze_keep=freeze_keep)
+                drift = (0.0 if freeze_keep
+                         else float((_flat_theta(a.concept_module) - theta_before).norm().item()))
                 _merge_nodes(nodes, predictors, keep=a, drop=b, W_keep=W["keep"], W_drop=W["drop"])
                 post = {t: predictors[t].accuracy(tasks[t]["test"], device)
                         for t in affected if t < len(predictors)}
                 deltas = {t: round(post[t] - base[t], 4) for t in post}
                 ok = all(post[t] >= base.get(t, 0.0) - merge_tolerance for t in post)
+                audit_entry = {
+                    "at_task": None, "kind": "merge", "node": a.task_id,
+                    "readers": sorted(affected), "drift": drift, "rel_error": None,
+                    "reader_deltas_val": {}, "reader_deltas_test": {str(t): d for t, d in deltas.items()},
+                    "tolerance": merge_tolerance,
+                }
                 if ok:
                     ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id,
                                 "similarity": sim, "sim_kind": sim_kind, "distilled": True,
                                 "recon_loss": W["recon_loss"], "backward_deltas": deltas})
+                    audit_entry["verdict"] = "kept"
+                    reader_audit.append(audit_entry)
                     merged = True
                     break
                 else:
@@ -375,6 +450,8 @@ def consolidate_nodes(
                                 "similarity": sim, "sim_kind": sim_kind, "recon_loss": W["recon_loss"],
                                 "backward_deltas": deltas, "worst_delta": min(deltas.values()),
                                 "merge_tolerance": merge_tolerance})
+                    audit_entry["verdict"] = "rolled_back"
+                    reader_audit.append(audit_entry)
             if merged:
                 break
 
@@ -382,7 +459,8 @@ def consolidate_nodes(
             "params_saved": params_before - pcount(), "n_ops": len(ops), "ops": ops,
             "merge_attempted": merge_attempted,
             "merge_accepted": sum(1 for op in ops if op["op"] == "merge"),
-            "merge_rejected": sum(1 for op in ops if op["op"] == "merge_rejected")}
+            "merge_rejected": sum(1 for op in ops if op["op"] == "merge_rejected"),
+            "reader_audit": reader_audit}
 
 
 def _is_ancestor(anc: DAGNode, desc: DAGNode) -> bool:
@@ -872,6 +950,10 @@ def run_exp3a_kan(
     # one-line print, which hid every accepted merge on `s_interleave`
     # ([[consolidation-provenance]] P6).
     consolidation_passes: List[dict] = []
+    # Every post-mint change to any node, in chronological order: truncations and merges (stamped
+    # from each pass's own `reader_audit`, below) plus `update_commit` entries appended in place
+    # at commit time — the audit trail the reader-audit gate covers ([[post-mint-audit-gap]] P5).
+    reader_audit: List[dict] = []
 
     def _resolve_provisional(current_t: int, end_of_stream: bool = False,
                              pass_result: Optional[dict] = None) -> None:
@@ -1264,11 +1346,19 @@ def run_exp3a_kan(
                     # Commit step (parent state mutation) stays in the main RNG stream — it only
                     # runs when `selected`, and must not be shielded from it.
                     if selected:
+                        drift = float((_flat_theta(module_copy) - _flat_theta(orig_module)).norm().item())
                         best_p.concept_module.load_state_dict(module_copy.state_dict())
                         best_p.compute_concept_subspace(tasks[best_p.task_id]["train"], device,
                                                         top_k=cfg.subspace_k,
                                                         max_batches=cfg.routing_batches)
                         best_p.freeze()
+                        reader_audit.append({
+                            "at_task": t, "kind": "update_commit", "node": best_p.task_id,
+                            "readers": sorted(affected), "drift": drift, "rel_error": None,
+                            "reader_deltas_val": backward_deltas_val,
+                            "reader_deltas_test": backward_deltas_test,
+                            "tolerance": cfg.update_tolerance, "verdict": "kept",
+                        })
                         X2, Xraw2, y2 = _cache_parent_stack(parents, task["train"], device,
                                                             max_batches=gate_batches)
                         composer2 = ReuseComposer(parent_dim=cfg.concept_dim, n_parents=len(parents),
@@ -1294,6 +1384,7 @@ def run_exp3a_kan(
             accept = make_accuracy_accept_fn(nodes, predictors, tasks, device, cfg.merge_tolerance)
             summ = consolidate_nodes(nodes, predictors, tasks, device, accept_fn=accept,
                                      similarity_threshold=cfg.similarity_threshold,
+                                     reader_tolerance=cfg.merge_tolerance,
                                      subspace_k=cfg.subspace_k, distill=cfg.distill,
                                      distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance,
                                      functional_threshold=(cfg.functional_threshold
@@ -1301,6 +1392,9 @@ def run_exp3a_kan(
             print(f"  [consolidate @ task {t}] saved {summ['params_saved']} params, {summ['n_ops']} ops")
             summ["at_task"] = t
             summ["final"] = False
+            for e in summ["reader_audit"]:
+                e["at_task"] = t
+            reader_audit.extend(summ["reader_audit"])
             consolidation_passes.append(summ)
             _resolve_provisional(t, pass_result=summ)
         _flush(device)
@@ -1309,15 +1403,27 @@ def run_exp3a_kan(
     accept = make_accuracy_accept_fn(nodes, predictors, tasks, device, cfg.merge_tolerance)
     consolidation = consolidate_nodes(nodes, predictors, tasks, device, accept_fn=accept,
                                       similarity_threshold=cfg.similarity_threshold,
+                                      reader_tolerance=cfg.merge_tolerance,
                                       subspace_k=cfg.subspace_k, distill=cfg.distill,
                                       distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance,
                                       functional_threshold=(cfg.functional_threshold
                                                             if cfg.functional_redundancy else None))
     consolidation["at_task"] = len(tasks) - 1
     consolidation["final"] = True
+    for e in consolidation["reader_audit"]:
+        e["at_task"] = len(tasks) - 1
+    reader_audit.extend(consolidation["reader_audit"])
     consolidation_passes.append(consolidation)
 
     _resolve_provisional(len(tasks) - 1, end_of_stream=True, pass_result=consolidation)
+
+    # D: `average_accuracy`/`test_accs` price the DAG BEFORE its last consolidation pass (each
+    # `test_accs[t]` is appended inside the task loop, ahead of that iteration's
+    # `consolidate_every` pass) — a merge's or truncation's cost, bounded by `merge_tolerance` /
+    # `reader_tolerance` per reader by construction, never reaches them. `test_accs_final` /
+    # `average_accuracy_final` re-evaluate every task once more, after the run's last
+    # consolidation, so the DAG is priced as it actually ends up.
+    test_accs_final = [predictors[tt].accuracy(tasks[tt]["test"], device) for tt in range(len(tasks))]
 
     n_grow = sum(1 for d in decisions if d["decision"] == "grow")
     n_search = sum(1 for d in decisions if d["decision"] == "search")
@@ -1326,6 +1432,9 @@ def run_exp3a_kan(
     results = {
         "average_accuracy": float(np.mean(test_accs)),
         "test_accs": test_accs,
+        "average_accuracy_final": float(np.mean(test_accs_final)),
+        "test_accs_final": test_accs_final,
+        "reader_audit": reader_audit,
         "n_grow": n_grow,
         "n_search": n_search,
         "n_reuse": n_reuse,

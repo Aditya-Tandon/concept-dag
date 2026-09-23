@@ -31,12 +31,18 @@ NEW_OR_NONDETERMINISTIC_KEYS = {
     # [[consolidation-provenance]] P6: every intermediate consolidation pass, previously thrown
     # away. New top-level key, so a plain top-level filter is enough.
     "consolidation_passes",
+    # [[post-mint-audit-gap]] P5: the audit trail of every post-mint change to a node (truncation,
+    # merge, update-rung commit) and the DAG re-priced after its last consolidation. New top-level
+    # keys, empty/equal-to-`average_accuracy` on any run this fixture already covers.
+    "reader_audit", "test_accs_final", "average_accuracy_final",
 }
 # [[consolidation-provenance]] P6: fields `consolidate_nodes` / `run_exp3a_kan` now add to the
 # (still-present) `consolidation` key itself — attempt/accept/reject counters and pass position —
 # stripped from the nested dict rather than the whole key, so the merge/params numbers it already
 # carried stay covered by the identity check.
-NEW_CONSOLIDATION_KEYS = {"merge_attempted", "merge_accepted", "merge_rejected", "at_task", "final"}
+# [[post-mint-audit-gap]] P5: `reader_audit` is the same kind of addition, on the same key.
+NEW_CONSOLIDATION_KEYS = {"merge_attempted", "merge_accepted", "merge_rejected", "at_task", "final",
+                          "reader_audit"}
 DECISION_KEYS_TO_IGNORE = {"gate_seconds"}
 
 
