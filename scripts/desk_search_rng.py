@@ -11,9 +11,14 @@ time is spent, neither of which needs a GPU:
     * `SearchComposer` carries **no dropout** (Linear → GELU → Linear, plus the full-rank skip), so
       training the `budget` candidates draws NOTHING on the device. The device generator when
       `search_compose` returns is therefore *exactly* `manual_seed(last candidate index)` with zero
-      draws consumed — not "that value plus the candidate's own training draws" as
-      [[provisional-growth-code-review]] should-fix 3 assumed. The displacement is total and
-      depends on `(budget, n_parents)` alone, through the last candidate's index.
+      draws consumed — correcting should-fix 3's closing clause and its verified-facts bullet in
+      [[provisional-growth-code-review]], which attribute the draws to `ConceptModule`'s dropout
+      where the Search rung builds a `SearchComposer` (should-fix 3's own second sentence already
+      says the block "only *constructs* the candidate"). The displacement is total and depends on
+      `(budget, n_parents)` alone, through the last candidate's index — and `n_parents` makes it
+      TWO values, not one: at the first gated task there is a single parent, so
+      `_enumerate_subsets(1)` returns one subset and `sd_last = budget - 1`; from the second gated
+      task on there are >= 3 subsets and `sd_last = 1`.
     * The draws do happen, immediately afterwards and from that overwritten state: the GROW rung is
       a `ConceptModule` (`dropout=0.1`, `n_layers=2`) and so is every later `train_node`.
 
@@ -194,8 +199,13 @@ def main() -> None:
     print(f"{'n':>7} {'par':>4} {'budget':>7} {'ep':>4} | {'inside search':>13} "
           f"{'elements':>10} | {'after search':>12} {'elements':>11} | {'sd_last':>7}")
     rows = []
-    for n, n_parents, budget, n_epochs in ((200, 2, 6, 15), (400, 2, 6, 15), (400, 3, 6, 15),
-                                           (2000, 3, 6, 15), (2000, 4, 6, 15)):
+    # The gate-cache sizes and parent counts that actually occur in the archive this quantifies:
+    # CTrL is 400 at every gated task except `s_plus` t4 (4,000); 5-Datasets is 16,384. n_parents is
+    # 1 at the first gated task and grows with the DAG (verified from `search_meta.subset` in
+    # results_provisional_v2_2026-09-23/ctrl_off).
+    for n, n_parents, budget, n_epochs in ((400, 1, 6, 15), (400, 2, 6, 15), (400, 3, 6, 15),
+                                           (400, 4, 6, 15), (4000, 4, 6, 15),
+                                           (16384, 1, 6, 15), (16384, 3, 6, 15)):
         r = count_dropout_draws(n=n, n_parents=n_parents, budget=budget, n_epochs=n_epochs)
         rows.append(r)
         print(f"{r['n']:>7} {r['n_parents']:>4} {r['budget']:>7} {r['n_epochs']:>4} | "
@@ -212,6 +222,7 @@ def main() -> None:
             s = post_gate_stream(run_seed=run_seed, fixed=fixed, budget=6, n_parents=2)
             brows.append({"code": "new" if fixed else "old", "run_seed": run_seed, "stream": s})
             print(f"{'new' if fixed else 'old':>6} {run_seed:>9}  {s}")
+    print("  (n_parents=2, i.e. the second gated task onward; sd_last = 1 there and 5 at the first)")
     out["post_gate_stream"] = brows
 
     old = [r["stream"] for r in brows if r["code"] == "old"]
