@@ -115,13 +115,18 @@ BIT_IDENTITY_OPTIONAL = ("test_accs_final", "average_accuracy_final")
 # ---------------------------------------------------------------------------
 
 def compare_runs(a: Optional[Dict], b: Optional[Dict], seed: int, stream: Optional[str],
-                 label_a: str, label_b: str) -> List[Dict]:
+                 label_a: str, label_b: str, strict_presence: bool = True) -> List[Dict]:
     """Field-by-field mismatches between two runs the note requires to be bit-identical.
 
     Ordered decision list, `average_accuracy`, every `L_*` key in every gate record, `test_accs`,
     `param_curve`, `param_curve_total`, and — when present on BOTH sides — `test_accs_final` and
     `average_accuracy_final`. Floats compare by exact equality on the serialised values. A field
     present on one side and absent on the other is a failure, not a skip.
+
+    `strict_presence=False` is H10's cross-archive reading (search-compose-device-reseed.md,
+    "Bit-identity, operationally"): the adoption archive predates fields the new runs carry, so a
+    field or `L_*` key present on one side only is SKIPPED rather than reported. Values present on
+    both sides, decision labels and the decision list itself are compared exactly as before.
     """
     if a is None or b is None:
         return []
@@ -137,7 +142,8 @@ def compare_runs(a: Optional[Dict], b: Optional[Dict], seed: int, stream: Option
     for f in BIT_IDENTITY_FIELDS:
         pa, pb = f in a, f in b
         if pa != pb:
-            note(f, a.get(f), b.get(f), detail="present on one side only")
+            if strict_presence:
+                note(f, a.get(f), b.get(f), detail="present on one side only")
             continue
         if not pa:
             continue
@@ -181,7 +187,8 @@ def compare_runs(a: Optional[Dict], b: Optional[Dict], seed: int, stream: Option
             note("decision", x.get("decision"), y.get("decision"), task=t)
         for k in sorted({k for k in list(x) + list(y) if k.startswith("L_")}):
             if (k in x) != (k in y):
-                note(k, x.get(k), y.get(k), task=t, detail="present on one side only")
+                if strict_presence:
+                    note(k, x.get(k), y.get(k), task=t, detail="present on one side only")
             elif x.get(k) != y.get(k):
                 note(k, x.get(k), y.get(k), task=t)
     return out
@@ -1020,14 +1027,41 @@ def observable_r2(cca_runs, cka_runs) -> Dict:
     return rec
 
 
-def observable_r3() -> Dict:
-    return {"observable": "R3: the search_compose device-reseed residual, left unfixed by "
-                          "pre-registration",
-            "value": {"fixed": False,
-                      "consequence": "every arm inherits it, so all seed-level SEs in this loop "
-                                     "understate seed variance by an unmeasured amount"},
-            "verdict": "descriptive",
-            "headline": "search_compose device re-seed NOT fixed (declared, own pre-registration)"}
+def observable_r3(all_runs: Sequence[Tuple[int, Optional[str], Dict]] = ()) -> Dict:
+    """R3, read from the runs rather than asserted.
+
+    It used to hard-code ``{"fixed": False}``; re-run on H10's re-baseline (every run carries
+    ``--search_device_rng_fix``) that would have recorded the opposite of what the sweep does
+    (search-compose-device-reseed.md). A flagged run writes ``search_device_rng_fix: true`` into
+    its results JSON (9edd46e); a run without the key is an unflagged, published-discipline run.
+    ``fixed`` is True only when EVERY run carries the flag, False when none does, and "mixed"
+    otherwise — a mixed tree pools two RNG disciplines and is itself the thing to report.
+    """
+    flags = [bool(r.get("search_device_rng_fix")) for _s, _st, r in all_runs]
+    n_fixed = sum(flags)
+    n = len(flags)
+    rec = {"observable": "R3: the search_compose device-reseed residual — whether the runs were "
+                         "produced with --search_device_rng_fix (read from each results JSON)",
+           "verdict": "descriptive"}
+    if n and n_fixed == n:
+        rec["value"] = {"fixed": True, "n_runs": n, "n_flagged": n_fixed,
+                        "consequence": "every run re-seeds the device generator from the run "
+                                       "seed; seed-level SEs carry the dropout stream's variance"}
+        rec["headline"] = (f"search_compose device re-seed FIXED in all {n} runs "
+                           f"(--search_device_rng_fix; H10 re-baseline)")
+    elif n_fixed == 0:
+        rec["value"] = {"fixed": False, "n_runs": n, "n_flagged": 0,
+                        "consequence": "every arm inherits it, so all seed-level SEs in this loop "
+                                       "understate seed variance by an unmeasured amount"}
+        rec["headline"] = ("search_compose device re-seed NOT fixed (declared, own "
+                           "pre-registration)")
+    else:
+        rec["value"] = {"fixed": "mixed", "n_runs": n, "n_flagged": n_fixed,
+                        "consequence": "the tree pools flagged and unflagged runs — two RNG "
+                                       "disciplines that must never be compared"}
+        rec["headline"] = (f"search_compose device re-seed MIXED: {n_fixed}/{n} runs flagged — "
+                           f"two reference sets pooled")
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -1253,7 +1287,7 @@ def evaluate(data: Dict, args) -> Dict:
 
     gates["R1"] = observable_r1(data["ctrl"]["evalue"], data["ctrl"]["se_proxy"])
     gates["R2"] = observable_r2(cca_runs, cka_runs)
-    gates["R3"] = observable_r3()
+    gates["R3"] = observable_r3(all_runs)
     gates["DA"] = {"gate": "DA", "verdict": "deferred",
                    "observable": "backward-delta AUROC and the CKA transfer clause on the "
                                  "token-mode dumps — the Track A desk script's gate, not this "
