@@ -25,7 +25,7 @@ Stages
            interval on SE_new / SE_old, and the ordered tree on INTERVALS (judge change 3).
   --s3     S3: the re-run `eval_attn_root.py` / `eval_provisional_v2.py` gate JSONs read at the
            note's named paths against the archived ones, plus the decision-flip census.
-  With no stage flag, all four run, plus the 114-run completeness check; every gate is computed
+  With no stage flag, all four run, plus the 124-run completeness check; every gate is computed
   and reported, and only then is the chain applied. The branch is named only when all four ran.
 
 Branch chain (first match wins; each branch carries its gate_verdict, status and action)
@@ -41,6 +41,11 @@ Layout expected under --new (the sweep root, `results_rng/` on the pod)
     5ds_<arm>/seed_<S>/exp5ds_kan/exp3a_kan_results.json            off, shadow, evalue, cls_off
     preflight_dup/{ctrl_off,int_evalue,5ds_off}/...                P0a's duplicates, OUTSIDE
                                                                    every evaluator's arm glob
+    5ds_n8_on/, 5ds_n8_off/  (seeds 45-49)                         the n = 8 extension: attn_pool
+                                                                   off, flag ON / flag OFF, same SHA
+                                                                   (S2's powered 5-Datasets clause;
+                                                                   P0b requires n8_off UNflagged;
+                                                                   P0c pairs n8_on with n8_off)
     progress_rng*.log                                              (P0b(i): the pytest output)
 
 Usage
@@ -97,6 +102,9 @@ T3, T4 = 3, 4
 CTRL_SEEDS = (42, 43, 44, 45, 46)
 INT_SEEDS = tuple(range(42, 52))
 FDS_SEEDS = (42, 43, 44)
+N8_SEEDS = (45, 46, 47, 48, 49)               # the n = 8 extension's new seeds
+#: Arm dirs run WITHOUT --search_device_rng_fix, by design: P0b(ii) requires them UNflagged.
+UNFLAGGED_DIRS = ("5ds_n8_off",)
 
 # --- thresholds, verbatim from the note (and, for R1b, from eval_attn_root.py) ---------------
 S2_UNCHANGED_LO, S2_UNCHANGED_HI = 0.8, 1.25   # (1) SE-UNCHANGED point-ratio window
@@ -132,8 +140,13 @@ RUN_TABLE: Dict[str, Set[KEY]] = {
     "ctrl_off_dup": {("s_plus", 42)},
     "int_evalue_dup": {(INT_STREAM, 42)},
     "5ds_off_dup": {(None, 42)},
+    # the coordinator's n = 8 extension (judge option 5, taken 2026-09-24): 5-Datasets attn_pool
+    # `off` at seeds 45-49, flag ON and flag OFF, both at the sweep SHA. Their own directories,
+    # which no other evaluator globs, so R1a/R1b/V0b/V4 keep their registered run sets.
+    "5ds_n8_on": {(None, s) for s in N8_SEEDS},
+    "5ds_n8_off": {(None, s) for s in N8_SEEDS},
 }
-RUN_TABLE_SIZE = 114
+RUN_TABLE_SIZE = 124
 
 #: Where each logical arm lives under the sweep root. The duplicates are written OUTSIDE every
 #: evaluator's `ctrl_<arm>/` / `int_<arm>/` / `5ds_<arm>/` glob (judge change 10), so no evaluator
@@ -196,11 +209,13 @@ COUNTERPART: Dict[str, Tuple[Tuple[str, str], ...]] = {
     "ctrl_off_dup": (("prov", "ctrl_off"), ("attn", "ctrl_attn_pool")),
     "int_evalue_dup": (("prov", "int_evalue"),),
     "5ds_off_dup": (("prov", "5ds_off"), ("attn", "5ds_attn_pool")),
+    # same-SHA: a flag-ON run's counterpart is the flag-OFF run at the same seed IN THE SWEEP
+    "5ds_n8_on": (("new", "5ds_n8_off"),),
 }
 
 
 def check_run_table() -> Dict:
-    """The table sums to the note's 114, and V0b's hard-coded 24-pair expectation
+    """The table sums to the note's 124 (114 + the n = 8 extension's 10), and V0b's hard-coded 24-pair expectation
     (`eval_provisional_v2.expected_pairs`, `:1191` in the note) is exactly the shadow arms of this
     table, each with an `off` partner — a shadow arm short of it would MANUFACTURE a V0b failure,
     which is why the note runs all 20 CTrL shadow runs. Raises on any discrepancy."""
@@ -275,15 +290,17 @@ def load_old(old_attn: Optional[str], old_prov: Optional[str]) -> Dict[str, Dict
     dirs = {"attn": set(), "prov": set()}
     for prefs in COUNTERPART.values():
         for arch, d in prefs:
-            dirs[arch].add(d)
+            if arch in dirs:                   # "new" counterparts live in the sweep itself
+                dirs[arch].add(d)
     roots = {"attn": old_attn, "prov": old_prov}
     return {arch: {d: load_dir(roots[arch], d) for d in sorted(ds)} for arch, ds in dirs.items()}
 
 
-def counterpart(old: Dict[str, Dict[str, Tree]], new_dir: str, key: KEY
-                ) -> Tuple[Optional[Dict], Optional[str]]:
-    for arch, d in COUNTERPART[new_dir]:
-        r = old.get(arch, {}).get(d, {}).get(key)
+def counterpart(old: Dict[str, Dict[str, Tree]], new_dir: str, key: KEY,
+                new: Optional[Dict[str, Tree]] = None) -> Tuple[Optional[Dict], Optional[str]]:
+    for arch, d in COUNTERPART.get(new_dir, ()):
+        src = (new or {}) if arch == "new" else old.get(arch, {})
+        r = src.get(d, {}).get(key)
         if r is not None:
             return r, f"{arch}:{d}"
     return None, None
@@ -396,6 +413,13 @@ def gate_p0b(new: Dict[str, Tree], progress: Sequence[str], required: Sequence[T
         for key, r in sorted(tree.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
             checked += 1
             st, seed = key
+            if d in UNFLAGGED_DIRS:
+                # the n = 8 extension's flag-OFF arm must be genuinely unflagged: no key, no base
+                if r.get("search_device_rng_fix") or any(
+                        dec.get("cand_seed_base") is not None for dec in r.get("decisions", [])):
+                    failures.append({"clause": "ii", "dir": d, "run": _keystr(key),
+                                     "detail": "a flag-OFF run carries the flag or a seed base"})
+                continue
             if r.get("search_device_rng_fix") is not True:
                 failures.append({"clause": "ii", "dir": d, "run": _keystr(key),
                                  "detail": "search_device_rng_fix is not true — an unflagged run"})
@@ -421,8 +445,10 @@ def gate_p0b(new: Dict[str, Tree], progress: Sequence[str], required: Sequence[T
 
 
 def all_table_runs() -> List[Tuple[str, KEY]]:
-    """Every (dir, key) of the table except the duplicates, which are P0a's business."""
-    return [(d, k) for d, ks in RUN_TABLE.items() if not d.endswith("_dup")
+    """Every (dir, key) of the table except the duplicates, which are P0a's business, and the
+    unflagged n = 8 arm, which has no counterpart of its own — it IS the flag-ON arm's."""
+    return [(d, k) for d, ks in RUN_TABLE.items()
+            if not d.endswith("_dup") and d not in UNFLAGGED_DIRS
             for k in sorted(ks, key=lambda k: (k[1], str(k[0])))]
 
 
@@ -440,7 +466,7 @@ def gate_p0c(new: Dict[str, Tree], old: Dict[str, Dict[str, Tree]],
     rows, failures, missing = [], [], []
     for d, key in runs:
         rn = new[d].get(key)
-        ro, src = counterpart(old, d, key)
+        ro, src = counterpart(old, d, key, new)
         if rn is None or ro is None:
             missing.append({"dir": d, "run": _keystr(key),
                             "absent": "new" if rn is None else "archive"})
@@ -737,6 +763,15 @@ def S2_METRICS(new: Dict[str, Tree], old: Dict[str, Dict[str, Tree]]) -> List[Di
         {"metric": "CTrL paired AA difference evalue - off", "primary": False,
          "old": _paired_rows(P["ctrl_off"], P["ctrl_evalue"], _aa_diff),
          "new": _paired_rows(new["ctrl_off"], new["ctrl_evalue"], _aa_diff)},
+        # The n = 8 extension (coordinator decision 2026-09-24, the judge's option 5): flag OFF =
+        # the archive's seeds 42-44 (the default path is byte-identical at the sweep SHA, asserted
+        # by tests/test_mlp_cls_byte_identity.py) + the sweep's unflagged seeds 45-49; flag ON = the
+        # sweep's 5ds_off 42-44 + 5ds_n8_on 45-49. Same SHA for 10 of the 16 runs; a secondary,
+        # and the only 5-Datasets clause with the power to resolve (8^8 > --bootstrap, so 2,000
+        # random paired label resamples).
+        {"metric": "5-Datasets off AA, n = 8 (flag ON vs OFF)", "primary": False,
+         "old": _rows({**P["5ds_off"], **new["5ds_n8_off"]}, _aa),
+         "new": _rows({**new["5ds_off"], **new["5ds_n8_on"]}, _aa)},
     ]
 
 

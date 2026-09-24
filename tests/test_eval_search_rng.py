@@ -93,11 +93,19 @@ def acc_for(key, *, shift=0.0, jitter=True):
 
 
 def build_world(ev, tmp_path, *, new_l_grow=1.5, pytest_outcome="PASSED", mutate=None):
-    """Old archives (v2 + attn) with the unfixed discipline, and a COMPLETE 114-run flagged sweep
-    whose every run differs from its archive (L_grow_bits) and whose duplicates reproduce."""
+    """Old archives (v2 + attn) with the unfixed discipline, and a COMPLETE 124-run sweep whose
+    every flagged run differs from its archive (L_grow_bits), whose duplicates reproduce, and whose
+    n = 8 flag-OFF arm is genuinely unflagged."""
     old_prov, old_attn, new = tmp_path / "prov", tmp_path / "attn", tmp_path / "new"
     for d, keys in ev.RUN_TABLE.items():
         if d.endswith("_dup"):
+            continue
+        if d.startswith("5ds_n8"):
+            unflag = d in ev.UNFLAGGED_DIRS
+            for key in keys:
+                write(new, d, key, mkrun(key[1], accs=acc_for(key), flag=not unflag,
+                                         base=None if unflag else "ok",
+                                         l_grow=1.0 if unflag else new_l_grow))
             continue
         for key in keys:
             # evalue is better than off AFTER consolidation only: before any deferral the two
@@ -171,8 +179,39 @@ def load(ev, new, old_attn, old_prov):
 # ---------------------------------------------------------------------------
 
 
-def test_run_table_is_the_notes_114_and_v0b_expects_its_24_shadow_pairs(ev):
-    assert ev.check_run_table() == {"n_runs": 114, "v0b_pairs": 24}
+def test_run_table_is_the_notes_124_and_v0b_expects_its_24_shadow_pairs(ev):
+    assert ev.check_run_table() == {"n_runs": 124, "v0b_pairs": 24}
+
+
+def test_the_n8_flag_off_arm_must_be_unflagged_and_its_flag_on_twin_must_differ(ev, tmp_path):
+    prog = lambda new: [os.path.join(new, "progress_rnga.log")]
+    new, oa, op = build_world(ev, tmp_path / "ok")
+    n, o = load(ev, new, oa, op)
+    assert ev.gate_p0b(n, prog(new), [])["verdict"] == "pass"
+    p0c = ev.gate_p0c(n, o, ev.all_table_runs())
+    assert p0c["verdict"] == "pass" and len(p0c["value"]["rows"]) == 116   # 111 + 5 same-SHA
+    assert {r["archive"] for r in p0c["value"]["rows"] if r["dir"] == "5ds_n8_on"} == {
+        "new:5ds_n8_off"}
+
+    new, oa, op = build_world(ev, tmp_path / "flagged")
+    edit(new, "5ds_n8_off", (None, 47), lambda r: r.__setitem__("search_device_rng_fix", True))
+    g = ev.gate_p0b(ev.load_new(new), prog(new), [])
+    assert g["verdict"] == "fail" and "flag-OFF run carries" in g["failures"][0]["detail"]
+
+    new, oa, op = build_world(ev, tmp_path / "inert")
+    with open(_path(new, "5ds_n8_off", (None, 48))) as f:
+        off48 = json.load(f)
+    edit(new, "5ds_n8_on", (None, 48), lambda r: (r.clear(), r.update(
+        {**off48, "search_device_rng_fix": True})))
+    g = ev.gate_p0c(*load(ev, new, oa, op), ev.all_table_runs())
+    assert g["verdict"] == "fail" and g["failures"][0]["run"] == "5ds/48"
+
+
+def test_s2_carries_the_n8_metric_on_eight_seeds(ev, tmp_path):
+    s2 = ev.stage_s2(*load(ev, *build_world(ev, tmp_path)), 200)
+    m = next(x for x in s2["metrics"] if x["metric"].startswith("5-Datasets off AA, n = 8"))
+    assert m["ratio"]["n_seeds"] == 8 and not m["ratio"]["bootstrap"]["exhaustive"]
+    assert len(s2["metrics"]) == 8
 
 
 def test_a_short_shadow_arm_is_caught_before_it_manufactures_a_v0b_failure(ev, monkeypatch):
