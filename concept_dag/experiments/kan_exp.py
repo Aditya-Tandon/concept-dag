@@ -727,6 +727,15 @@ class KanExpConfig(Exp3Config):
                                           # it the rank-16 bottleneck is narrower than reuse's
                                           # full-rank linear map, rel_search goes negative and the
                                           # ladder is non-monotone — see search-on-raw-probe-result.
+    search_device_rng_fix: bool = False   # derive the Search candidates' init seeds from `seed` and
+                                          # fork the DEVICE generators around each init, instead of
+                                          # seeding on the candidate INDEX inside a CPU-only fork.
+                                          # False = the published behaviour, under which every
+                                          # accelerator run's post-gate dropout stream is a function
+                                          # of the candidate index alone and multi-seed spreads
+                                          # understate seed variance. True changes the numerics of
+                                          # every CUDA/MPS arm, `off` included, so it needs its own
+                                          # reference runs — see [[search-compose-device-reseed]].
     raw_grow_probe:      bool  = False    # grow probe sees the raw encoder features (a real grown
                                           # root's view) instead of the frozen parent stack; an
                                           # organic grow then mints a ROOT node. Feature-mode only
@@ -1087,7 +1096,8 @@ def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode
         "seed": cfg.seed,
         "config": {k: getattr(cfg, k) for k in (
             "gate_epochs", "gate_lr", "eps_rel", "eps_search", "search_budget", "search_rank",
-            "search_skip", "routing_batches", "gate_cache_max", "child_epochs", "lr", "reducible_mode",
+            "search_skip", "search_device_rng_fix",
+            "routing_batches", "gate_cache_max", "child_epochs", "lr", "reducible_mode",
             "gate_estimator", "gate_splits", "update_lr", "eps_update", "update_tolerance",
             "subspace_k", "n_mlp_layers",
         )},
@@ -1367,6 +1377,9 @@ def run_exp3a_kan(
                         if cfg.gate_estimator == "select-score" else {})
             force = t in cfg.force_grow_ids
             split_gen = torch.Generator().manual_seed(cfg.seed * 1000 + t)
+            # None keeps the published (seed-independent, device-leaking) candidate seeding: the
+            # default path stays byte-identical to every archived run. See KanExpConfig.
+            cand_seed_base = (cfg.seed * 1000 + t) if cfg.search_device_rng_fix else None
             gate_t0 = time.perf_counter()
             if cfg.enable_search and not force:
                 # Three-way reuse/search/grow escalation (test-time-compute rung).
@@ -1377,6 +1390,7 @@ def run_exp3a_kan(
                     eps_search=cfg.eps_search, search_budget=cfg.search_budget, search_rank=cfg.search_rank,
                     search_skip=cfg.search_skip, reducible_mode=cfg.reducible_mode,
                     estimator=cfg.gate_estimator, n_splits=cfg.gate_splits, split_generator=split_gen,
+                    candidate_seed_base=cand_seed_base,
                     **raw_kwargs, **preq_kwargs, **ss_kwargs,
                 )
             else:
@@ -1418,6 +1432,8 @@ def run_exp3a_kan(
                         search_rank=cfg.search_rank, search_skip=cfg.search_skip,
                         reducible_mode=cfg.reducible_mode, estimator="select-score",
                         split_generator=torch.Generator().manual_seed(cfg.seed * 1000 + t + 900),
+                        candidate_seed_base=((cfg.seed * 1000 + t + 900)
+                                             if cfg.search_device_rng_fix else None),
                         evalue_bits=math.log2(max(task["n_classes"], 2)),
                         evalue_alpha=cfg.provisional_alpha,
                         **raw_kwargs,
