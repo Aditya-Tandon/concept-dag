@@ -369,3 +369,24 @@ def test_the_fixed_path_is_reproducible_too(tmp_path):
     assert a == b, (
         "the fix must stay deterministic at a fixed seed — the re-baseline's bit-identity "
         "pre-flight is exactly this assertion on the GPU")
+
+
+def test_the_flagged_run_self_identifies_and_the_default_run_does_not(tmp_path):
+    """The two reference sets must be distinguishable from the artefact alone.
+
+    `exp3a_kan_results.json` records no config, so without this a re-baselined reference and an
+    archived one are indistinguishable by inspection and a future V0 could compare across
+    disciplines. The key is written only when the flag is set, because the identity fixtures
+    (tests/test_mlp_cls_byte_identity.py) compare the WHOLE results dict against a stored fixture
+    and an unconditional key would break the very property the flag exists to preserve.
+    """
+    from concept_dag.experiments.kan_exp import run_exp3a_kan
+    from tests.fixtures.cls_identity_stream import make_cls_tasks
+
+    def _run(name, fix):
+        return run_exp3a_kan(
+            _stream_cfg(tmp_path / name, fix=fix),
+            make_cls_tasks(n_tasks=2, n_per_class=96, feature_dim=24, batch_size=16, seed=11))
+
+    assert "search_device_rng_fix" not in _run("plain", False)
+    assert _run("flagged", True)["search_device_rng_fix"] is True

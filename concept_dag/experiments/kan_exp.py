@@ -1805,6 +1805,13 @@ def run_exp3a_kan(
         "gate_cache_max": cfg.gate_cache_max,
         "decisions": decisions,
     }
+    if cfg.search_device_rng_fix:
+        # Self-identify the RNG discipline the run was produced under, so the two reference sets
+        # (flagged and unflagged) can never be silently compared against each other. Written ONLY
+        # when the flag is set: an unconditional key would change every default-path results JSON
+        # and break the whole-dict identity fixtures, which is exactly the property the flag exists
+        # to preserve. A run WITHOUT this key is an unflagged (published-discipline) run.
+        results["search_device_rng_fix"] = True
     out_path = os.path.join(cfg.results_dir, "exp3a_kan_results.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
