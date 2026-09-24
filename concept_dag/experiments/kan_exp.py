@@ -1474,6 +1474,13 @@ def run_exp3a_kan(
                     v = getattr(rec, k, None)
                     if v is not None:
                         d[k] = v
+                if cand_seed_base is not None:
+                    # The Search candidates' actual init-seed base, so a MIS-THREADED base (one
+                    # constant across seeds, or derived from `t` alone) is visible in the artefact
+                    # instead of having to be inferred. Written only when the fix is on: an
+                    # unconditional key would change every default-path results JSON, which the
+                    # whole-dict fixture in tests/test_mlp_cls_byte_identity.py forbids.
+                    d["cand_seed_base"] = cand_seed_base
                 for k in ("L_null_bits", "reducible_grow", "reducible_best", "reducible_mode",
                           "rel_search_best", "rel_grow_best", "rel_improvement_best",
                           "n_rungs_above_null", "estimator_meta"):

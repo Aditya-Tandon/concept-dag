@@ -390,3 +390,27 @@ def test_the_flagged_run_self_identifies_and_the_default_run_does_not(tmp_path):
 
     assert "search_device_rng_fix" not in _run("plain", False)
     assert _run("flagged", True)["search_device_rng_fix"] is True
+
+
+def test_the_per_gate_seed_base_is_recorded_and_is_seed_dependent(tmp_path):
+    """A mis-threaded base — constant across seeds, or derived from the task index alone — passes
+    every bit-identity clause and every cross-seed difference check, because the data subsampling
+    and split permutations already differ across seeds on the UNFIXED path. The only run-level
+    evidence that the base really carries the run seed is the base itself, so it is recorded."""
+    from concept_dag.experiments.kan_exp import run_exp3a_kan
+    from tests.fixtures.cls_identity_stream import make_cls_tasks
+
+    def _bases(seed, fix):
+        res = run_exp3a_kan(
+            _stream_cfg(tmp_path / f"s{seed}_{fix}", fix=fix, seed=seed),
+            make_cls_tasks(n_tasks=2, n_per_class=96, feature_dim=24, batch_size=16, seed=11))
+        return [d.get("cand_seed_base") for d in res["decisions"] if d["task"] > 0]
+
+    off = _bases(42, False)
+    assert off and all(b is None for b in off), "the default path must record no base"
+
+    a, b = _bases(42, True), _bases(43, True)
+    assert all(x is not None for x in a)
+    assert a == [42 * 1000 + t for t in range(1, len(a) + 1)]
+    assert b == [43 * 1000 + t for t in range(1, len(b) + 1)]
+    assert a != b, "the base must be a function of the run seed, not of the task index alone"
