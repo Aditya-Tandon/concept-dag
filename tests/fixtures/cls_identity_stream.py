@@ -43,6 +43,17 @@ NEW_OR_NONDETERMINISTIC_KEYS = {
 # [[post-mint-audit-gap]] P5: `reader_audit` is the same kind of addition, on the same key.
 NEW_CONSOLIDATION_KEYS = {"merge_attempted", "merge_accepted", "merge_rejected", "at_task", "final",
                           "reader_audit"}
+# [[merge-detector-separability]] Track C item 1: the CKA pre-filter records BOTH redundancy
+# statistics on every merge op record, including on the default (`--merge_trigger cca`) arm, where
+# `cka` is logging only — it is what calibrates `--merge_cka_threshold` offline. It never enters a
+# decision on this arm, so it is stripped from the op records exactly as the keys above are
+# stripped from the pass record; every other field of every op, and `similarity` itself, stays
+# inside the identity check.
+NEW_OP_KEYS = {"cka", "cca_topk"}
+# ... and the pairs the trigger STOPPED, which previously left no record at all. Purely additive
+# entries in the op list: they are appended where a bare `continue` used to be, so no decision,
+# loader or RNG draw moves with them.
+NEW_OP_TYPES = {"trigger_rejected"}
 DECISION_KEYS_TO_IGNORE = {"gate_seconds"}
 
 
@@ -105,6 +116,16 @@ def comparable(results: dict) -> dict:
     if "consolidation" in out:
         out["consolidation"] = {k: v for k, v in out["consolidation"].items()
                                 if k not in NEW_CONSOLIDATION_KEYS}
+        out["consolidation"]["ops"] = [
+            {k: v for k, v in op.items() if k not in NEW_OP_KEYS}
+            for op in out["consolidation"].get("ops", [])
+            if op.get("op") not in NEW_OP_TYPES
+        ]
+        # `n_ops` is len(ops); recomputed rather than dropped, so the pre-change count of
+        # merge/truncate ops stays inside the identity check even though the op list has grown
+        # entries for the pairs the trigger stopped.
+        if "n_ops" in out["consolidation"]:
+            out["consolidation"]["n_ops"] = len(out["consolidation"]["ops"])
     return out
 
 

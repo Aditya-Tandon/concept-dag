@@ -278,6 +278,8 @@ def consolidate_nodes(
     distill_epochs: int = 20,
     merge_tolerance: float = 0.01,
     functional_threshold: Optional[float] = None,
+    merge_trigger: str = "cca",
+    merge_cka_threshold: float = 0.55,
 ) -> Dict[str, object]:
     """
     One consolidation pass over the grown DAGNode list.
@@ -326,9 +328,15 @@ def consolidate_nodes(
     # would apply; only when it would do we pay for reader accuracies and the real (mutating) call.
     if truncate_energy is not None:
         for n in nodes:
-            probe_rec = low_rank_factorize_final_layer(
-                copy.deepcopy(n.concept_module),
-                energy=truncate_energy, max_rel_error=truncate_max_rel_error)
+            # The probe is a dry run and must cost the run nothing but time. An APPLIED
+            # factorisation builds two fresh `nn.Linear`s, and their default init draws from the
+            # CPU generator — so without this fork a node that truncates pays that init TWICE
+            # (once for the throwaway deepcopy, once for real) and every later draw in the run
+            # shifts. Zero runs in the H8 archive truncate, which is exactly why it went unseen.
+            with fork_rng_all_devices():
+                probe_rec = low_rank_factorize_final_layer(
+                    copy.deepcopy(n.concept_module),
+                    energy=truncate_energy, max_rel_error=truncate_max_rel_error)
             if not probe_rec.get("applied"):
                 continue
 
@@ -384,11 +392,39 @@ def consolidate_nodes(
                 # Redundancy trigger. Default (geometric) principal-angle overlap misses concepts
                 # that are functionally identical but sit in different bases; when a functional
                 # threshold is set, use mean canonical correlation instead (basis-invariant).
+                #
+                # `merge_trigger="cka"` swaps the DECIDING statistic for linear CKA (the merge
+                # pre-filter). Both statistics are read off ONE pass over ONE draw
+                # (`_paired_root_features`): `_combined_loader` shuffles and therefore consumes the
+                # global RNG, so scoring the two triggers on two passes would compare different
+                # samples AND move the run's stream.
+                sim_extra: Dict[str, float] = {}
                 if functional_threshold is not None:
-                    sim = _functional_similarity(
-                        a, b, _combined_loader(tasks, a.task_id, b.task_id), device, subspace_k)
-                    sim_kind = "functional"
-                    if sim < functional_threshold:
+                    Fa, Fb = _paired_root_features(
+                        a, b, _combined_loader(tasks, a.task_id, b.task_id), device)
+                    # BOTH statistics, off the one draw, in BOTH modes. The one the trigger did
+                    # not use is logging — and it is the logging that makes an offline
+                    # counterfactual ("what would the other trigger have merged?") possible at
+                    # all, which is the whole reason the pre-filter can be evaluated without
+                    # re-running the stream. Neither statistic draws RNG and neither builds a
+                    # loader of its own, so the default path's stream is untouched.
+                    cca = _cca_topk(Fa, Fb, subspace_k)
+                    cka = _linear_cka(Fa, Fb)
+                    sim_extra = {"cka": cka, "cca_topk": cca}
+                    if merge_trigger == "cka":
+                        sim, sim_kind, thr = cka, "cka", merge_cka_threshold
+                    else:
+                        sim, sim_kind, thr = cca, "functional", functional_threshold
+                    if sim < thr:
+                        # A pair the trigger stops used to vanish: a bare `continue` is
+                        # indistinguishable from "no pair was ever considered", so the archive
+                        # could not say whether the merge rung was silent because nothing was
+                        # redundant or because the trigger was mis-set. Every EXAMINED pair now
+                        # leaves exactly one record per scan. Appended to the op list only — no
+                        # decision, no loader, no draw moves.
+                        ops.append({"op": "trigger_rejected", "keep": a.task_id, "drop": b.task_id,
+                                    "similarity": sim, "sim_kind": sim_kind, "threshold": thr,
+                                    **sim_extra})
                         continue
                 else:
                     sim = _subspace_similarity(a, b, subspace_k)
@@ -404,7 +440,8 @@ def consolidate_nodes(
                         continue
                     _merge_nodes(nodes, predictors, keep=a, drop=b)
                     ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id,
-                                "similarity": sim, "sim_kind": sim_kind, "distilled": False})
+                                "similarity": sim, "sim_kind": sim_kind, "distilled": False,
+                                **sim_extra})
                     merged = True
                     break
 
@@ -436,7 +473,8 @@ def consolidate_nodes(
                 if ok:
                     ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id,
                                 "similarity": sim, "sim_kind": sim_kind, "distilled": True,
-                                "recon_loss": W["recon_loss"], "backward_deltas": deltas})
+                                "recon_loss": W["recon_loss"], "backward_deltas": deltas,
+                                **sim_extra})
                     audit_entry["verdict"] = "kept"
                     reader_audit.append(audit_entry)
                     merged = True
@@ -449,7 +487,7 @@ def consolidate_nodes(
                     ops.append({"op": "merge_rejected", "keep": a.task_id, "drop": b.task_id,
                                 "similarity": sim, "sim_kind": sim_kind, "recon_loss": W["recon_loss"],
                                 "backward_deltas": deltas, "worst_delta": min(deltas.values()),
-                                "merge_tolerance": merge_tolerance})
+                                "merge_tolerance": merge_tolerance, **sim_extra})
                     audit_entry["verdict"] = "rolled_back"
                     reader_audit.append(audit_entry)
             if merged:
@@ -491,6 +529,19 @@ def _functional_similarity(a: DAGNode, b: DAGNode, loader, device: str, top_k: i
     so this is the correct trigger for the distill+recovery-adapter merge (which linearly re-aligns
     the surviving concept anyway). See Central Library: five-datasets-kan-merge-detector.
     """
+    Fa, Fb = _paired_root_features(a, b, loader, device, max_batches)
+    return _cca_topk(Fa, Fb, top_k)
+
+
+def _paired_root_features(a: DAGNode, b: DAGNode, loader, device: str,
+                          max_batches: int = 8) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Both concepts' outputs over the SAME sample batch of `loader`, in the same order.
+
+    Factored out of `_functional_similarity` so every redundancy statistic is read off one pass
+    over one draw. That matters for more than cost: `_combined_loader` shuffles, so a second pass
+    would both score the two triggers on different samples and advance the run's RNG stream.
+    Returns raw (uncentred) CPU float32 (N, concept_dim) matrices.
+    """
     a_out, b_out = [], []
     a.eval(); b.eval()
     with torch.no_grad():
@@ -500,7 +551,12 @@ def _functional_similarity(a: DAGNode, b: DAGNode, loader, device: str, top_k: i
             x = batch[0].to(device)
             a_out.append(a(x).detach().cpu().float())
             b_out.append(b(x).detach().cpu().float())
-    Ha = torch.cat(a_out); Hb = torch.cat(b_out)
+    return torch.cat(a_out), torch.cat(b_out)
+
+
+def _cca_topk(Fa: torch.Tensor, Fb: torch.Tensor, top_k: int) -> float:
+    """Mean of the top-k canonical correlations between two feature matrices, in [0, 1]."""
+    Ha, Hb = Fa, Fb
     if Ha.shape[0] <= Ha.shape[1]:               # too few samples for a stable CCA
         return 0.0
     Ha = Ha - Ha.mean(0, keepdim=True)
@@ -510,6 +566,28 @@ def _functional_similarity(a: DAGNode, b: DAGNode, loader, device: str, top_k: i
     sv = torch.linalg.svdvals(qa.T @ qb).clamp(0.0, 1.0)
     k = min(top_k, sv.numel())
     return float(sv[:k].mean().item())
+
+
+def _linear_cka(Fa: torch.Tensor, Fb: torch.Tensor) -> float:
+    """Linear CKA between two column-centred feature matrices (Kornblith 2019), in [0, 1].
+
+    ``cka = ||Fa^T Fb||_F^2 / (||Fa^T Fa||_F ||Fb^T Fb||_F)`` — 1 exactly when the two
+    representations agree up to an orthogonal map (and any isotropic scale), so like CCA it is
+    basis-invariant, but unlike CCA it is NOT invariant to an arbitrary invertible map: it keeps
+    reading the variance each direction carries. That is what makes it usable as a merge
+    PRE-FILTER — the top-k CCA of two roots saturates near 1 on any pair whose class-carrying
+    directions happen to span, which is why the H8 archive's merge rung fires (or does not) almost
+    independently of how redundant the pair really is. Needs no QR/SVD, so it costs one matmul per
+    side on features `_paired_root_features` already collected.
+    """
+    Ha = Fa - Fa.mean(0, keepdim=True)
+    Hb = Fb - Fb.mean(0, keepdim=True)
+    cross = float((Ha.T @ Hb).pow(2).sum().item())
+    na = float((Ha.T @ Ha).norm().item())
+    nb = float((Hb.T @ Hb).norm().item())
+    if na <= 0.0 or nb <= 0.0:                   # a constant representation has no similarity
+        return 0.0
+    return cross / (na * nb)
 
 
 def _compose(existing: Optional[nn.Module], recovery: Optional[nn.Module]) -> Optional[nn.Module]:
@@ -635,6 +713,11 @@ class KanExpConfig(Exp3Config):
     functional_redundancy: bool = True    # detect merge candidates by canonical correlation (basis-
                                           # invariant), not principal-angle subspace overlap
     functional_threshold: float = 0.9     # mean top-k canonical correlation to trigger a merge
+    merge_trigger:       str   = "cca"    # "cca" | "cka" — which statistic DECIDES a merge
+                                          # candidate. "cca" is the published trigger; "cka" is the
+                                          # linear-CKA pre-filter (merge-detector separability).
+                                          # Both are always RECORDED on every merge op record.
+    merge_cka_threshold: float = 0.55     # linear CKA a pair must reach (merge_trigger == "cka")
     enable_search:       bool  = False    # three-way reuse/search/grow gate (test-time-compute rung)
     eps_search:          float = 0.05     # min reducible-info fraction bounded search must add over reuse
     search_budget:       int   = 6        # trained candidates the Search level may spend
@@ -689,13 +772,26 @@ class KanExpConfig(Exp3Config):
     provisional_alpha:   float = 0.05     # the e-process level; decide at 1/alpha
     provisional_z:       float = 1.0      # se_proxy arm: margin band in paired SEs
     always_n_max:        int   = 1000     # "always" arm: only data-poor positions (CTrL t3 has 400)
-    crystallise_after:   int   = 3        # tasks after which a still-flagged provisional root freezes
+    crystallise_after:   int   = 3        # tasks after which a still-flagged provisional root
+                                          # freezes (crystallises). 0 = NEVER time out: only a
+                                          # merge, or the end of the stream, resolves a root.
     oracle_rungs:        bool  = False    # after the decision, ALSO train+eval the other rungs'
                                           # predictors (reuse/search/grow) on task["test"], without
                                           # altering the DAG — for post-hoc regret analysis.
     dump_gate_tensors:   bool  = False    # write gate_dump.pt (feature mode only) — raw per-task
                                           # tensors + node/predictor state, for offline desk-stage
                                           # re-analysis without re-running training.
+    dump_max_per_split:  int   = 1024     # token mode only: examples per split the dump keeps
+                                          # (the FIRST n in loader order; a split SHORTER than
+                                          # this is dumped whole). A token set is ~100 kB an
+                                          # image, so the CLS dump's "everything" is tens of GB.
+                                          # 1024 > `always_n_max` (1000) on purpose: every
+                                          # data-poor position the provisional hypothesis is
+                                          # about — CTrL t3's 400 — is dumped COMPLETE.
+    dump_max_bytes:      float = 2e9      # refuse to write a gate_dump.pt bigger than this
+    token_pool:          Optional[int] = None   # patch-grid average-pool factor the token cache
+                                          # was built with; recorded in the dump so a desk script
+                                          # can tell a 64-token run from a 256-token one.
     enable_update:       bool  = False    # the "update" rung: refine an existing root parent's
                                           # concept in place instead of reuse/search/grow, gated by
                                           # backward safety on earlier tasks.
@@ -806,33 +902,145 @@ def _cache_raw_full(loader) -> Tuple[torch.Tensor, torch.Tensor]:
     return _cache_raw_capped(loader, max_batches=0)
 
 
+def _cache_raw_first_n(loader, n_max: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The FIRST `n_max` examples in loader order (0 = all).
+
+    Deterministic by construction: it selects a prefix rather than drawing a subset, so the token
+    dump owes the run no RNG state. The loader's own shuffling still decides which examples a
+    prefix contains, which is why the caller forks around the iteration.
+    """
+    xs, ys = [], []
+    got = 0
+    for x, y in loader:
+        take = len(y) if not n_max else min(len(y), n_max - got)
+        xs.append(x[:take].cpu())
+        ys.append(y[:take].cpu())
+        got += take
+        if n_max and got >= n_max:
+            break
+    if not xs:
+        return torch.empty(0), torch.empty(0, dtype=torch.long)
+    return torch.cat(xs, 0), torch.cat(ys, 0)
+
+
+def _root_mint_snapshot(node: DAGNode, predictor: TaskPredictor, t: int) -> dict:
+    """A CPU float32 copy of a root AND its reader, the moment the root finished training.
+
+    Consolidation merges roots away and rolls truncations back, so the end-of-run `nodes` list is
+    not enough to recover what any given task actually minted — the merged ones are simply gone.
+    The root alone is not enough either: re-scoring a dropped root's task off the dump needs the
+    head (and, for a non-grow reader, the composer) that read it, which is exactly what
+    `distill_merge`'s backward audit compares against. Plain tensor copies, taken outside anything
+    that draws: the snapshot cannot move the run.
+    """
+    composer = getattr(predictor, "composer", None)
+    return {
+        "task_id": t, "_node": node,
+        "state_dict": {k: v.detach().cpu().float().clone()
+                       for k, v in node.state_dict().items()},
+        "predictor_kind": predictor.kind,
+        "head_state": {k: v.detach().cpu().float().clone()
+                       for k, v in predictor.head.state_dict().items()},
+        "composer_kind": (None if composer is None else type(composer).__name__),
+        "composer_state": (None if composer is None else
+                           {k: v.detach().cpu().float().clone()
+                            for k, v in composer.state_dict().items()}),
+    }
+
+
+def _split_rows(loader, cap: int) -> int:
+    """How many rows the dump would take from `loader` (0 cap = all), without touching it."""
+    try:
+        n = len(loader.dataset)
+    except (TypeError, AttributeError):          # an iterable-style loader: assume the cap binds
+        return cap
+    return min(n, cap) if cap else n
+
+
+def _estimate_gate_dump_bytes(cfg: "KanExpConfig", tasks: List[Dict], token_mode: bool,
+                              model_bytes: int = 0) -> int:
+    """The dump's tensor payload, computed from SHAPES before anything is materialised.
+
+    The size guard exists to refuse a dump that will not fit; estimating it from the finished
+    dump means the 13 GB token dump OOMs while being built, which is the one outcome the guard
+    was written to prevent (v2 review, should-fix 9). Row counts come from `len(loader.dataset)`,
+    which reads a length and no data.
+    """
+    total = int(model_bytes)
+    label_bytes = 8                               # int64 labels, one per row
+    if token_mode:
+        per_row = (cfg.n_tokens or 1) * (cfg.feature_dim or 0) * 2      # fp16 token sets
+        for task in tasks:
+            for split in ("train", "test"):       # val is not dumped in token mode
+                total += _split_rows(task[split], cfg.dump_max_per_split) * (per_row + label_bytes)
+        return total
+    per_row = (cfg.feature_dim or cfg.cnn_out_dim or 0) * 4             # float32 CLS features
+    for task in tasks:
+        total += _split_rows(task["train"], cfg.gate_cache_max) * (per_row + label_bytes)
+        total += _split_rows(task.get("val", task["test"]), 0) * (per_row + label_bytes)
+        total += _split_rows(task["test"], 0) * (per_row + label_bytes)
+    return total
+
+
+def _dump_nbytes(obj) -> int:
+    """Bytes of tensor payload in a (nested) dump structure — the post-build cross-check."""
+    if torch.is_tensor(obj):
+        return obj.numel() * obj.element_size()
+    if isinstance(obj, dict):
+        return sum(_dump_nbytes(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_dump_nbytes(v) for v in obj)
+    return 0
+
+
 def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode],
                      predictors: List[TaskPredictor], decisions: List[dict],
-                     gate_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]]) -> dict:
+                     gate_cache: Dict[int, Tuple[Optional[torch.Tensor], torch.Tensor]],
+                     roots_at_mint: Optional[List[dict]] = None) -> dict:
+    # Token mode keeps a bounded PREFIX of train and test only; the CLS dump below is unchanged,
+    # field for field, because every desk script that reads a published dump depends on it.
+    token_mode = (cfg.root_family == "attn_pool")
     # Same GATE cache sizing as run_exp3a_kan's live decisions — separate from `routing_batches`.
     gate_batches = math.ceil(cfg.gate_cache_max / cfg.batch_size) if cfg.gate_cache_max else 0
     gate_dump_tasks = []
-    for t, task in enumerate(tasks):
-        if t in gate_cache:
-            # SAME cap/order as the (Xraw, y) that fed this task's live gate decision
-            # (INTERFACE_SPEC.md §6) — captured once at decision time in the main loop, not
-            # re-sampled here (re-sampling from the shuffled loader after the run would draw a
-            # different `gate_cache_max`-sized subset than `_cache_parent_stack` used).
-            train_raw, train_y = gate_cache[t]
-        else:
-            # No gate decision was made for this task (root: growth forced, nothing to
-            # reproduce) — re-sampling here is harmless, but fork the RNG so it doesn't perturb
-            # the main stream that later tasks' training/decisions already consumed.
-            with torch.random.fork_rng(devices=[]):
-                train_raw, train_y = _cache_raw_capped(task["train"], gate_batches)
-        val_raw, val_y = _cache_raw_full(task.get("val", task["test"]))
-        test_raw, test_y = _cache_raw_full(task["test"])
-        gate_dump_tasks.append({
-            "task": t, "n_classes": task["n_classes"], "ctrl": task.get("ctrl"),
-            "train_raw": train_raw.float(), "train_y": train_y.long(),
-            "val_raw": val_raw.float(), "val_y": val_y.long(),
-            "test_raw": test_raw.float(), "test_y": test_y.long(),
-        })
+    if token_mode:
+        # A (1 + T, D) token set is ~100 kB an image, so "every split in full" is tens of GB on a
+        # 5-Datasets stream. Keep a bounded PREFIX of train and test, in fp16 (the cache's own
+        # storage dtype — see test_token_feature_cache_stays_half_in_memory). Val is dropped
+        # outright: the desk analyses this dump exists for score train-fit against test, and the
+        # `meta` block below says so rather than leaving a reader to infer it from a missing key.
+        for t, task in enumerate(tasks):
+            entry = {"task": t, "n_classes": task["n_classes"], "ctrl": task.get("ctrl")}
+            for split in ("train", "test"):
+                # `_cache_raw_first_n` draws nothing itself, but iterating a shuffled train loader
+                # does; fork so a dump can never move a stream the run has already been scored on.
+                with fork_rng_all_devices():
+                    raw, y = _cache_raw_first_n(task[split], cfg.dump_max_per_split)
+                entry[f"{split}_raw"] = raw.half()
+                entry[f"{split}_y"] = y.long()
+            gate_dump_tasks.append(entry)
+    else:
+        for t, task in enumerate(tasks):
+            if t in gate_cache:
+                # SAME cap/order as the (Xraw, y) that fed this task's live gate decision
+                # (INTERFACE_SPEC.md §6) — captured once at decision time in the main loop, not
+                # re-sampled here (re-sampling from the shuffled loader after the run would draw a
+                # different `gate_cache_max`-sized subset than `_cache_parent_stack` used).
+                train_raw, train_y = gate_cache[t]
+            else:
+                # No gate decision was made for this task (root: growth forced, nothing to
+                # reproduce) — re-sampling here is harmless, but fork the RNG so it doesn't perturb
+                # the main stream that later tasks' training/decisions already consumed.
+                with torch.random.fork_rng(devices=[]):
+                    train_raw, train_y = _cache_raw_capped(task["train"], gate_batches)
+            val_raw, val_y = _cache_raw_full(task.get("val", task["test"]))
+            test_raw, test_y = _cache_raw_full(task["test"])
+            gate_dump_tasks.append({
+                "task": t, "n_classes": task["n_classes"], "ctrl": task.get("ctrl"),
+                "train_raw": train_raw.float(), "train_y": train_y.long(),
+                "val_raw": val_raw.float(), "val_y": val_y.long(),
+                "test_raw": test_raw.float(), "test_y": test_y.long(),
+            })
 
     node_index = {id(n): i for i, n in enumerate(nodes)}
     gate_dump_nodes = []
@@ -871,7 +1079,7 @@ def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode
                 "search_meta": search_meta,
             })
 
-    return {
+    dump = {
         "feature_mode": True,
         "concept_dim": cfg.concept_dim,
         "feature_dim": cfg.feature_dim,
@@ -888,6 +1096,54 @@ def _build_gate_dump(cfg: "KanExpConfig", tasks: List[Dict], nodes: List[DAGNode
         "predictors": gate_dump_preds,
         "decisions": decisions,
     }
+    if not token_mode:
+        # A published CLS dump is what every existing desk script reads; it gains nothing here.
+        return dump
+
+    # `nodes` holds each node's CONCEPT MODULE only, which in token mode leaves the root's
+    # AttentionPool — the thing the whole family ablation is about — out of the dump entirely.
+    dump["mode"] = "token"
+    dump["token_pool"] = cfg.token_pool
+    dump["roots"] = [
+        {"index": i, "task_id": n.task_id,
+         "state_dict": {k: v.detach().cpu().float() for k, v in n.state_dict().items()}}
+        for i, n in enumerate(nodes) if n.is_root
+    ]
+    # ... and consolidation merges roots away, so the end-of-run list cannot answer "what did
+    # task t actually mint?" for a root that was later dropped. `node_id` is the index into
+    # `nodes`/`roots` if the snapshotted root survived to the end of the run, and None if a
+    # merge took it.
+    dump["roots_at_mint"] = [
+        {k: v for k, v in r.items() if k != "_node"}
+        | {"node_id": node_index.get(id(r["_node"]))}
+        for r in (roots_at_mint or [])
+    ]
+    dump["meta"] = {
+        "splits": ["train", "test"],
+        "val_omitted": True,
+        "val_omitted_reason": (
+            "token mode keeps a bounded prefix per split; val is dropped because the desk "
+            "analyses this dump exists for fit on train and score on test"),
+        "max_per_split": cfg.dump_max_per_split,
+        "selection": ("first n examples in loader order (no RNG draw of its own); a split with "
+                      "fewer than max_per_split examples is dumped WHOLE, and the default 1024 "
+                      "is above always_n_max (1000) so every data-poor gated position is"
+                      " complete"),
+        "raw_dtype": "float16",
+        "raw_shape": "(n, 1 + T, feature_dim)",
+        "n_tokens": cfg.n_tokens,
+        "roots_at_mint_keys": {
+            "task_id": "stream position that minted this root",
+            "node_id": "index into `nodes`/`roots` if it survived to the end of the run, else None"
+                       " (a consolidation merge dropped it)",
+            "state_dict": "the ROOT's full state at mint, CPU float32 (AttentionPool included)",
+            "predictor_kind": "the reader's rung at mint — 'grow' for every freshly minted root",
+            "head_state": "that task's reader head at mint, CPU float32",
+            "composer_kind": "class name of the reader's composer, or None for a grow reader",
+            "composer_state": "the composer's state at mint, CPU float32, or None",
+        },
+    }
+    return dump
 
 
 def run_exp3a_kan(
@@ -910,6 +1166,22 @@ def run_exp3a_kan(
     gate_batches = math.ceil(cfg.gate_cache_max / cfg.batch_size) if cfg.gate_cache_max else 0
     use_cnn = (cfg.backbone == "smallcnn")
 
+    # --- decision-timing preconditions ---------------------------------------------------
+    if cfg.provisional != "off" and str(cfg.device).startswith("mps"):
+        # Every arm but `off` rests on a forked block being a no-op on the RNG stream: the
+        # shadow refit computes and acts on nothing, and P0b is the check that it really did.
+        # On MPS that block cannot be made a no-op at all — torch's MPS rng_state omits the
+        # philox offset, so `set_rng_state` rewinds the seed but not the position in the stream
+        # (see concept_dag/utils/rng.py). A `--provisional` run on MPS is therefore not a null
+        # and cannot be certified as one, whatever its numbers say. Raised here rather than in
+        # run_experiment.py so it covers every caller (PR #8 review, should-fix 6).
+        raise ValueError(
+            f"--provisional {cfg.provisional} is refused on device 'mps': the MPS generator "
+            f"cannot be forked (its rng_state omits the philox offset), so the shadow refit "
+            f"perturbs every later dropout mask and the arm is not a null — P0b cannot be "
+            f"certified on this backend. Run the arm on cuda or cpu, or use --provisional off."
+        )
+
     # --- token-mode preconditions -------------------------------------------------------
     if cfg.root_family == "attn_pool":
         if use_cnn:
@@ -921,16 +1193,11 @@ def run_exp3a_kan(
                 "a (N, 1 + T, D) token set has no 2-D form for. Run the update rung under "
                 "root_family='mlp_cls', or extend _UpdateModel to carry a token root."
             )
+    # `--dump_gate_tensors` used to be refused in token mode, because the CLS dump keeps every
+    # split of every task in full and a token set is ~100 kB an image (65 x 384 float32) — tens of
+    # GB for a 5-Datasets stream. The token dump instead keeps the FIRST `dump_max_per_split`
+    # examples of train and test only, and is guarded by `dump_max_bytes` at write time.
     dump_gate_tensors = cfg.dump_gate_tensors
-    if dump_gate_tensors and cfg.root_family == "attn_pool":
-        # gate_dump.pt stores every task's train/val/test raw inputs; in token mode that is
-        # ~100 kB/image (65 x 384 float32) — tens of GB for a 5-Datasets stream — and the desk
-        # scripts that read it all assume a 2-D feature matrix. Disabled loudly rather than
-        # silently writing something unusable.
-        print("[kan_exp] --dump_gate_tensors is disabled in token mode (root_family='attn_pool'): "
-              "the dump would hold (N, 1+T, D) token sets and the desk scripts expect (N, D). "
-              "Re-run with --root_family mlp_cls to produce a dump.")
-        dump_gate_tensors = False
 
     nodes: List[DAGNode] = []
     predictors: List[TaskPredictor] = []
@@ -940,7 +1207,10 @@ def run_exp3a_kan(
     test_accs: List[float] = []
     # (Xraw, y) actually fed to each gated task's live decision, captured at decision time so
     # `_build_gate_dump` can dump the SAME rows/order instead of re-sampling post hoc (§6).
-    gate_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+    gate_cache: Dict[int, Tuple[Optional[torch.Tensor], torch.Tensor]] = {}
+    # Every ROOT's full state the moment it finished training, before any consolidation pass could
+    # merge or truncate it (token-mode dump only — see `_root_mint_snapshot`).
+    roots_at_mint: List[dict] = []
     # One record per provisional root, from mint to resolution. `resolution` is the quantity the
     # loop turns on: a mechanism whose roots are ALL resolved by timeout is delayed unconditional
     # growth, not decision timing ([[provisional-growth-undetermined-gate]] P6).
@@ -972,6 +1242,22 @@ def run_exp3a_kan(
                          if op["op"] == "merge"}
         for task_id, rec_p in provisional_log.items():
             if rec_p["resolution"] is not None:
+                # A root the clock crystallised is an ordinary frozen root again, and a LATER
+                # pass may still merge it away. That is not a second resolution — the resolution
+                # stays `timeout`, which is what actually happened to the provisional FLAG — but
+                # it has to be recorded, or the two bookkeeping paths the evaluators reconcile
+                # (`provisional_roots[*].resolution` against accepted merge ops naming a
+                # provisional root as `drop`) disagree on a perfectly correct run and every
+                # cross-check fires (v2 review, blocker 2). Reachable in the pre-registered
+                # `always` arm: at crystallise_after 3 on CTrL's 6 positions the t1/t2 roots age
+                # out at t4/t5 and are then candidates for the final pass.
+                if (rec_p["resolution"] == "timeout"
+                        and rec_p.get("merged_after_crystallisation") is None
+                        and id(rec_p["_node"]) not in live):
+                    merge_op = merge_by_drop.get(task_id)
+                    if merge_op is not None:
+                        rec_p["merged_after_crystallisation"] = merge_op["keep"]
+                        rec_p["merged_after_crystallisation_at"] = current_t
                 continue
             node = rec_p["_node"]
             if id(node) not in live:
@@ -984,7 +1270,14 @@ def run_exp3a_kan(
                     rec_p["resolution"] = "removed_unexplained"
                 rec_p["resolved_at"] = current_t
                 continue
-            aged_out = (current_t - rec_p["minted_at"]) >= cfg.crystallise_after
+            # `crystallise_after = 0` means NEVER time out, not "time out immediately": a
+            # deferral whose clock is zero is a root that only merge (or the end of the stream)
+            # can resolve, which is the control arm for "does the timeout do any work?". Read
+            # literally, `0 >= 0` crystallised a root inside the very task that minted it — a
+            # state that was unreachable before the per-task clock landed (v2 review, sf 12).
+            # The `end_of_stream` call still resolves everything, so P9 holds either way.
+            aged_out = (cfg.crystallise_after > 0
+                        and (current_t - rec_p["minted_at"]) >= cfg.crystallise_after)
             if end_of_stream or aged_out:
                 node.provisional = False
                 node.freeze()
@@ -1040,6 +1333,8 @@ def run_exp3a_kan(
             node.freeze()
             nodes.append(node)
             predictors.append(TaskPredictor("grow", head, node=node))
+            if dump_gate_tensors and node.is_root:
+                roots_at_mint.append(_root_mint_snapshot(node, predictors[-1], t))
             decisions.append({"task": t, "decision": "grow", "reason": "root"})
         else:
             sel_idx, _scores = route_for_task(nodes, task["train"], n_par, cfg.subspace_k,
@@ -1055,7 +1350,9 @@ def run_exp3a_kan(
                 # Only retained when a dump will be written: Xraw is the full gate cache
                 # (16,384 x 1+T x D in token mode ≈ 1.6 GB float32) and holding one per task
                 # would carry the whole stream's caches to the end of the run for nothing.
-                gate_cache[t] = (Xraw, y)  # exact rows/order the live decision below sees
+                # The token dump reads a bounded prefix straight off the loaders and never looks
+                # at this cache, so there it keeps the labels alone (`results["_gate_cache_y"]`).
+                gate_cache[t] = (None if token_root_mode else Xraw, y)
             raw_kwargs = ({"raw_stack": Xraw, "root_module_factory": root_module_factory}
                           if use_raw_probe else {})
             # Prequential-estimator kwargs are passed ONLY when selected, so the call signature
@@ -1238,6 +1535,10 @@ def run_exp3a_kan(
                 if t in provisional_log:
                     provisional_log[t]["params_at_mint"] = sum(p.numel() for p in node.parameters())
                 predictors.append(TaskPredictor("grow", head, node=node))
+                if dump_gate_tensors and node.is_root:
+                    # Provisional or not: a provisional root is an ordinary root plus a flag, and
+                    # it is precisely the one consolidation is allowed to drop.
+                    roots_at_mint.append(_root_mint_snapshot(node, predictors[-1], t))
             elif rec.decision == "search":
                 # Search: keep the best bounded-search composition over frozen parents; add NO node.
                 meta = rec.search_meta or {}
@@ -1274,8 +1575,18 @@ def run_exp3a_kan(
                     # into nor depends on the main run's RNG stream — otherwise every later task's
                     # init/batch order would differ from a control run with enable_update=False,
                     # and borderline decisions on later tasks would flip for an RNG reason rather
-                    # than because of the update rung. Matches _oracle_rungs' fork_rng usage above.
-                    with torch.random.fork_rng(devices=[]):
+                    # than because of the update rung.
+                    #
+                    # The fork must cover the DEVICE generator, not just the CPU one: this is the
+                    # P0b bug (commit 8d65718) at a second call site. `torch.manual_seed` below
+                    # re-seeds EVERY device generator (it fans out to `cuda.manual_seed_all` and
+                    # `mps.manual_seed`), while `torch.random.fork_rng(devices=[])` names no
+                    # device and puts back only the CPU half — so the probe used to leave the
+                    # device generator wherever its own training loop ended, and the dropout mask
+                    # stream of every later `train_node` in the run moved with it. Invisible on
+                    # CPU, which is why the suite said nothing; it makes `--enable_update` fail to
+                    # be a clean comparison against its own control on any GPU/MPS run.
+                    with fork_rng_all_devices():
                         torch.manual_seed(cfg.seed * 1000 + t + 500)
                         best = None
                         for i in root_parent_idxs:
@@ -1388,7 +1699,9 @@ def run_exp3a_kan(
                                      subspace_k=cfg.subspace_k, distill=cfg.distill,
                                      distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance,
                                      functional_threshold=(cfg.functional_threshold
-                                                           if cfg.functional_redundancy else None))
+                                                           if cfg.functional_redundancy else None),
+                                     merge_trigger=cfg.merge_trigger,
+                                     merge_cka_threshold=cfg.merge_cka_threshold)
             print(f"  [consolidate @ task {t}] saved {summ['params_saved']} params, {summ['n_ops']} ops")
             summ["at_task"] = t
             summ["final"] = False
@@ -1397,6 +1710,24 @@ def run_exp3a_kan(
             reader_audit.extend(summ["reader_audit"])
             consolidation_passes.append(summ)
             _resolve_provisional(t, pass_result=summ)
+        elif cfg.provisional != "off" and t < len(tasks) - 1:
+            # Crystallisation is a property of the STREAM's clock — "a provisional root that is
+            # still flagged `crystallise_after` tasks later has run out of time" — not of the
+            # consolidation schedule. Running it only inside the `consolidate_every` branch meant
+            # that at the default `consolidate_every=0` NO root could time out until the final
+            # pass, so every run's P6 read "resolved at the last task" and the timeout clock was
+            # never actually exercised (PR #8 review, should-fix 7). A merge still resolves a root
+            # only in a consolidation pass, which is why no `pass_result` is passed here: with no
+            # pass, no node can have vanished, and the merge bookkeeping has nothing to do.
+            #
+            # NOT at the last task: the final consolidation pass runs immediately after this loop
+            # and its `end_of_stream` call already covers every still-flagged root, WITH the
+            # pass's ops in hand. Crystallising here first would stamp `timeout` on a root the
+            # final pass then merges away — `_resolve_provisional` skips any record that already
+            # has a resolution — and bias the resolution histogram, the one observable that
+            # separates provisional growth from delayed unconditional growth, toward `timeout`.
+            # That is the exact opposite of what this change was for (v2 review, blocker 1).
+            _resolve_provisional(t)
         _flush(device)
 
     # Final consolidation.
@@ -1407,7 +1738,9 @@ def run_exp3a_kan(
                                       subspace_k=cfg.subspace_k, distill=cfg.distill,
                                       distill_epochs=cfg.distill_epochs, merge_tolerance=cfg.merge_tolerance,
                                       functional_threshold=(cfg.functional_threshold
-                                                            if cfg.functional_redundancy else None))
+                                                            if cfg.functional_redundancy else None),
+                                      merge_trigger=cfg.merge_trigger,
+                                      merge_cka_threshold=cfg.merge_cka_threshold)
     consolidation["at_task"] = len(tasks) - 1
     consolidation["final"] = True
     for e in consolidation["reader_audit"]:
@@ -1472,9 +1805,33 @@ def run_exp3a_kan(
         results["_gate_cache_y"] = {t: yv for t, (_, yv) in gate_cache.items()}
 
     if dump_gate_tensors and not use_cnn:
-        dump = _build_gate_dump(cfg, tasks, nodes, predictors, decisions, gate_cache)
         dump_path = os.path.join(cfg.results_dir, "gate_dump.pt")
-        torch.save(dump, dump_path)
-        print(f"Gate tensor dump saved to {dump_path}")
+
+        def _refuse(n_bytes: int, stage: str) -> None:
+            print(f"[kan_exp] REFUSING to write {dump_path}: {stage} {n_bytes / 1e9:.3f} GB "
+                  f"exceeds --dump_max_bytes {cfg.dump_max_bytes / 1e9:.3f} GB. Lower "
+                  f"--dump_max_per_split (currently {cfg.dump_max_per_split}) or raise the limit. "
+                  f"The run itself is complete and its results JSON is already written.")
+
+        # Estimated from SHAPES, before a single tensor is collected: a guard that measures the
+        # finished dump lets the dump it exists to refuse OOM while being built.
+        model_bytes = 2 * sum(p.numel() for n in nodes for p in n.parameters()) * 4
+        est_bytes = _estimate_gate_dump_bytes(cfg, tasks, token_root_mode, model_bytes)
+        print(f"[kan_exp] gate_dump.pt estimated tensor payload: {est_bytes / 1e9:.3f} GB "
+              f"(limit --dump_max_bytes {cfg.dump_max_bytes / 1e9:.3f} GB)")
+        if est_bytes > cfg.dump_max_bytes:
+            _refuse(est_bytes, "estimated")
+        else:
+            dump = _build_gate_dump(cfg, tasks, nodes, predictors, decisions, gate_cache,
+                                    roots_at_mint)
+            # Cross-check the estimate against what was actually collected, so an optimistic
+            # estimate cannot smuggle an over-size dump onto the disk.
+            actual = _dump_nbytes(dump)
+            if actual > cfg.dump_max_bytes:
+                _refuse(actual, f"actual (estimate said {est_bytes / 1e9:.3f} GB);")
+            else:
+                torch.save(dump, dump_path)
+                print(f"Gate tensor dump saved to {dump_path} "
+                      f"({actual / 1e9:.3f} GB tensor payload)")
 
     return results

@@ -32,7 +32,12 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
+import os
+
 from concept_dag.experiments.kan_exp import KanExpConfig, run_exp3a_kan
+
+#: `scripts/` is not a package; the evaluators are loaded by path where a test needs one.
+_SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 
 
 # ---------------------------------------------------------------------------
@@ -316,3 +321,209 @@ def test_provisional_evalue_without_enable_search_exits(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ===========================================================================
+# 6. The timeout clock runs on the STREAM, not on the consolidation schedule
+# ===========================================================================
+#
+# `_resolve_provisional` used to be called only inside the `consolidate_every` branch, so at the
+# default `consolidate_every=0` the crystallise_after clock could not fire until the final pass:
+# every root in every published run read "resolved at the last task", and the timeout mechanism
+# — the thing that makes "provisional" different from "delayed unconditional growth" — was never
+# exercised (PR #8 review, should-fix 7).
+
+
+def test_crystallisation_fires_mid_stream_without_a_consolidation_pass(tmp_path):
+    tasks = _make_feature_tasks(n_tasks=5, seed=7)
+    cfg = _base_cfg(tmp_path, provisional="always", enable_search=True, search_skip=True,
+                    always_n_max=1000)
+    cfg.consolidate_every = 0          # the published default: no mid-stream pass at all
+    cfg.crystallise_after = 2
+    res = run_exp3a_kan(cfg, tasks)
+
+    by_mint = {r["minted_at"]: r for r in res["provisional_roots"]}
+    assert 1 in by_mint, "the 'always' arm must mint at t1 on this stream"
+
+    # Minted at t1 with crystallise_after=2: it is out of time the moment t - 1 >= 2, i.e. at t3,
+    # which on a 5-task stream is BEFORE the end (t4) and before any consolidation pass exists.
+    root_t1 = by_mint[1]
+    assert root_t1["resolution"] == "timeout"
+    assert root_t1["resolved_at"] == 3
+
+    # ... and a root minted later is still in time at t3, so the clock is a clock and not a
+    # blanket "crystallise everything once".
+    if 3 in by_mint:
+        assert by_mint[3]["resolved_at"] > 3 or by_mint[3]["resolution"] == "merge"
+
+    for rec in res["provisional_roots"]:
+        assert rec["resolution"] in {"merge", "timeout"}
+        assert rec["resolved_at"] is not None
+
+
+def test_the_off_arm_never_reaches_the_resolution_path(tmp_path):
+    """`--provisional off` mints nothing and the new per-task call is guarded, not just empty."""
+    tasks = _make_feature_tasks(n_tasks=5, seed=7)
+    cfg = _base_cfg(tmp_path, provisional="off", enable_search=True, search_skip=True)
+    cfg.consolidate_every = 0
+    cfg.crystallise_after = 2
+    res = run_exp3a_kan(cfg, tasks)
+
+    assert "provisional_roots" not in res or res["provisional_roots"] == []
+    assert all("provisional" not in d for d in res["decisions"])
+
+
+# ===========================================================================
+# 7. --provisional is refused on MPS, for every caller (review should-fix 6)
+# ===========================================================================
+#
+# Every arm but `off` rests on a forked block being a no-op on the RNG stream, and on MPS that is
+# unattainable: torch's MPS rng_state omits the philox offset, so `set_rng_state` rewinds the seed
+# but not the position in the stream. A `--provisional` run on MPS is not a null and cannot be
+# certified as one. This used to be a `warnings.warn` in `run_experiment.py`, which covered the
+# CLI and nothing else — not the tests, not the sweep scripts, not any other caller.
+
+
+@pytest.mark.parametrize("arm", ["shadow", "evalue", "se_proxy", "always"])
+def test_provisional_on_mps_is_refused(tmp_path, arm):
+    cfg = _base_cfg(tmp_path, provisional=arm, enable_search=True, search_skip=True)
+    cfg.device = "mps"
+    with pytest.raises(ValueError) as excinfo:
+        run_exp3a_kan(cfg, _make_feature_tasks(n_tasks=2, seed=1))
+    msg = str(excinfo.value)
+    assert "mps" in msg and "philox" in msg and "P0b" in msg
+    # It must refuse BEFORE doing any work — the task list is never touched.
+
+
+def test_provisional_off_on_mps_is_allowed_through_the_guard(tmp_path):
+    """The guard is about the arm, not about MPS: an `off` run is refused by nothing here."""
+    cfg = _base_cfg(tmp_path, provisional="off", enable_search=True, search_skip=True)
+    cfg.device = "mps"
+    # It will fail later for want of an actual MPS device on this machine, but NOT with the
+    # provisional refusal — which is the whole claim.
+    try:
+        run_exp3a_kan(cfg, _make_feature_tasks(n_tasks=2, seed=1))
+    except ValueError as e:                      # pragma: no cover - machine dependent
+        assert "--provisional" not in str(e)
+    except Exception:                            # pragma: no cover - no MPS on this machine
+        pass
+
+
+def test_a_root_ageing_out_at_the_last_task_is_left_to_the_final_pass(tmp_path):
+    """The clock must not pre-empt the final consolidation pass (v2 review, blocker 1).
+
+    The per-task check runs BEFORE the final pass. A root that ages out exactly at the last task
+    would be stamped `timeout` there, and `_resolve_provisional` skips any record that already
+    carries a resolution — so the final pass's merge of that very root is never recorded, and the
+    resolution histogram (V4/V6's input, and the observable that separates provisional growth
+    from delayed unconditional growth) is biased toward `timeout` on a run whose merges fired.
+    """
+    from tests.fixtures.cls_identity_stream import make_duplicate_cls_tasks
+
+    def _run(crystallise_after: int):
+        tasks = make_duplicate_cls_tasks()
+        cfg = KanExpConfig(
+            results_dir=str(tmp_path / f"ca{crystallise_after}"), device="cpu",
+            backbone="dinov2_vits14", feature_dim=24, concept_dim=16, seed=42,
+            root_epochs=12, child_epochs=12, gate_epochs=6,
+            n_tasks=len(tasks), n_parents=2, routing_batches=4, gate_cache_max=256,
+            subspace_k=3, batch_size=16, raw_grow_probe=True, enable_search=True,
+            search_skip=True, consolidate_every=0, distill=True, distill_epochs=4,
+            log_every=100000, provisional="always", always_n_max=100000,
+            crystallise_after=crystallise_after)
+        return run_exp3a_kan(cfg, tasks)
+
+    last = 4                                     # 5 tasks: t0..t4
+    slow = _run(5)                               # nothing ages out: the final pass decides all
+    fast = _run(2)                               # the t2 root ages out exactly AT the last task
+
+    slow_by_mint = {r["minted_at"]: r for r in slow["provisional_roots"]}
+    fast_by_mint = {r["minted_at"]: r for r in fast["provisional_roots"]}
+
+    # The two runs' final passes are identical — the clock does not change what merges.
+    def _ops(res):
+        return [(o["op"], o.get("keep"), o.get("drop")) for o in res["consolidation"]["ops"]]
+    assert _ops(slow) == _ops(fast)
+    assert slow["consolidation"]["params_saved"] == fast["consolidation"]["params_saved"]
+
+    # The t2 root ages out at t4 == the last task, and the final pass merges it into root 0.
+    assert 2 in fast_by_mint and slow_by_mint[2]["resolution"] == "merge"
+    assert fast_by_mint[2]["resolution"] == "merge", (
+        "a root ageing out at the last task was stamped `timeout` before the final pass could "
+        "record its merge")
+    assert fast_by_mint[2]["resolved_at"] == last
+    assert fast_by_mint[2]["merged_into"] == slow_by_mint[2]["merged_into"]
+
+    # ... while a root that ages out genuinely mid-stream still times out, on its own task.
+    assert fast_by_mint[1]["resolution"] == "timeout"
+    assert fast_by_mint[1]["resolved_at"] == 3 < last
+
+
+def test_a_root_merged_after_crystallisation_stays_reconcilable(tmp_path):
+    """The clock and the merge bookkeeping must not contradict each other (v2 review, blocker 2).
+
+    A root the clock crystallises MID-stream is an ordinary frozen root again, and a later
+    consolidation pass may still merge it away. Its resolution stays `timeout` — that is what
+    happened to the provisional flag — but it does produce an accepted merge op naming it as
+    `drop`. Without recording that, `resolved_by_merge` and "accepted ops dropping a provisional
+    root" disagree, and every evaluator's cross-check fires on a correct run.
+    """
+    import sys
+
+    from tests.fixtures.cls_identity_stream import make_duplicate_cls_tasks
+
+    sys.path.insert(0, str(_SCRIPTS))
+    import eval_provisional
+
+    tasks = make_duplicate_cls_tasks()
+    cfg = KanExpConfig(
+        results_dir=str(tmp_path), device="cpu", backbone="dinov2_vits14",
+        feature_dim=24, concept_dim=16, seed=42, root_epochs=12, child_epochs=12, gate_epochs=6,
+        n_tasks=len(tasks), n_parents=2, routing_batches=4, gate_cache_max=256, subspace_k=3,
+        batch_size=16, raw_grow_probe=True, enable_search=True, search_skip=True,
+        consolidate_every=0, distill=True, distill_epochs=4, log_every=100000,
+        provisional="always", always_n_max=100000, crystallise_after=2)
+    res = run_exp3a_kan(cfg, tasks)
+
+    by_mint = {r["minted_at"]: r for r in res["provisional_roots"]}
+    # The t1 root ages out at t3, mid-stream, and the final pass merges it into root 0.
+    t1 = by_mint[1]
+    assert t1["resolution"] == "timeout" and t1["resolved_at"] == 3
+    assert t1["merged_after_crystallisation"] == 0
+    assert t1["merged_after_crystallisation_at"] == len(tasks) - 1
+
+    # ... and the two bookkeeping paths reconcile, so the cross-check does not fire.
+    row = eval_provisional._p6_row_stats(42, "s_interleave", res)
+    assert row["merged_after_crystallisation"] == 1
+    assert (row["resolved_by_merge"] + row["merged_after_crystallisation"]
+            == row["accepted_merge_ops_dropping_a_provisional_root"])
+    assert row["cross_check_mismatch"] is False
+
+
+def test_crystallise_after_zero_means_never_time_out(tmp_path):
+    """0 is the no-timeout control arm, not "time out immediately" (v2 review, should-fix 12).
+
+    Read literally the clock is `0 >= 0`, which crystallised a root inside the very task that
+    minted it — a state that was unreachable before the per-task check landed. The end-of-stream
+    sweep still resolves everything, so P9 (no root survives a run) holds either way.
+    """
+    tasks = _make_feature_tasks(n_tasks=5, seed=7)
+    cfg = _base_cfg(tmp_path, provisional="always", enable_search=True, search_skip=True,
+                    always_n_max=1000)
+    cfg.consolidate_every = 0
+    cfg.crystallise_after = 0
+    res = run_exp3a_kan(cfg, tasks)
+
+    roots = res["provisional_roots"]
+    assert roots, "the 'always' arm must mint on this stream"
+    last = len(tasks) - 1
+    for rec in roots:
+        assert rec["resolution"] in {"merge", "timeout"}
+        assert rec["resolved_at"] is not None
+        if rec["resolution"] == "timeout":
+            assert rec["resolved_at"] == last, (
+                "with crystallise_after=0 nothing may time out before the end of the stream; "
+                f"root minted at {rec['minted_at']} timed out at {rec['resolved_at']}")
+        assert rec["resolved_at"] != rec["minted_at"] or rec["minted_at"] == last, (
+            "the per-task clock must never resolve a root inside the task that minted it; "
+            "only the end-of-stream sweep may, and only for a root minted at the last task")

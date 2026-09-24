@@ -1365,7 +1365,20 @@ def decide_reuse_search_grow(
         if evalue_bits:
             alt_is_search = sel_search <= sel_reuse
             pe_alt = pe_search if alt_is_search else pe_reuse
-            reducible_sel = max(sel_null - min(sel_reuse, sel_search, sel_grow), 1e-6)
+            # The indifference margin is `eps_grow * reducible`, and `reducible` is whichever
+            # normaliser the run CONFIGURED — the same choice the ladder itself makes at line
+            # ~1425, on the same rungs, just measured on SELECT bits. It was hard-coded to
+            # "best" here, so a `--reducible grow` run silently tested a DIFFERENT margin than
+            # the one it decided with (PR #8 review, should-fix 8). Default is "best", so no
+            # archived number moves. Both are recorded either way.
+            reducible_sel_grow = max(sel_null - sel_grow, 1e-6)
+            reducible_sel_best = max(sel_null - min(sel_reuse, sel_search, sel_grow), 1e-6)
+            if reducible_mode == "grow":
+                reducible_sel = reducible_sel_grow
+            elif reducible_mode == "best":
+                reducible_sel = reducible_sel_best
+            else:
+                raise ValueError(f"unknown reducible_mode {reducible_mode!r}")
             shift = float(eps_grow) * reducible_sel
             d = (pe_alt - pe_grow).double().tolist()          # >0 => grow codes the example better
             evalue_meta = _evalue_decide(d, float(evalue_bits), threshold_bits=shift,
@@ -1385,6 +1398,9 @@ def decide_reuse_search_grow(
             evalue_meta.update({
                 "alt_rung": "search" if alt_is_search else "reuse",
                 "reducible_select": reducible_sel,
+                "reducible_select_grow": reducible_sel_grow,
+                "reducible_select_best": reducible_sel_best,
+                "reducible_mode": reducible_mode,
                 "eps_grow": float(eps_grow),
                 # Bias budget (D3): the per-rung early-stopping optimism this test could otherwise
                 # mistake for signal, and how much of the tail the +-B clip removed on each side.

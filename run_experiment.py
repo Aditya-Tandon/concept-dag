@@ -78,6 +78,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--consolidate_every", type=int, default=0,
                         help="[3a-kan] run the consolidation (reduction) pass every K tasks (0 = only "
                              "at the end)")
+    parser.add_argument("--merge_trigger", type=str, default="cca", choices=["cca", "cka"],
+                        help="[5ds-kan/3a-kan/ctrl] which redundancy statistic DECIDES a merge "
+                             "candidate: 'cca' (default, published) = mean top-k canonical "
+                             "correlation >= --functional_threshold; 'cka' = linear CKA >= "
+                             "--merge_cka_threshold (the merge pre-filter arm). Both statistics "
+                             "are recorded on every merge op record either way, so a cca-mode run "
+                             "is what calibrates the CKA threshold.")
+    parser.add_argument("--merge_cka_threshold", type=float, default=0.55,
+                        help="[--merge_trigger cka] linear CKA a candidate pair must reach before "
+                             "it is handed to distill_merge.")
     parser.add_argument("--device",   type=str,   default="auto",
                         help="Device: 'cpu', 'cuda', 'mps', or 'auto'")
     parser.add_argument("--epochs",   type=int,   default=30,
@@ -136,8 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "(1 + T) patch-token set, then the same MLP (module-family-ablation "
                              "arm C). 'attn_pool' switches the whole data path to token mode: the "
                              "feature cache stores (N, 1 + T, 384) fp16, the gate's raw-root grow "
-                             "probe and the oracle grow rung use the same family, and the update "
-                             "rung and --dump_gate_tensors are unavailable.")
+                             "probe and the oracle grow rung use the same family, "
+                             "--dump_gate_tensors writes a bounded token dump (see "
+                             "--dump_max_per_split) and the update rung is unavailable.")
     parser.add_argument("--token_pool", type=int, default=2,
                         help="[--root_family attn_pool] average-pool factor on DINOv2's 16x16 patch "
                              "grid: 1 -> 256 tokens, 2 -> 64 (default, the ablation's best), 4 -> 16. "
@@ -199,6 +210,18 @@ def build_parser() -> argparse.ArgumentParser:
                              "rungs' predictors and record test accuracy")
     parser.add_argument("--dump_gate_tensors", action="store_true",
                         help="[5ds-kan/3a-kan/ctrl] write gate_dump.pt (feature mode only)")
+    parser.add_argument("--dump_max_per_split", type=int, default=1024,
+                        help="[--dump_gate_tensors, token mode] examples per split the dump keeps "
+                             "(the FIRST n in loader order; train and test only, val is omitted). "
+                             "A split SHORTER than this is dumped whole, and the default is above "
+                             "--always_n_max (1000) so every data-poor gated position the "
+                             "provisional hypothesis is about is dumped COMPLETE. A (1 + T, D) "
+                             "token set is ~100 kB an image, so the CLS dump's 'every split in "
+                             "full' would be tens of GB.")
+    parser.add_argument("--dump_max_bytes", type=float, default=2e9,
+                        help="[--dump_gate_tensors] refuse to write a gate_dump.pt whose tensor "
+                             "payload is estimated above this many bytes (the run still finishes "
+                             "and its results JSON is still written)")
     parser.add_argument("--enable_update", action="store_true",
                         help="[5ds-kan/3a-kan/ctrl] enable the update rung (refinement placement)")
     parser.add_argument("--update_lr", type=float, default=1e-4,
@@ -245,9 +268,30 @@ def build_parser() -> argparse.ArgumentParser:
                         help="[provisional] tasks after which a still-flagged provisional root is "
                              "frozen (crystallised) unresolved, so no provisional root can survive "
                              "a run indefinitely (P6/P9: every root must end resolved as merge or "
-                             "timeout).")
+                             "timeout). 0 means NEVER time out — only a merge, or the end of the "
+                             "stream, resolves a root; that is the control arm for whether the "
+                             "timeout does any work.")
     return parser
 
+
+
+def write_public_results_json(results: dict, out_path: str) -> dict:
+    """Write `results` minus its private (leading-underscore) keys, atomically.
+
+    Private keys are in-memory only — e.g. the label tensors a --dump_gate_tensors run keeps in
+    results["_gate_cache_y"] — and are not JSON-serialisable; run_exp3a_kan never writes them.
+    The CTrL branch re-serialises the whole dict after appending the ground truth, and doing so
+    with the private keys present truncated every dumped CTrL results file mid-write (H9,
+    2026-09-24). Writing to a temp file and renaming means a failed write can never leave a
+    truncated results JSON behind. Returns the dict that was written.
+    """
+    import json
+    public = {k: v for k, v in results.items() if not str(k).startswith("_")}
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(public, f, indent=2)
+    os.replace(tmp_path, out_path)
+    return public
 
 def main():
     args = build_parser().parse_args()
@@ -273,17 +317,8 @@ def main():
             f"computes the third gate state runs the three-way reuse/search/grow ladder, and "
             f"without it there is nothing for --provisional to act on."
         )
-    if args.provisional != "off" and device.startswith("mps"):
-        # The shadow refit restores every RNG it can (concept_dag/utils/rng.py), but torch's MPS
-        # generator state does not carry the philox offset, so `set_rng_state` cannot put an
-        # advanced MPS stream back. On MPS the `shadow` arm is therefore NOT a strict null and
-        # P0b cannot be certified — fine for a smoke run, not for a recorded arm.
-        warnings.warn(
-            "--provisional on MPS: the MPS generator cannot be forked (its rng_state omits the "
-            "philox offset), so the shadow refit perturbs later dropout masks and the arm is not "
-            "a null. Use cuda or cpu for any run whose numbers are recorded.",
-            RuntimeWarning, stacklevel=2,
-        )
+    # (The `--provisional` + MPS refusal lives in `run_exp3a_kan` now, so it covers every caller
+    # of the experiment and not just this CLI — PR #8 review, should-fix 6.)
 
     # Token-mode preconditions, checked before anything expensive is built.
     token_mode = (args.root_family == "attn_pool")
@@ -491,6 +526,11 @@ def main():
             provisional = args.provisional,
             provisional_alpha = args.provisional_alpha,
             provisional_z = args.provisional_z,
+            dump_max_per_split = args.dump_max_per_split,
+            dump_max_bytes = args.dump_max_bytes,
+            token_pool  = (args.token_pool if token_mode else None),
+            merge_trigger = args.merge_trigger,
+            merge_cka_threshold = args.merge_cka_threshold,
             always_n_max = args.always_n_max,
             crystallise_after = args.crystallise_after,
         )
@@ -560,6 +600,11 @@ def main():
             provisional = args.provisional,
             provisional_alpha = args.provisional_alpha,
             provisional_z = args.provisional_z,
+            dump_max_per_split = args.dump_max_per_split,
+            dump_max_bytes = args.dump_max_bytes,
+            token_pool  = (args.token_pool if token_mode else None),
+            merge_trigger = args.merge_trigger,
+            merge_cka_threshold = args.merge_cka_threshold,
             always_n_max = args.always_n_max,
             crystallise_after = args.crystallise_after,
         )
@@ -571,8 +616,12 @@ def main():
         results["ctrl_n_test"] = args.ctrl_n_test
         import json
         out_path = os.path.join(cfg.results_dir, "exp3a_kan_results.json")
-        with open(out_path, "w") as f:
-            json.dump(results, f, indent=2)
+        # Private keys (leading underscore, e.g. the label tensors a --dump_gate_tensors run keeps
+        # in results["_gate_cache_y"]) are in-memory only: they are not JSON-serialisable and
+        # run_exp3a_kan never writes them. Serialising them here truncated every dumped CTrL
+        # results file mid-write (H9, 2026-09-24). Write to a temp file and rename so a failed
+        # write can never leave a truncated results JSON behind.
+        write_public_results_json(results, out_path)
         print(f"[ctrl] ground-truth relations appended to {out_path}")
 
     elif args.exp in ("3a", "3b"):

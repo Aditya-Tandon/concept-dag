@@ -311,25 +311,159 @@ def test_token_feature_cache_stays_half_in_memory_but_yields_identical_floats(tm
 
 
 # ===========================================================================
-# 6 / 7. --dump_gate_tensors: disabled (loudly) in token mode, unaffected in CLS mode
+# 6 / 7. --dump_gate_tensors: a bounded TOKEN dump, and the CLS dump untouched
 # ===========================================================================
+#
+# The token dump used to be refused outright: the CLS dump keeps every split of every task in
+# full, and a (1 + T, D) token set is ~100 kB an image — tens of GB on a 5-Datasets stream. It now
+# keeps a bounded PREFIX of train and test in fp16, plus the two things the CLS dump structurally
+# cannot carry in token mode: each ROOT's full state (`nodes` holds concept modules only, so the
+# AttentionPool the family ablation is about was missing entirely) and a snapshot of every root as
+# it was MINTED, since consolidation merges roots away and the end-of-run list cannot answer
+# "what did task t mint?" for one that was dropped.
 
 
-def test_dump_gate_tensors_is_disabled_in_token_mode(tmp_path, capsys):
+def _token_dump_cfg(tmp_path, feature_dim, n_tokens, **kw):
+    return KanExpConfig(
+        backbone="dinov2_vits14", feature_dim=feature_dim, n_tokens=n_tokens, token_pool=2,
+        root_family="attn_pool", concept_dim=16, root_epochs=2, child_epochs=2, gate_epochs=2,
+        n_parents=1, routing_batches=2, gate_cache_max=128, batch_size=16,
+        # `raw_grow_probe` makes an organic grow mint a ROOT, so the stream has more than the
+        # task-0 root for `roots`/`roots_at_mint` to be a non-trivial assertion.
+        raw_grow_probe=True, dump_gate_tensors=True, log_every=1000, device="cpu",
+        results_dir=str(tmp_path), **kw)
+
+
+def test_token_mode_dump_is_written_and_bounded(tmp_path):
+    feature_dim, n_tokens, n_max = 24, 7, 8
+    tasks = _make_synthetic_token_tasks(n_tasks=3, n_classes=4, feature_dim=feature_dim,
+                                        n_tokens=n_tokens, n_per_class=48, batch_size=16, seed=1)
+    cfg = _token_dump_cfg(tmp_path, feature_dim, n_tokens, dump_max_per_split=n_max)
+    results = run_exp3a_kan(cfg, tasks)
+
+    path = os.path.join(str(tmp_path), "gate_dump.pt")
+    assert os.path.exists(path)
+    dump = torch.load(path)
+
+    assert dump["mode"] == "token"
+    assert dump["token_pool"] == 2
+    assert dump["meta"]["val_omitted"] is True and dump["meta"]["splits"] == ["train", "test"]
+    assert dump["meta"]["max_per_split"] == n_max
+
+    for entry in dump["tasks"]:
+        assert set(entry) == {"task", "n_classes", "ctrl", "train_raw", "train_y",
+                              "test_raw", "test_y"}, "val must not be dumped in token mode"
+        for split in ("train", "test"):
+            raw, y = entry[f"{split}_raw"], entry[f"{split}_y"]
+            assert raw.dtype == torch.float16
+            assert raw.shape == (n_max, n_tokens, feature_dim)
+            assert y.shape == (n_max,) and y.dtype == torch.int64
+
+    # Every root's FULL state (AttentionPool included), not just its concept module.
+    n_roots = sum(1 for n in dump["nodes"] if n["is_root"])
+    assert len(dump["roots"]) == n_roots
+    assert any(k.startswith("root_pool.") for k in dump["roots"][0]["state_dict"])
+
+    # One mint snapshot per root the run minted. Under `raw_grow_probe` every grow is a root,
+    # so that is the grow count — and it must be at least 2, or the assertion is vacuous.
+    n_minted = sum(1 for d in results["decisions"] if d["decision"] == "grow")
+    assert n_minted >= 2
+    assert len(dump["roots_at_mint"]) == n_minted
+    for snap in dump["roots_at_mint"]:
+        assert set(snap) == {"task_id", "node_id", "state_dict", "predictor_kind",
+                             "head_state", "composer_kind", "composer_state"}
+        assert all(v.dtype == torch.float32 for v in snap["state_dict"].values())
+        assert any(k.startswith("root_pool.") for k in snap["state_dict"])
+        # The reader that read this root at mint — what re-scoring a DROPPED root's task needs.
+        assert snap["predictor_kind"] == "grow"
+        assert snap["head_state"] and all(v.dtype == torch.float32
+                                          for v in snap["head_state"].values())
+        assert snap["composer_kind"] is None and snap["composer_state"] is None
+    assert set(dump["meta"]["roots_at_mint_keys"]) == set(dump["roots_at_mint"][0])
+    assert [s["task_id"] for s in dump["roots_at_mint"]] == sorted(
+        s["task_id"] for s in dump["roots_at_mint"]), "snapshots must be in mint order"
+
+
+def test_a_split_shorter_than_the_cap_is_dumped_whole(tmp_path):
+    """The data-poor positions the provisional hypothesis is about must be dumped COMPLETE."""
+    feature_dim, n_tokens, n_per_class = 24, 7, 25       # 4 x 25 = 100, 20 % test = 20 rows
+    tasks = _make_synthetic_token_tasks(n_tasks=2, n_classes=4, feature_dim=feature_dim,
+                                        n_tokens=n_tokens, n_per_class=n_per_class,
+                                        batch_size=16, seed=5)
+    cfg = _token_dump_cfg(tmp_path, feature_dim, n_tokens)   # default cap, far above the task
+    assert cfg.dump_max_per_split == 1024
+    run_exp3a_kan(cfg, tasks)
+
+    dump = torch.load(os.path.join(str(tmp_path), "gate_dump.pt"))
+    for entry, task in zip(dump["tasks"], tasks):
+        assert entry["train_raw"].shape[0] == len(task["train"].dataset)
+        assert entry["test_raw"].shape[0] == len(task["test"].dataset)
+
+
+def test_token_dump_prefix_is_deterministic_and_matches_loader_order(tmp_path):
+    """The prefix is a prefix, not a sample: two runs of the same stream dump the same rows."""
+    feature_dim, n_tokens = 24, 7
+    kw = dict(n_tasks=2, n_classes=4, feature_dim=feature_dim, n_tokens=n_tokens,
+              n_per_class=48, batch_size=16, seed=3)
+    dumps = []
+    for name in ("a", "b"):
+        d = tmp_path / name
+        run_exp3a_kan(_token_dump_cfg(d, feature_dim, n_tokens, dump_max_per_split=8),
+                      _make_synthetic_token_tasks(**kw))
+        dumps.append(torch.load(os.path.join(str(d), "gate_dump.pt")))
+    for ea, eb in zip(dumps[0]["tasks"], dumps[1]["tasks"]):
+        assert torch.equal(ea["test_raw"], eb["test_raw"])   # test loader is unshuffled
+        assert torch.equal(ea["test_y"], eb["test_y"])
+
+
+def test_dump_size_guard_estimates_from_shapes_before_materialising(tmp_path, monkeypatch):
+    """The guard must refuse BEFORE the dump is built, or the dump it refuses OOMs first."""
+    from concept_dag.experiments import kan_exp
+
     feature_dim, n_tokens = 24, 7
     tasks = _make_synthetic_token_tasks(n_tasks=2, n_classes=4, feature_dim=feature_dim,
                                         n_tokens=n_tokens, n_per_class=48, batch_size=16, seed=1)
-    cfg = KanExpConfig(
-        backbone="dinov2_vits14", feature_dim=feature_dim, n_tokens=n_tokens,
-        root_family="attn_pool", concept_dim=16, root_epochs=2, child_epochs=2, gate_epochs=2,
-        n_parents=1, routing_batches=2, gate_cache_max=128, batch_size=16,
-        dump_gate_tensors=True, log_every=1000, device="cpu", results_dir=str(tmp_path),
-    )
+    built = []
+    real_build = kan_exp._build_gate_dump
+    monkeypatch.setattr(kan_exp, "_build_gate_dump",
+                        lambda *a, **kw: (built.append(1), real_build(*a, **kw))[1])
+
+    cfg = _token_dump_cfg(tmp_path, feature_dim, n_tokens, dump_max_per_split=8,
+                          dump_max_bytes=1.0)
     run_exp3a_kan(cfg, tasks)
+    assert not built, "the dump was materialised before the size guard could refuse it"
+
+    # The estimate itself is shape arithmetic and touches no data: 8 rows x 7 tokens x 24 dims
+    # x 2 bytes + 8 label bytes, per split, for 2 splits and 2 tasks.
+    est = kan_exp._estimate_gate_dump_bytes(cfg, tasks, token_mode=True)
+    assert est == 2 * 2 * 8 * (n_tokens * feature_dim * 2 + 8)
+
+
+def test_dump_size_estimate_uses_the_real_row_count_when_a_split_is_short(tmp_path):
+    from concept_dag.experiments import kan_exp
+
+    feature_dim, n_tokens = 24, 7
+    tasks = _make_synthetic_token_tasks(n_tasks=1, n_classes=4, feature_dim=feature_dim,
+                                        n_tokens=n_tokens, n_per_class=25, batch_size=16, seed=5)
+    cfg = _token_dump_cfg(tmp_path, feature_dim, n_tokens)      # default cap 1024, far above
+    est = kan_exp._estimate_gate_dump_bytes(cfg, tasks, token_mode=True)
+    rows = len(tasks[0]["train"].dataset) + len(tasks[0]["test"].dataset)
+    assert est == rows * (n_tokens * feature_dim * 2 + 8)
+
+
+def test_dump_size_guard_refuses_and_lets_the_run_finish(tmp_path, capsys):
+    feature_dim, n_tokens = 24, 7
+    tasks = _make_synthetic_token_tasks(n_tasks=2, n_classes=4, feature_dim=feature_dim,
+                                        n_tokens=n_tokens, n_per_class=48, batch_size=16, seed=1)
+    cfg = _token_dump_cfg(tmp_path, feature_dim, n_tokens, dump_max_per_split=8,
+                          dump_max_bytes=1.0)
+    results = run_exp3a_kan(cfg, tasks)
 
     assert not os.path.exists(os.path.join(str(tmp_path), "gate_dump.pt"))
     out = capsys.readouterr().out
-    assert "dump_gate_tensors" in out
+    assert "REFUSING to write" in out and "--dump_max_bytes" in out
+    assert results["average_accuracy"] >= 0.0          # the run itself completed
+    assert os.path.exists(os.path.join(str(tmp_path), "exp3a_kan_results.json"))
 
 
 def test_cls_mode_dump_still_written(tmp_path):
@@ -343,7 +477,16 @@ def test_cls_mode_dump_still_written(tmp_path):
     )
     run_exp3a_kan(cfg, tasks)
 
-    assert os.path.exists(os.path.join(str(tmp_path), "gate_dump.pt"))
+    path = os.path.join(str(tmp_path), "gate_dump.pt")
+    assert os.path.exists(path)
+    # The published CLS dump gains NOTHING from the token work: same keys, val still present.
+    dump = torch.load(path)
+    assert set(dump) == {"feature_mode", "concept_dim", "feature_dim", "n_parents", "seed",
+                         "config", "tasks", "nodes", "predictors", "decisions"}
+    for entry in dump["tasks"]:
+        assert set(entry) == {"task", "n_classes", "ctrl", "train_raw", "train_y",
+                              "val_raw", "val_y", "test_raw", "test_y"}
+        assert entry["train_raw"].dtype == torch.float32
 
 
 if __name__ == "__main__":
