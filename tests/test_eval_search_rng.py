@@ -73,9 +73,10 @@ def mkrun(seed, *, accs=(0.9, 0.8, 0.7, 0.6, 0.5), accs_final=None, flag=True, b
 
 def write(root, dirname, key, run):
     stream, seed = key
-    if dirname.startswith("ctrl_"):
+    base = os.path.basename(dirname)
+    if base.startswith("ctrl_"):
         p = os.path.join(root, dirname, f"seed_{seed}", f"exp_ctrl_{stream}")
-    elif dirname.startswith("int_"):
+    elif base.startswith("int_"):
         p = os.path.join(root, dirname, f"seed_{seed}", "exp_ctrl_s_interleave")
     else:
         p = os.path.join(root, dirname, f"seed_{seed}", "exp5ds_kan")
@@ -101,7 +102,8 @@ def build_world(ev, tmp_path, *, new_l_grow=1.5, pytest_outcome="PASSED", mutate
         for key in keys:
             # evalue is better than off AFTER consolidation only: before any deferral the two
             # arms share every draw, so `test_accs` must be identical (V5a).
-            shift = 0.01 if "evalue" in d else 0.0
+            tied = key[1] in (42, 44) or key == ("s_plus", 43)
+            shift = 0.01 if ("evalue" in d and not (d == "ctrl_evalue" and tied)) else 0.0
             o = mkrun(key[1], accs=acc_for(key), accs_final=acc_for(key, shift=shift),
                       flag=False, base=None)
             for arch, od in ev.COUNTERPART[d][:1]:
@@ -117,7 +119,7 @@ def build_world(ev, tmp_path, *, new_l_grow=1.5, pytest_outcome="PASSED", mutate
             write(new, d, key, n)
     for prim, dup, key in ev.P0A_PAIRS:
         with open(_path(new, prim, key)) as f:
-            write(new, dup, key, json.load(f))
+            write(new, DUPS[dup], key, json.load(f))
     # 5-Datasets evalue must equal off (S1's identity clause): overwrite with the off run.
     with open(_path(new, "5ds_off", (None, 42))) as f:
         write(new, "5ds_evalue", (None, 42), json.load(f))
@@ -137,10 +139,17 @@ def build_world(ev, tmp_path, *, new_l_grow=1.5, pytest_outcome="PASSED", mutate
     return str(new), str(old_attn), str(old_prov)
 
 
+DUPS = {"ctrl_off_dup": "preflight_dup/ctrl_off", "int_evalue_dup": "preflight_dup/int_evalue",
+        "5ds_off_dup": "preflight_dup/5ds_off"}
+
+
 def _path(root, d, key):
+    """`d` is a logical arm; the duplicates live under preflight_dup/ (judge change 10)."""
+    d = DUPS.get(d, d)
     st, s = key
-    sub = (f"exp_ctrl_{st}" if d.startswith("ctrl_") else
-           "exp_ctrl_s_interleave" if d.startswith("int_") else "exp5ds_kan")
+    base = os.path.basename(d)
+    sub = (f"exp_ctrl_{st}" if base.startswith("ctrl_") else
+           "exp_ctrl_s_interleave" if base.startswith("int_") else "exp5ds_kan")
     return os.path.join(root, d, f"seed_{s}", sub, "exp3a_kan_results.json")
 
 
@@ -229,7 +238,7 @@ def test_p0b_ii_an_unflagged_run_or_a_mis_threaded_base_fails(ev, tmp_path):
 def test_p0c_fails_when_a_flagged_run_reproduces_the_archive(ev, tmp_path):
     new, oa, op = build_world(ev, tmp_path, new_l_grow=1.0)     # new == old on every value
     g = ev.gate_p0c(*load(ev, new, oa, op))
-    assert g["verdict"] == "fail" and len(g["failures"]) == 8
+    assert g["verdict"] == "fail" and len(g["failures"]) == 9
 
 
 def test_p0c_is_cross_archive_so_new_only_fields_do_not_count_as_a_difference(ev, tmp_path):
@@ -260,25 +269,40 @@ def test_s1_passes_when_every_sign_holds(ev, tmp_path):
 
 
 def test_s1_v2a_a_flipped_improvement_breaks_and_an_archived_zero_is_tied(ev, tmp_path):
-    key = ("s_minus", 45)
-
-    def flip(new, prov, attn):
+    def flip(key):
         # sweep: evalue now WORSE than off at t3 for this run
-        edit(new, "ctrl_evalue", key, lambda r: r["test_accs_final"].__setitem__(3, 0.2))
+        return lambda new, p, a: edit(new, "ctrl_evalue", key,
+                                      lambda r: r["test_accs_final"].__setitem__(3, 0.2))
 
-    s1 = ev.stage_s1(*load(ev, *build_world(ev, tmp_path, mutate=flip)))
+    s1 = ev.stage_s1(*load(ev, *build_world(ev, tmp_path, mutate=flip(("s_minus", 45)))))
     v2a = s1["clauses"]["V2a"]
     assert v2a["verdict"] == "fail" and v2a["failures"][0]["label"] == "s_minus/45"
     assert s1["verdict"] == "fail"
 
-    def tie(new, prov, attn):
-        edit(prov, "ctrl_evalue", key, lambda r: r["test_accs_final"].__setitem__(
-            3, json.load(open(_path(prov, "ctrl_off", key)))["test_accs_final"][3]))
-        flip(new, prov, attn)
-
-    s1 = ev.stage_s1(*load(ev, *build_world(ev, tmp_path / "t", mutate=tie)))
-    row = next(r for r in s1["clauses"]["V2a"]["rows"] if r["label"] == "s_minus/45")
+    # seed 44 is an archived exact 0: reported TIED, never tested
+    s1 = ev.stage_s1(*load(ev, *build_world(ev, tmp_path / "t", mutate=flip(("s_minus", 44)))))
+    row = next(r for r in s1["clauses"]["V2a"]["rows"] if r["label"] == "s_minus/44")
     assert row["status"] == "TIED" and s1["clauses"]["V2a"]["verdict"] == "pass"
+    assert s1["clauses"]["V2a"]["n_got"] == 11
+
+
+def test_s1_v2a_an_archive_that_is_not_the_frozen_11_is_incomplete(ev, tmp_path):
+    def untie(new, prov, attn):
+        edit(prov, "ctrl_evalue", ("s_minus", 42),
+             lambda r: r["test_accs_final"].__setitem__(3, 0.9))
+    s1 = ev.stage_s1(*load(ev, *build_world(ev, tmp_path, mutate=untie)))
+    v2a = s1["clauses"]["V2a"]
+    assert v2a["verdict"] == "incomplete" and v2a["archive_mismatch"]["archive_only"] == [
+        "s_minus/42"]
+
+
+def test_s1_a_clause_short_of_its_pre_registered_pairs_is_incomplete(ev, tmp_path):
+    def drop(new, prov, attn):
+        os.remove(_path(new, "ctrl_evalue", ("s_out", 46)))
+    s1 = ev.stage_s1(*load(ev, *build_world(ev, tmp_path, mutate=drop)))
+    assert s1["clauses"]["V2c"]["verdict"] == "incomplete"
+    assert s1["clauses"]["V2c"]["n_got"] == 19
+    assert s1["verdict"] == "incomplete"
 
 
 def test_s1_a_sign_that_goes_to_zero_is_broken(ev):
@@ -334,28 +358,42 @@ def test_se_ratio_is_undefined_below_two_seeds(ev):
     assert ev.se_ratio({42: 1.0}, {42: 2.0}, 2000)["defined"] is False
 
 
-def _metric(primary, ratio, ci):
-    return {"primary": primary, "ratio": {"defined": ratio is not None, "ratio": ratio,
-                                          "ci_contains_1": ci}}
+def _metric(primary, ci, ratio=1.0):
+    return {"metric": "m", "primary": primary,
+            "ratio": {"defined": ci is not None, "ratio": ratio,
+                      "bootstrap": {"ci95": ci} if ci is not None else {}}}
 
 
-@pytest.mark.parametrize("ratios, outcome", [
-    ([(1.0, True)] * 7, "SE-UNCHANGED"),
-    ([(1.3, True)] + [(1.1, True)] * 4 + [(0.9, True)] * 2, "SE-WIDENS"),
-    ([(1.3, False)] + [(1.1, False)] * 3 + [(0.9, False)] * 3, "SE-MIXED"),   # only 3 of 6 up
-    ([(0.9, False)] + [(1.5, False)] * 6, "SE-MIXED"),                        # primary not up
-    ([(1.0, True)] * 6 + [(None, False)], "SE-MIXED"),       # UNCHANGED needs all 7 defined
+WIN, WIDE, UP, DOWN = [0.85, 1.2], [0.5, 2.0], [1.1, 1.9], [0.4, 0.9]
+
+
+@pytest.mark.parametrize("primary, secondaries, outcome", [
+    (UP, [WIDE] * 6, "SE-WIDENS"),
+    (DOWN, [WIDE] * 6, "SE-NARROWS"),
+    (WIN, [UP] + [WIDE] * 5, "SE-MIXED"),        # stream-dependent: powered flat, one resolved
+    (WIN, [DOWN] + [WIDE] * 5, "SE-MIXED"),
+    (WIN, [WIDE] * 6, "SE-UNCHANGED"),
+    (WIDE, [UP] * 6, "SE-UNRESOLVED"),           # the powered interval is not inside the window
+    (None, [UP] * 6, "SE-UNRESOLVED"),
+    ([0.8, 1.3], [WIDE] * 6, "SE-UNRESOLVED"),   # straddles 1 but leaves the window
 ])
-def test_s2_decision_tree(ev, ratios, outcome):
-    ms = [_metric(i == 0, r, c) for i, (r, c) in enumerate(ratios)]
+def test_s2_decision_tree_is_on_intervals_only(ev, primary, secondaries, outcome):
+    ms = [_metric(True, primary)] + [_metric(False, c) for c in secondaries]
     assert ev.classify_s2(ms)["outcome"] == outcome
 
 
-def test_s2_undefined_secondaries_leave_the_4_of_6_count_with_its_denominator(ev):
-    ms = ([_metric(True, 1.2, True)] + [_metric(False, 1.1, True)] * 4
-          + [_metric(False, None, False)] * 2)
+def test_s2_point_ratios_alone_never_resolve_anything(ev):
+    """At n = 3..5 a point ratio above 1 is a coin flip; only an interval resolves a metric."""
+    ms = [_metric(True, WIN, ratio=1.2)] + [_metric(False, WIDE, ratio=3.0)] * 6
     c = ev.classify_s2(ms)
-    assert c["outcome"] == "SE-WIDENS" and c["n_secondary_defined"] == 4
+    assert c["outcome"] == "SE-UNCHANGED" and c["resolved_secondaries"] == []
+
+
+def test_s2_transports_a_factor_only_when_the_interval_excludes_1(ev):
+    ms = [_metric(True, WIN), _metric(False, UP, ratio=1.5), _metric(False, WIDE, ratio=1.5)]
+    ev.classify_s2(ms)
+    assert ms[1]["transport"] == {"kind": "factor", "factor": 1.5, "ci95": UP}
+    assert ms[2]["transport"]["kind"] == "interval"
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +444,8 @@ def test_s3_a_flip_is_named_with_its_direction(ev):
 
 def test_s3_not_run_is_not_computed_not_a_flip(ev):
     s3 = ev.stage_s3(_attn(R1b="not-run"), _prov(), _attn(), _prov(), CENSUS)
-    assert s3["verdict"] == "pass" and "adoption R1b" in s3["not_computed"]
+    assert not s3["flipped"] and "adoption R1b" in s3["not_computed"]
+    assert s3["verdict"] == "incomplete"      # a re-evaluable gate may not be quietly absent
 
 
 def test_s3_census_counts_decision_changes(ev, tmp_path):
@@ -429,32 +468,53 @@ def G(**v):
     out.setdefault("S1", {"verdict": "pass"})["clause_verdicts"] = {"V2a": v.get("S1", "pass")}
     out.setdefault("S3", {"verdict": "pass"})["flipped"] = [{"gate": "adoption R2b",
                                                              "direction": "fail -> pass"}]
+    out["S3"].setdefault("not_computed", [])
     return out
 
 
-ALL_PASS = dict(P0a="pass", P0b="pass", P0c="pass", S1="pass", S2="pass", S3="pass")
+ALL_PASS = dict(Completeness="pass", P0a="pass", P0b="pass", P0c="pass", P0d="pass",
+                S1="pass", S2="pass", S3="pass")
 
 
 @pytest.mark.parametrize("over, s2, branch", [
     (dict(P0c="fail", P0a="fail"), "SE-MIXED", "FLAG-INERT"),       # FLAG-INERT outranks all
     (dict(P0b="fail"), "SE-MIXED", "IDENTITY-BROKEN"),
+    (dict(P0d="fail"), "SE-MIXED", "IDENTITY-BROKEN"),
     (dict(P0a="fail", S3="fail"), "SE-MIXED", "IDENTITY-BROKEN"),
+    (dict(Completeness="incomplete"), "SE-MIXED", "INCOMPLETE"),
+    (dict(P0b="incomplete", S3="fail"), "SE-MIXED", "INCOMPLETE"),  # before VERDICT-FLIPS
+    (dict(S1="incomplete"), "SE-MIXED", "INCOMPLETE"),
     (dict(S3="fail", S1="fail"), "SE-MIXED", "VERDICT-FLIPS"),
     (dict(S1="fail"), "SE-MIXED", "SIGNS-BREAK"),
     ({}, "SE-WIDENS", "SIGNS-HOLD-SE-WIDENS"),
+    ({}, "SE-NARROWS", "SIGNS-HOLD-SE-NARROWS"),
     ({}, "SE-MIXED", "SIGNS-HOLD-SE-MIXED"),
     ({}, "SE-UNCHANGED", "SIGNS-HOLD-SE-UNCHANGED"),
+    ({}, "SE-UNRESOLVED", "SIGNS-HOLD-SE-UNRESOLVED"),
     (dict(S2="not-run"), "SE-MIXED", "UNMATCHED-COMBINATION"),
-    (dict(P0b="incomplete", S3="fail"), "SE-MIXED", "UNMATCHED-COMBINATION"),
-    (dict(S1="incomplete"), "SE-MIXED", "UNMATCHED-COMBINATION"),
+    (dict(S3="not-run"), "SE-MIXED", "UNMATCHED-COMBINATION"),
 ])
 def test_branch_chain(ev, over, s2, branch):
     g = G(**{**ALL_PASS, **over})
     g["S2"]["outcome"] = s2
     b = ev.determine_branch(g)
     assert b["branch"] == branch, b
+    assert b["gate_verdict"] in ("accepted", "rejected", "inconclusive") and b["action"]
     if branch == "UNMATCHED-COMBINATION":
         assert "not passing" in b["reason"]
+
+
+def test_s3_not_computed_routes_to_incomplete(ev):
+    g = G(**ALL_PASS)
+    g["S2"]["outcome"] = "SE-MIXED"
+    g["S3"]["not_computed"] = ["adoption R1b"]
+    assert ev.determine_branch(g)["branch"] == "INCOMPLETE"
+
+
+def test_every_branch_has_a_gate_record(ev):
+    names = set(ev.S2_BRANCH.values()) | {"FLAG-INERT", "IDENTITY-BROKEN", "INCOMPLETE",
+                                          "VERDICT-FLIPS", "SIGNS-BREAK", "UNMATCHED-COMBINATION"}
+    assert names == set(ev.BRANCH_RECORD)
 
 
 def _s3_files(tmp_path, new_attn=None, new_prov=None):

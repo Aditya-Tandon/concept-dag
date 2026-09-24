@@ -16,23 +16,31 @@ Stages
            fork (i: the CUDA unit test RAN and PASSED on the pod, read from the pasted pytest
            output in the progress log; ii: every run carries `search_device_rng_fix: true` and
            every gated decision's `cand_seed_base == seed*1000 + t`); P0c the flag does something
-           (each of the 8 pre-flight runs differs from its archived counterpart).
-  --signs  S1: the within-seed paired comparisons keep their signs (V2a on its archived-non-zero
-           runs, V2c, V5a, V5b, V0b, the 5-Datasets evalue/off identity, R1b's absolute bars).
+           (each of the 9 pre-flight runs — at full evaluation, EVERY run — differs from its
+           archived counterpart); P0d 5-Datasets 42 `shadow` bit-identical to 42 `off`.
+  --signs  S1: the within-seed paired comparisons keep their signs (V2a on its 11 frozen
+           archived-non-zero runs, V2c, V5a, V5b, V0b, the 5-Datasets evalue/off identity, R1b's
+           absolute bars), each against its pre-registered pair count.
   --se     S2: seed-level SE old vs new on the same seeds, with a paired seed-label bootstrap
-           interval on SE_new / SE_old, and the note's ordered decision tree.
+           interval on SE_new / SE_old, and the ordered tree on INTERVALS (judge change 3).
   --s3     S3: the re-run `eval_attn_root.py` / `eval_provisional_v2.py` gate JSONs read at the
            note's named paths against the archived ones, plus the decision-flip census.
-  With no stage flag, all four run. The branch is named only when all four ran.
+  With no stage flag, all four run, plus the 114-run completeness check; every gate is computed
+  and reported, and only then is the chain applied. The branch is named only when all four ran.
+
+Branch chain (first match wins; each branch carries its gate_verdict, status and action)
+---------------------------------------------------------------------------------------
+  FLAG-INERT -> IDENTITY-BROKEN -> INCOMPLETE -> VERDICT-FLIPS -> SIGNS-BREAK ->
+  SIGNS-HOLD-SE-{WIDENS, NARROWS, MIXED, UNCHANGED, UNRESOLVED}; UNMATCHED-COMBINATION otherwise,
+  which after INCOMPLETE is reachable only when a stage was not computed at all (`not-run`).
 
 Layout expected under --new (the sweep root, `results_rng/` on the pod)
 -----------------------------------------------------------------------
-    ctrl_<arm>/seed_<S>/exp_ctrl_<stream>/exp3a_kan_results.json   arm in off, evalue, shadow,
-                                                                   cls_off, off_dup
-    int_<arm>/seed_<S>/exp_ctrl_s_interleave/exp3a_kan_results.json  off, evalue, shadow,
-                                                                   evalue_dup
-    5ds_<arm>/seed_<S>/exp5ds_kan/exp3a_kan_results.json            off, shadow, evalue,
-                                                                   cls_off, off_dup
+    ctrl_<arm>/seed_<S>/exp_ctrl_<stream>/exp3a_kan_results.json   off, evalue, shadow, cls_off
+    int_<arm>/seed_<S>/exp_ctrl_s_interleave/exp3a_kan_results.json  off, evalue, shadow
+    5ds_<arm>/seed_<S>/exp5ds_kan/exp3a_kan_results.json            off, shadow, evalue, cls_off
+    preflight_dup/{ctrl_off,int_evalue,5ds_off}/...                P0a's duplicates, OUTSIDE
+                                                                   every evaluator's arm glob
     progress_rng*.log                                              (P0b(i): the pytest output)
 
 Usage
@@ -51,19 +59,16 @@ Ambiguities resolved while implementing (conservative readings, reasoned at each
   * **"R1b's absolute threshold"** is read as both of R1b's bars, per (seed) and per (seed,
     non-SVHN task): the attention arm's AA against 0.9113, and its per-task delta vs the
     `mlp_cls` arm at the same seed against -0.01. Each is a signed margin whose sign must hold.
-  * **S2 SE-UNCHANGED needs all 7 ratios defined.** "all 7 ratios" cannot hold with one missing;
-    such a sweep falls through to SE-WIDENS / SE-MIXED, whose 4-of-6 count excludes the
-    undefined metric and reports the denominator, as the note says.
+  * **"CTrL t3 accuracy"** is `test_accs_final[3]` — the accuracy on task 3 (SVHN, the
+    `--ctrl_middles` third middle) after the run's last consolidation; the 5-Datasets "SVHN root
+    accuracy" is R1a's own observable, `test_accs[3]`.
   * **The bootstrap is exhaustive when n^n <= --bootstrap** (the note: "at n = 3 only 27
-    distinct resamples exist and the interval is reported as such"); a resample whose OLD SE is
-    0 (every label the same seed) has no ratio and is counted in `n_undefined`, not dropped
-    silently.
+    distinct resamples exist and the interval is reported as such"); the interval is the 95 %
+    percentile interval, and a resample whose OLD SE is 0 (every label the same seed) has no
+    ratio and is counted in `n_undefined` — 3 of 27 at n = 3.
   * **An incomplete gate is not a failed gate.** A gate whose pre-registered inputs are missing
     is `incomplete` (mirrors H9's `_identity_gate`, except that a gate that is short AND already
-    mismatching stays `fail`). The chain treats `incomplete` / `not-run` as unmatched, so it
-    emits UNMATCHED-COMBINATION rather than naming a branch on evidence it does not have.
-  * **VERDICT-FLIPS and every later branch require P0 to have passed.** The note's chain is
-    first-match; a sweep whose P0 is incomplete must not be read past P0.
+    mismatching stays `fail`), and routes the chain to INCOMPLETE.
 """
 
 from __future__ import annotations
@@ -95,7 +100,6 @@ FDS_SEEDS = (42, 43, 44)
 
 # --- thresholds, verbatim from the note (and, for R1b, from eval_attn_root.py) ---------------
 S2_UNCHANGED_LO, S2_UNCHANGED_HI = 0.8, 1.25   # (1) SE-UNCHANGED point-ratio window
-S2_WIDENS_MIN_SECONDARY = 4                   # (2) SE-WIDENS: >= 4 of the 6 secondaries > 1
 S2_CI = (0.025, 0.975)
 R1B_AA_THRESHOLD = 0.9113                     # eval_attn_root.R1B_AA_THRESHOLD
 R1B_TASK_TOL = 0.01                           # eval_attn_root.R1B_TASK_TOL
@@ -131,12 +135,42 @@ RUN_TABLE: Dict[str, Set[KEY]] = {
 }
 RUN_TABLE_SIZE = 114
 
-#: Stage 0: the 8 pre-flight runs, as (dir, key). Five belong to the sweep table, three are dups.
+#: Where each logical arm lives under the sweep root. The duplicates are written OUTSIDE every
+#: evaluator's `ctrl_<arm>/` / `int_<arm>/` / `5ds_<arm>/` glob (judge change 10), so no evaluator
+#: can double-count or pair them; the first copy, in the arm directory, is canonical.
+DUP_DIR = "preflight_dup"
+ARM_PATH: Dict[str, str] = {d: (os.path.join(DUP_DIR, d[:-len("_dup")]) if d.endswith("_dup")
+                                else d) for d in RUN_TABLE}
+
+#: Stage 0: the 9 pre-flight runs, as (dir, key). Six belong to the sweep table, three are dups.
+#: 5-Datasets seed 42 `shadow` is here (judge change 8, a re-sequence, count unchanged) so the
+#: pre-flight spans the shadow-refit arm — the configuration H8 failed — via P0d. The seed-43 runs
+#: are here because P0b(ii)'s `cand_seed_base == seed*1000 + t` must be seen at TWO seeds before a
+#: base constant across seeds can be ruled out from the artefacts.
 PREFLIGHT_RUNS: Tuple[Tuple[str, KEY], ...] = (
     ("5ds_off", (None, 42)), ("5ds_off_dup", (None, 42)), ("5ds_off", (None, 43)),
+    ("5ds_shadow", (None, 42)),
     ("int_evalue", (INT_STREAM, 42)), ("int_evalue_dup", (INT_STREAM, 42)),
     ("ctrl_off", ("s_plus", 42)), ("ctrl_off_dup", ("s_plus", 42)), ("ctrl_off", ("s_plus", 43)),
 )
+#: P0d: the one shadow/off pair in stage 0 (5-Datasets 42, a 16,384-row cache).
+P0D_PAIR: Tuple[str, str, KEY] = ("5ds_off", "5ds_shadow", (None, 42))
+
+#: V2a's archived-non-zero runs, frozen (judge change 7: the note's parenthetical did not add up).
+#: The archive (results_provisional_v2_2026-09-23, ctrl_off vs ctrl_evalue) has an exact-0 t3
+#: regret improvement at every stream of seeds 42 and 44 and at seed 43 `s_plus`; these 11 are
+#: the rest. S1 asserts the archive still yields exactly this set.
+V2A_NONZERO_RUNS: Tuple[str, ...] = (
+    "s_minus/43", "s_out/43", "s_in/43",
+    "s_minus/45", "s_out/45", "s_plus/45", "s_in/45",
+    "s_minus/46", "s_out/46", "s_plus/46", "s_in/46",
+)
+
+#: The pair counts each S1 clause is pre-registered to compare (judge change 1): fewer is
+#: INCOMPLETE, never a vacuous pass. V5b's count depends on which runs defer at t4, so it has
+#: none and is reported.
+S1_EXPECTED = {"V2a": 11, "V2c": 20, "V5a": 30, "V0b": 24, "5ds-evalue-identity": 1,
+               "R1b-bars": 15}
 #: P0a: (primary dir, duplicate dir, key)
 P0A_PAIRS: Tuple[Tuple[str, str, KEY], ...] = (
     ("5ds_off", "5ds_off_dup", (None, 42)),
@@ -186,7 +220,7 @@ def check_run_table() -> Dict:
     if not v0b <= off:
         problems.append(f"V0b pairs with no off partner: {sorted(map(str, v0b - off))}")
     pre = [k for k in PREFLIGHT_RUNS if k[1] not in RUN_TABLE.get(k[0], set())]
-    if pre or len(PREFLIGHT_RUNS) != 8:
+    if pre or len(PREFLIGHT_RUNS) != 9:
         problems.append(f"pre-flight runs outside the table: {pre}")
     if problems:
         raise AssertionError("; ".join(problems))
@@ -201,10 +235,12 @@ Tree = Dict[KEY, Dict]
 
 
 def load_dir(root: Optional[str], dirname: str) -> Tree:
-    """{(stream, seed): results} for one arm directory, whatever its family."""
+    """{(stream, seed): results} for one arm directory (a path relative to `root`), whatever its
+    family — the family is read from the directory's own name."""
     if not root:
         return {}
     path = os.path.join(root, dirname)
+    dirname = os.path.basename(dirname)
     if dirname.startswith("ctrl_"):
         t = h8._load_ctrl_tree(path)
         return {(st, s): r for s, streams in t.items() for st, r in streams.items()}
@@ -218,7 +254,21 @@ def load_dir(root: Optional[str], dirname: str) -> Tree:
 
 
 def load_new(root: Optional[str]) -> Dict[str, Tree]:
-    return {d: load_dir(root, d) for d in RUN_TABLE}
+    return {d: load_dir(root, ARM_PATH[d]) for d in RUN_TABLE}
+
+
+def completeness(new: Dict[str, Tree]) -> Dict:
+    """Every run of the 114-run table, present or not (judge change 1: an absent run routes the
+    chain to INCOMPLETE rather than letting a thinner sweep pass)."""
+    missing = [{"dir": ARM_PATH[d], "run": _keystr(k)} for d, ks in RUN_TABLE.items()
+               for k in sorted(ks, key=lambda k: (k[1], str(k[0]))) if new[d].get(k) is None]
+    # Runs OUTSIDE the table are reported, not dropped and not failed: P0b/P0c still read them
+    # (an extra unflagged run is still an unflagged run), but no S-stage expectation counts them.
+    unexpected = [{"dir": ARM_PATH[d], "run": _keystr(k)} for d, t in new.items()
+                  for k in sorted(set(t) - RUN_TABLE[d], key=lambda k: (k[1], str(k[0])))]
+    return {"n_expected": RUN_TABLE_SIZE, "n_present": RUN_TABLE_SIZE - len(missing),
+            "missing": missing, "unexpected": unexpected,
+            "verdict": "pass" if not missing else "incomplete"}
 
 
 def load_old(old_attn: Optional[str], old_prov: Optional[str]) -> Dict[str, Dict[str, Tree]]:
@@ -370,16 +420,25 @@ def gate_p0b(new: Dict[str, Tree], progress: Sequence[str], required: Sequence[T
     return gate
 
 
-def gate_p0c(new: Dict[str, Tree], old: Dict[str, Dict[str, Tree]]) -> Dict:
-    """Each pre-flight run must NOT reproduce its archived counterpart. Cross-archive, so the
-    note's presence rule is relaxed (`strict_presence=False`) and the two new keys, which
-    `compare_runs` never reads, are excluded by construction."""
+def all_table_runs() -> List[Tuple[str, KEY]]:
+    """Every (dir, key) of the table except the duplicates, which are P0a's business."""
+    return [(d, k) for d, ks in RUN_TABLE.items() if not d.endswith("_dup")
+            for k in sorted(ks, key=lambda k: (k[1], str(k[0])))]
+
+
+def gate_p0c(new: Dict[str, Tree], old: Dict[str, Dict[str, Tree]],
+             runs: Sequence[Tuple[str, KEY]] = PREFLIGHT_RUNS) -> Dict:
+    """Each listed run must NOT reproduce its archived counterpart — the pre-flight's 9 at stage 0,
+    and every run of the sweep at full evaluation (judge change 9: the `mlp_cls`, `shadow` and
+    `evalue` paths are otherwise never checked for flag wiring). ANY run identical to its archive
+    is FLAG-INERT. Cross-archive, so the note's presence rule is relaxed (`strict_presence=False`)
+    and the two new keys, which `compare_runs` never reads, are excluded by construction."""
     gate = {"gate": "P0c",
-            "observable": "each of the 8 pre-flight runs vs its archived (unfixed-code) counterpart",
+            "observable": f"each of {len(runs)} runs vs its archived (unfixed-code) counterpart",
             "threshold": "NOT identical — an inert flag would reproduce the archive",
             "verdict": "not-run"}
     rows, failures, missing = [], [], []
-    for d, key in PREFLIGHT_RUNS:
+    for d, key in runs:
         rn = new[d].get(key)
         ro, src = counterpart(old, d, key)
         if rn is None or ro is None:
@@ -397,6 +456,17 @@ def gate_p0c(new: Dict[str, Tree], old: Dict[str, Dict[str, Tree]]) -> Dict:
     gate["headline"] = (f"{len(rows) - len(failures)}/{len(rows)} runs differ from the archive; "
                         f"{len(failures)} reproduce it; {len(missing)} missing")
     return gate
+
+
+def gate_p0d(new: Dict[str, Tree]) -> Dict:
+    """5-Datasets seed 42 `shadow` must be bit-identical to seed 42 `off` at the sweep SHA — the
+    shadow refit must act on nothing, on the 16,384-row cache H8's P0b failed on."""
+    off_d, sh_d, key = P0D_PAIR
+    g = v2._identity_gate(
+        "P0d", "5-Datasets seed 42 shadow vs off, in stage 0 (the configuration H8 failed)",
+        [(key[1], key[0], new[off_d].get(key), new[sh_d].get(key))],
+        "arm off", "arm shadow", expected={key})
+    return _identity_status(g)
 
 
 # ---------------------------------------------------------------------------
@@ -476,18 +546,46 @@ def _r1b_margins(treat: Tree, ctrl: Tree) -> Dict:
     return out
 
 
+def _clause_n(name: str, c: Dict) -> int:
+    """The number of pairs a clause actually compared, in the unit its S1_EXPECTED count uses:
+    V2a its non-tied runs (11), V5a its off/evalue pairs, the identity clauses their compared
+    runs, V2c and R1b-bars every paired row (tied or not)."""
+    if name == "V2a":
+        return c.get("n_compared", 0)
+    if name == "V5a":
+        return c.get("n_pairs", 0)
+    if name in ("V0b", "5ds-evalue-identity"):
+        return (c.get("value") or {}).get("n_runs_compared", 0)
+    return len(c.get("rows", []))
+
+
 def stage_s1(new: Dict[str, Tree], old: Dict[str, Dict[str, Tree]]) -> Dict:
     P, A = old["prov"], old["attn"]
     clauses: Dict[str, Dict] = {}
 
     # V2a — the PRIMARY clause, on the archived-non-zero runs only (11 of 20 in the archive).
+    # Tested on the FROZEN 11 only (archived exact 0s ride along as TIED): a run outside the
+    # frozen set is never sign-tested, and an archive that does not yield the frozen set makes
+    # the clause unreadable (incomplete) rather than testing a set the note never registered.
+    old_v2a = _v2a_rows(P["ctrl_off"], P["ctrl_evalue"])
     clauses["V2a"] = _sign_clause(
-        "V2a", _v2a_rows(P["ctrl_off"], P["ctrl_evalue"]),
+        "V2a", {k: v for k, v in old_v2a.items() if k in V2A_NONZERO_RUNS or v == 0},
         _v2a_rows(new["ctrl_off"], new["ctrl_evalue"]),
         "per-run t3 regret improvement off_regret - evalue_regret (post-consolidation), paired "
-        "by (stream, seed); archived exact 0s are TIED")
-    clauses["V2a"]["n_archived_nonzero"] = clauses["V2a"]["n_compared"] + len(
-        [m for m in clauses["V2a"]["missing"] if m["old"] != 0])
+        "by (stream, seed), on the 11 frozen archived-non-zero runs; archived exact 0s are TIED")
+    nonzero = sorted(k for k, v in old_v2a.items() if v != 0)
+    clauses["V2a"]["n_archived_nonzero"] = len(nonzero)
+    clauses["V2a"]["frozen_nonzero_runs"] = list(V2A_NONZERO_RUNS)
+    if nonzero != sorted(V2A_NONZERO_RUNS):
+        # The wrong archive, or an archive that changed under the note: the restriction the note
+        # froze no longer describes it, so the clause cannot be read.
+        clauses["V2a"]["archive_mismatch"] = {
+            "archive_only": sorted(set(nonzero) - set(V2A_NONZERO_RUNS)),
+            "frozen_only": sorted(set(V2A_NONZERO_RUNS) - set(nonzero))}
+        clauses["V2a"]["missing"].append({"detail": "the archive's non-zero V2a runs are not the "
+                                                    "frozen 11"})
+        if clauses["V2a"]["verdict"] == "pass":
+            clauses["V2a"]["verdict"] = "incomplete"
 
     clauses["V2c"] = _sign_clause(
         "V2c", _v2c_rows(P["ctrl_off"], P["ctrl_evalue"]),
@@ -500,9 +598,12 @@ def stage_s1(new: Dict[str, Tree], old: Dict[str, Dict[str, Tree]]) -> Dict:
     g5_old = v2.gate_v5(_v5_pairs(P["ctrl_off"], P["ctrl_evalue"], P["int_off"], P["int_evalue"]))
     a_new = ((g5_new.get("value") or {}).get("a_non_deferred_positions") or {})
     leaks = a_new.get("before_first_deferral_violations", [])
+    v5_pairs_new = _v5_pairs(new["ctrl_off"], new["ctrl_evalue"], new["int_off"],
+                             new["int_evalue"])
     v5a = {"clause": "V5a", "observable": "per-task pre-deferral deltas on test_accs (CTrL + "
                                           "s_interleave, off vs evalue) — must stay exactly 0",
-           "n_leaks": len(leaks), "leaks": leaks}
+           "json_path": "V5.value.a_non_deferred_positions.before_first_deferral_violations",
+           "n_pairs": len(v5_pairs_new), "n_leaks": len(leaks), "leaks": leaks}
     clauses["V5a"] = _finish(v5a, leaks,
                              [] if g5_new.get("value") else [{"detail": "no off/evalue pairs"}])
 
@@ -542,6 +643,17 @@ def stage_s1(new: Dict[str, Tree], old: Dict[str, Dict[str, Tree]]) -> Dict:
         _r1b_margins(new["5ds_off"], new["5ds_cls_off"]),
         f"R1b's absolute bars as signed margins: attention-arm AA - {R1B_AA_THRESHOLD} per seed; "
         f"(attn - mlp_cls) + {R1B_TASK_TOL} per non-SVHN task per seed")
+
+    # A clause that compared fewer pairs than it is pre-registered to compare is INCOMPLETE, not a
+    # vacuous pass (judge change 1). A clause already failing stays failed.
+    for name, want in S1_EXPECTED.items():
+        c = clauses[name]
+        got = _clause_n(name, c)
+        c["n_expected"], c["n_got"] = want, got
+        if got < want and c.get("verdict") == "pass":
+            c["verdict"] = "incomplete"
+            c.setdefault("missing", []).append(
+                {"detail": f"{got} of {want} pre-registered pairs compared"})
 
     verdicts = {n: _status(c) for n, c in clauses.items()}
     stage = {"gate": "S1", "clauses": clauses, "clause_verdicts": verdicts,
@@ -685,25 +797,66 @@ def se_ratio(old_ps: Dict[int, float], new_ps: Dict[int, float], n_boot: int,
     return out
 
 
+def metric_resolution(r: Dict) -> str:
+    """A metric's SE change is RESOLVED only by its interval (judge change 3): `widens` when the
+    95 % interval lies wholly above 1, `narrows` wholly below, otherwise `unresolved` — "not
+    resolved at this n". A point ratio alone never resolves anything."""
+    ci = (r.get("bootstrap") or {}).get("ci95") if r.get("defined") else None
+    if not ci:
+        return "undefined"
+    if ci[0] > 1.0:
+        return "widens"
+    if ci[1] < 1.0:
+        return "narrows"
+    return "unresolved"
+
+
+def transport(r: Dict, resolution: str) -> Dict:
+    """What a downstream note may carry (judge change 4): a FACTOR only when the interval excludes
+    1; otherwise the interval itself, declared as unresolved."""
+    ci = (r.get("bootstrap") or {}).get("ci95")
+    if resolution in ("widens", "narrows"):
+        return {"kind": "factor", "factor": r.get("ratio"), "ci95": ci}
+    return {"kind": "interval", "ci95": ci,
+            "note": "not resolved at this n — transport the interval, not a factor"}
+
+
 def classify_s2(metrics: List[Dict]) -> Dict:
-    """The note's ordered tree, first match wins."""
-    defined = [m for m in metrics if m["ratio"]["defined"]]
+    """The ordered tree, first match wins, on INTERVALS only (judge change 3). The primary
+    (s_interleave, 10 seeds) is the only clause with power:
+      SE-WIDENS     the primary's interval lies wholly above 1;
+      SE-NARROWS    the primary's interval lies wholly below 1;
+      SE-MIXED      the primary's interval sits inside [0.8, 1.25] AND at least one secondary's
+                    interval excludes 1 — the only reading that licenses "stream-dependent";
+      SE-UNCHANGED  the primary's interval sits inside [0.8, 1.25] and no secondary is resolved;
+      SE-UNRESOLVED otherwise — not resolved at this n (e.g. a primary interval straddling 1 but
+                    wider than the window, or an undefined primary)."""
+    for m in metrics:
+        m["resolution"] = metric_resolution(m["ratio"])
+        m["transport"] = transport(m["ratio"], m["resolution"])
     primary = next((m for m in metrics if m["primary"]), None)
     secondary = [m for m in metrics if not m["primary"]]
-    sec_defined = [m for m in secondary if m["ratio"]["defined"]]
-    n_sec_up = sum(1 for m in sec_defined if m["ratio"]["ratio"] > 1)
+    resolved_sec = [m["metric"] for m in secondary if m["resolution"] in ("widens", "narrows")]
+    p_res = primary["resolution"] if primary else "undefined"
+    p_ci = (primary["ratio"].get("bootstrap") or {}).get("ci95") if primary else None
+    p_in_window = bool(p_ci and S2_UNCHANGED_LO <= p_ci[0] and p_ci[1] <= S2_UNCHANGED_HI)
 
-    unchanged = (len(defined) == len(metrics) == 7 and all(
-        m["ratio"]["ci_contains_1"]
-        and S2_UNCHANGED_LO <= m["ratio"]["ratio"] <= S2_UNCHANGED_HI for m in metrics))
-    widens = (primary is not None and primary["ratio"]["defined"]
-              and primary["ratio"]["ratio"] > 1 and n_sec_up >= S2_WIDENS_MIN_SECONDARY)
-    outcome = "SE-UNCHANGED" if unchanged else "SE-WIDENS" if widens else "SE-MIXED"
-    return {"outcome": outcome, "n_defined": len(defined),
-            "primary_ratio": primary["ratio"]["ratio"] if primary else None,
-            "n_secondary_up": n_sec_up, "n_secondary_defined": len(sec_defined),
-            "secondary_denominator_note": (f"{n_sec_up} of {len(sec_defined)} defined secondary "
-                                           f"ratios > 1 (of 6 pre-registered)")}
+    if p_res == "widens":
+        outcome = "SE-WIDENS"
+    elif p_res == "narrows":
+        outcome = "SE-NARROWS"
+    elif p_in_window and resolved_sec:
+        outcome = "SE-MIXED"
+    elif p_in_window:
+        outcome = "SE-UNCHANGED"
+    else:
+        outcome = "SE-UNRESOLVED"
+    return {"outcome": outcome,
+            "primary_ratio": primary["ratio"].get("ratio") if primary else None,
+            "primary_ci95": p_ci, "primary_resolution": p_res,
+            "primary_ci_inside_window": p_in_window,
+            "resolved_secondaries": resolved_sec,
+            "n_secondary_defined": sum(1 for m in secondary if m["resolution"] != "undefined")}
 
 
 def stage_s2(new: Dict[str, Tree], old: Dict[str, Dict[str, Tree]], n_boot: int) -> Dict:
@@ -716,8 +869,11 @@ def stage_s2(new: Dict[str, Tree], old: Dict[str, Dict[str, Tree]], n_boot: int)
     cls = classify_s2(metrics)
     verdict = "pass" if metrics and any(m["ratio"]["defined"] for m in metrics) else "not-run"
     return {"gate": "S2", "metrics": metrics, **cls, "verdict": verdict,
-            "headline": f"{cls['outcome']} (primary ratio {cls['primary_ratio']}, "
-                        f"{cls['secondary_denominator_note']})"}
+            "quantity": "the COMBINED effect of seed-dependent candidate inits and the post-gate "
+                        "device stream (e3c964d changes both; judge change 6)",
+            "headline": f"{cls['outcome']} (primary ratio {cls['primary_ratio']}, CI "
+                        f"{cls['primary_ci95']}; resolved secondaries "
+                        f"{cls['resolved_secondaries']})"}
 
 
 # ---------------------------------------------------------------------------
@@ -777,10 +933,13 @@ def _read_s3(doc: Optional[Dict], path: Sequence[str], field: str) -> Tuple[obje
 
 
 def decision_census(new: Dict[str, Tree], old: Dict[str, Dict[str, Tree]]) -> Dict:
-    """How many of the 40 CTrL (off + evalue) and 20 s_interleave runs change ANY decision vs the
-    archive, and at which task. Reported, not gated."""
+    """How many runs change ANY decision vs the archive, and at which task. Reported, not gated.
+    The note's "40 CTrL" are the attention arm's `off` + `evalue` (judge ambiguity 7); `mlp_cls`
+    and `shadow` are reported separately so they never pad that count."""
     out = {}
-    for label, dirs in (("ctrl", ("ctrl_off", "ctrl_evalue")), ("int", ("int_off", "int_evalue"))):
+    groups = (("ctrl", ("ctrl_off", "ctrl_evalue")), ("int", ("int_off", "int_evalue")),
+              ("ctrl_mlp_cls", ("ctrl_cls_off",)), ("ctrl_shadow", ("ctrl_shadow",)))
+    for label, dirs in groups:
         runs, by_task, changed = 0, {}, []
         for d in dirs:
             for key, rn in sorted(new[d].items(), key=lambda kv: (kv[0][1], str(kv[0][0]))):
@@ -831,15 +990,18 @@ def stage_s3(new_attn: Optional[Dict], new_prov: Optional[Dict], old_attn: Optio
              "adoption_R3_branch": {"old": r3o.get("r3_branch"), "new": r3n.get("r3_branch")},
              "census": census}
     computed = [r for r in rows if r["status"] != "NOT-COMPUTED"]
+    # A flip is a flip even if other gates are short; a re-evaluable gate that came back
+    # NOT-COMPUTED makes the stage INCOMPLETE (judge change 1) — every gate in S3_PATHS is one the
+    # note lists as re-evaluable on this sweep, so none may be quietly absent.
     if new_attn is None and new_prov is None:
         stage["verdict"] = "not-run"
         stage["note"] = "no re-run gate JSONs supplied (--s3-new-attn / --s3-new-prov)"
     elif flipped:
         stage["verdict"] = "fail"
-    elif computed:
-        stage["verdict"] = "pass"
-    else:
+    elif not_computed:
         stage["verdict"] = "incomplete"
+    else:
+        stage["verdict"] = "pass"
     stage["headline"] = (f"{len(computed) - len(flipped)}/{len(computed)} computed gates held, "
                          f"{len(flipped)} flipped "
                          f"({', '.join(r['gate'] + ' ' + r['direction'] for r in flipped)}), "
@@ -851,39 +1013,106 @@ def stage_s3(new_attn: Optional[Dict], new_prov: Optional[Dict], old_attn: Optio
 
 
 # ---------------------------------------------------------------------------
-# Branch precedence
+# Branch precedence, and each branch's gate record and pre-registered action (judge change 12)
 # ---------------------------------------------------------------------------
 
-S2_BRANCH = {"SE-WIDENS": "SIGNS-HOLD-SE-WIDENS", "SE-MIXED": "SIGNS-HOLD-SE-MIXED",
-             "SE-UNCHANGED": "SIGNS-HOLD-SE-UNCHANGED"}
+S2_BRANCH = {"SE-WIDENS": "SIGNS-HOLD-SE-WIDENS", "SE-NARROWS": "SIGNS-HOLD-SE-NARROWS",
+             "SE-MIXED": "SIGNS-HOLD-SE-MIXED", "SE-UNCHANGED": "SIGNS-HOLD-SE-UNCHANGED",
+             "SE-UNRESOLVED": "SIGNS-HOLD-SE-UNRESOLVED"}
+
+_HOLD = {"H10.1": "accepted", "H10.3": "accepted", "H10.4": "accepted"}
+BRANCH_RECORD: Dict[str, Dict] = {
+    "FLAG-INERT": {
+        "gate_verdict": "inconclusive", "status": "needs-review", "hypotheses": {},
+        "action": "STOP. At stage 0: stage 1 is not released. At full evaluation: the sweep is "
+                  "void. Fix the flag's wiring (a new SHA, a new tag, a new pre-flight); no "
+                  "downstream note is touched."},
+    "IDENTITY-BROKEN": {
+        "gate_verdict": "inconclusive", "status": "needs-review",
+        "hypotheses": {"H10.4": "rejected"},
+        "action": "STOP. Stage 1 is not released. Diagnose the determinism / device-fork / "
+                  "shadow-refit failure before any re-run; no downstream note is touched."},
+    "INCOMPLETE": {
+        "gate_verdict": "inconclusive", "status": "needs-review", "hypotheses": {},
+        "action": "Re-run the missing runs or re-stage the evaluators named in the reason, then "
+                  "re-evaluate. No branch below may be read and no downstream note is touched "
+                  "until the evidence is complete."},
+    "VERDICT-FLIPS": {
+        "gate_verdict": "rejected", "status": "refuted",
+        "hypotheses": {"H10.3": "rejected"},
+        "action": "Apply the note's 'What changes downstream if the branch is VERDICT-FLIPS', "
+                  "per note, for the gates named in the reason."},
+    "SIGNS-BREAK": {
+        "gate_verdict": "rejected", "status": "refuted",
+        "hypotheses": {"H10.1": "rejected", "H10.3": "accepted", "H10.4": "accepted"},
+        "action": "Every published claim resting on a broken paired sign is flagged "
+                  "needs-review in its note; the verdicts stand (S3 held)."},
+    "SIGNS-HOLD-SE-WIDENS": {
+        "gate_verdict": "accepted", "status": "validated",
+        "hypotheses": {**_HOLD, "H10.2": "accepted"},
+        "action": "Replace R3's caveat with the measured factor on the streams whose interval "
+                  "excludes 1; transport intervals, not factors, elsewhere."},
+    "SIGNS-HOLD-SE-NARROWS": {
+        "gate_verdict": "accepted", "status": "validated",
+        "hypotheses": {**_HOLD, "H10.2": "rejected"},
+        "action": "Record that the fix NARROWED the powered stream's spread (the opposite of "
+                  "H10.2); transport as for SE-WIDENS."},
+    "SIGNS-HOLD-SE-MIXED": {
+        "gate_verdict": "accepted", "status": "validated",
+        "hypotheses": {**_HOLD, "H10.2": "accepted (stream-dependent)"},
+        "action": "Narrow R3's caveat per stream: a factor where the interval excludes 1, the "
+                  "interval elsewhere."},
+    "SIGNS-HOLD-SE-UNCHANGED": {
+        "gate_verdict": "accepted", "status": "validated",
+        "hypotheses": {**_HOLD, "H10.2": "rejected"},
+        "action": "R3's caveat is retired for the powered stream; the n = 3..5 streams carry "
+                  "their intervals — SE-UNCHANGED is a statement about n, not a vindication."},
+    "SIGNS-HOLD-SE-UNRESOLVED": {
+        "gate_verdict": "accepted", "status": "validated",
+        "hypotheses": {**_HOLD, "H10.2": "inconclusive"},
+        "action": "Signs and verdicts stand; R3's caveat is kept and each archived SE carries "
+                  "this sweep's interval, not a factor. Not resolved at this n."},
+    "UNMATCHED-COMBINATION": {
+        "gate_verdict": "inconclusive", "status": "needs-review", "hypotheses": {},
+        "action": "Report the combination and the non-passing gates; the coordinator decides. "
+                  "Reached only when a stage was not computed at all (not-run: not requested, "
+                  "or its inputs could not be loaded)."},
+}
 
 
 def determine_branch(g: Dict[str, Dict]) -> Dict:
-    """FLAG-INERT -> IDENTITY-BROKEN -> VERDICT-FLIPS -> SIGNS-BREAK -> SIGNS-HOLD-SE-WIDENS ->
-    SIGNS-HOLD-SE-MIXED -> SIGNS-HOLD-SE-UNCHANGED, first match wins; anything else is
-    UNMATCHED-COMBINATION with the non-passing gates named — never a fall-through to a pass."""
+    """FLAG-INERT -> IDENTITY-BROKEN -> INCOMPLETE -> VERDICT-FLIPS -> SIGNS-BREAK ->
+    SIGNS-HOLD-SE-{WIDENS, NARROWS, MIXED, UNCHANGED, UNRESOLVED}, first match wins; anything
+    else is UNMATCHED-COMBINATION with the non-passing gates named — never a fall-through to a
+    pass. `g` may carry a `completeness` record for the 114-run table."""
     v = {k: _status(x) for k, x in g.items()}
     not_passing = sorted(k for k, s in v.items() if s != "pass")
 
     def br(name, reason):
-        return {"branch": name, "reason": reason, "verdicts": v}
+        return {"branch": name, "reason": reason, "verdicts": v, **BRANCH_RECORD[name]}
 
     if v.get("P0c") == "fail":
-        return br("FLAG-INERT", "P0c: a flagged pre-flight run reproduces the archive")
-    if v.get("P0a") == "fail" or v.get("P0b") == "fail":
-        return br("IDENTITY-BROKEN", f"P0a={v.get('P0a')}, P0b={v.get('P0b')}")
-    p0_ok = all(v.get(k) == "pass" for k in ("P0a", "P0b", "P0c"))
-    if p0_ok and v.get("S3") == "fail":
+        return br("FLAG-INERT", "P0c: a flagged run reproduces its archived counterpart")
+    if any(v.get(k) == "fail" for k in ("P0a", "P0b", "P0d")):
+        return br("IDENTITY-BROKEN",
+                  f"P0a={v.get('P0a')}, P0b={v.get('P0b')}, P0d={v.get('P0d')}")
+    short = sorted(k for k, s in v.items() if s == "incomplete")
+    s3_nc = (g.get("S3") or {}).get("not_computed") or []
+    if short or s3_nc:
+        why = f"incomplete: {short}" + (f"; S3 NOT-COMPUTED: {s3_nc}" if s3_nc else "")
+        return br("INCOMPLETE", why)
+    stages = ("P0a", "P0b", "P0c", "P0d", "S1", "S2", "S3")
+    if any(v.get(k) != "pass" and not (k in ("S1", "S3") and v.get(k) == "fail")
+           for k in stages):
+        return br("UNMATCHED-COMBINATION", f"no branch matches; not passing: {not_passing}")
+    if v["S3"] == "fail":
         flips = [f"{r['gate']} ({r['direction']})" for r in g["S3"]["flipped"]]
         return br("VERDICT-FLIPS", "S3 flipped: " + "; ".join(flips))
-    if p0_ok and v.get("S3") == "pass":
-        if v.get("S1") == "fail":
-            broken = [n for n, s in g["S1"]["clause_verdicts"].items() if s == "fail"]
-            return br("SIGNS-BREAK", f"S1 clauses broken with S3 holding: {broken}")
-        if v.get("S1") == "pass" and v.get("S2") == "pass":
-            outcome = g["S2"]["outcome"]
-            return br(S2_BRANCH[outcome], f"S1 and S3 hold; S2 = {outcome}")
-    return br("UNMATCHED-COMBINATION", f"no branch matches; not passing: {not_passing}")
+    if v["S1"] == "fail":
+        broken = [n for n, s in g["S1"]["clause_verdicts"].items() if s == "fail"]
+        return br("SIGNS-BREAK", f"S1 clauses broken with S3 holding: {broken}")
+    outcome = g["S2"]["outcome"]
+    return br(S2_BRANCH[outcome], f"S1 and S3 hold; S2 = {outcome}")
 
 
 # ---------------------------------------------------------------------------
@@ -922,10 +1151,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _print(gates: Dict[str, Dict]) -> None:
-    print(f"{'gate':5s}{'verdict':12s}headline")
+    print(f"{'gate':13s}{'verdict':12s}headline")
     print("-" * 120)
     for k, g in gates.items():
-        print(f"{k:5s}{str(g.get('verdict')):12s}{str(g.get('headline') or g.get('note'))[:100]}")
+        head = g.get("headline") or g.get("note") or (
+            f"{g.get('n_present')}/{g.get('n_expected')} runs present" if k == "Completeness"
+            else "")
+        print(f"{k:13s}{str(g.get('verdict')):12s}{str(head)[:95]}")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -940,13 +1172,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     progress = (args.progress if args.progress is not None
                 else sorted(glob.glob(os.path.join(args.new, "progress_rng*.log"))))
 
+    # Every gate is computed, reported in the note's order, and only then is the chain applied
+    # (judge change 2): VERDICT-FLIPS vs SIGNS-BREAK needs S3 even after S1 has failed.
     gates: Dict[str, Dict] = {}
+    if not preflight_only:
+        gates["Completeness"] = completeness(new)
     if "p0" in stages:
         required = (list(PREFLIGHT_RUNS) if preflight_only else
                     [(d, k) for d, ks in RUN_TABLE.items() for k in ks])
         gates["P0a"] = gate_p0a(new)
         gates["P0b"] = gate_p0b(new, progress, required)
-        gates["P0c"] = gate_p0c(new, old)
+        # stage 0: the 9 pre-flight runs; full evaluation: every run of the sweep (judge change 9)
+        gates["P0c"] = gate_p0c(new, old, PREFLIGHT_RUNS if preflight_only else all_table_runs())
+        gates["P0d"] = gate_p0d(new)
     if "signs" in stages:
         gates["S1"] = stage_s1(new, old)
     if "se" in stages:
@@ -964,14 +1202,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     out: Dict = {"run_table": table, "stages": stages, "progress_logs": progress, **gates}
     _print(gates)
-    p0 = {k: gates[k] for k in ("P0a", "P0b", "P0c") if k in gates}
+    p0 = {k: gates[k] for k in ("P0a", "P0b", "P0c", "P0d") if k in gates}
     failed = [k for k, g in p0.items() if _status(g) == "fail"]
     short = [k for k, g in p0.items() if _status(g) == "incomplete"]
-    code = 0
     if len(stages) == 4:
         branch = determine_branch(gates)
         out["branch"], out["branch_detail"] = branch["branch"], branch
-        print(f"\n=== branch: {branch['branch']} ===\n  reason: {branch['reason']}")
+        print(f"\n=== branch: {branch['branch']} (gate_verdict {branch['gate_verdict']}) ===\n"
+              f"  reason: {branch['reason']}\n  action: {branch['action']}")
     elif p0:
         out["preflight"] = {"failed_gates": failed, "incomplete_gates": short}
         if failed:
@@ -982,7 +1220,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif short:
             print(f"\n=== PREFLIGHT INCONCLUSIVE: {short} short of pre-registered inputs ===")
         else:
-            print("\n=== PREFLIGHT OK: P0a, P0b, P0c pass — stage 1 may be released on the "
+            print("\n=== PREFLIGHT OK: P0a, P0b, P0c, P0d pass — stage 1 may be released on the "
                   "coordinator's go ===")
     code = 1 if failed else 2 if short else 0
     with open(args.out, "w") as f:
