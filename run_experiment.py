@@ -274,6 +274,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+def write_public_results_json(results: dict, out_path: str) -> dict:
+    """Write `results` minus its private (leading-underscore) keys, atomically.
+
+    Private keys are in-memory only — e.g. the label tensors a --dump_gate_tensors run keeps in
+    results["_gate_cache_y"] — and are not JSON-serialisable; run_exp3a_kan never writes them.
+    The CTrL branch re-serialises the whole dict after appending the ground truth, and doing so
+    with the private keys present truncated every dumped CTrL results file mid-write (H9,
+    2026-09-24). Writing to a temp file and renaming means a failed write can never leave a
+    truncated results JSON behind. Returns the dict that was written.
+    """
+    import json
+    public = {k: v for k, v in results.items() if not str(k).startswith("_")}
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(public, f, indent=2)
+    os.replace(tmp_path, out_path)
+    return public
+
 def main():
     args = build_parser().parse_args()
 
@@ -597,8 +616,12 @@ def main():
         results["ctrl_n_test"] = args.ctrl_n_test
         import json
         out_path = os.path.join(cfg.results_dir, "exp3a_kan_results.json")
-        with open(out_path, "w") as f:
-            json.dump(results, f, indent=2)
+        # Private keys (leading underscore, e.g. the label tensors a --dump_gate_tensors run keeps
+        # in results["_gate_cache_y"]) are in-memory only: they are not JSON-serialisable and
+        # run_exp3a_kan never writes them. Serialising them here truncated every dumped CTrL
+        # results file mid-write (H9, 2026-09-24). Write to a temp file and rename so a failed
+        # write can never leave a truncated results JSON behind.
+        write_public_results_json(results, out_path)
         print(f"[ctrl] ground-truth relations appended to {out_path}")
 
     elif args.exp in ("3a", "3b"):
