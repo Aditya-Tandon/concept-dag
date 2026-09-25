@@ -234,8 +234,12 @@ def _snapshot_topology(nodes: List[DAGNode], predictors: List[TaskPredictor], ke
         "node_edges": {id(n): (list(n.parent_models),
                                list(getattr(n, "parent_adapters", None) or []),
                                n.concept_module.n_parents) for n in nodes},
+        # Every parent-reading predictor (reuse, search, update), not only reuse: a merge with
+        # `repoint_all_readers` re-points search/update edges too, and a rollback that restored
+        # only reuse edges would leave them pointing at `keep` (PR #2 review, finding 1). For the
+        # published merge, which never touches search/update edges, restoring them is a no-op.
         "pred_edges": {id(p): (list(p.parents or []), list(getattr(p, "parent_adapters", None) or []))
-                       for p in predictors if p.kind == "reuse"},
+                       for p in predictors if p.kind != "grow"},
         "grow_preds": {id(p): (p.node, p.node_adapter) for p in predictors if p.kind == "grow"},
         "keep_state": {k: v.detach().clone() for k, v in keep.concept_module.state_dict().items()},
         "keep_id": id(keep),
@@ -280,6 +284,7 @@ def consolidate_nodes(
     functional_threshold: Optional[float] = None,
     merge_trigger: str = "cca",
     merge_cka_threshold: float = 0.55,
+    merge_fixes: bool = False,
 ) -> Dict[str, object]:
     """
     One consolidation pass over the grown DAGNode list.
@@ -294,6 +299,10 @@ def consolidate_nodes(
     ``update_commit`` entry of its own and stamps ``at_task`` on all of them): the audit gate that
     covers every way a node can change after it was minted, not just the merge path's own forgetting
     check ([[post-mint-audit-gap]]).
+
+    ``merge_fixes`` (PR #2 review, findings 1 and 4; False = published): re-point search and update
+    predictors on a merge too, and decide a distilled merge on VAL accuracy, as truncation already
+    is, logging the test deltas alongside instead of selecting on them.
     """
     def pcount():
         return sum(p.numel() for n in nodes for p in n.concept_module.parameters())
@@ -438,17 +447,32 @@ def consolidate_nodes(
                     # Structural merge (safe only for near-identical subspaces); gate decides.
                     if not accept_fn(a, b, affected):
                         continue
-                    _merge_nodes(nodes, predictors, keep=a, drop=b)
-                    ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id,
-                                "similarity": sim, "sim_kind": sim_kind, "distilled": False,
-                                **sim_extra})
+                    still_read = _merge_nodes(nodes, predictors, keep=a, drop=b,
+                                              repoint_all_readers=merge_fixes)
+                    op = {"op": "merge", "keep": a.task_id, "drop": b.task_id,
+                          "similarity": sim, "sim_kind": sim_kind, "distilled": False,
+                          **sim_extra}
+                    if still_read:
+                        op["drop_still_read_by"] = still_read
+                    ops.append(op)
                     merged = True
                     break
 
                 # Distilled merge: snapshot → distill keep → tentatively apply adapted merge →
                 # forgetting check → commit or roll back (topology + keep weights).
-                base = {t: predictors[t].accuracy(tasks[t]["test"], device)
-                        for t in affected if t < len(predictors)}
+                #
+                # The published gate measures, and DECIDES on, test accuracy. With `merge_fixes`
+                # it decides on val (the truncation audit's split) and logs test next to it.
+                gate_split = "val" if merge_fixes else "test"
+
+                def _accs(split: str) -> Dict[int, float]:
+                    return {t: predictors[t].accuracy(
+                                tasks[t]["test"] if split == "test" else tasks[t].get("val", tasks[t]["test"]),
+                                device)
+                            for t in affected if t < len(predictors)}
+
+                base = _accs(gate_split)
+                base_test = _accs("test") if merge_fixes else base
                 snap = _snapshot_topology(nodes, predictors, keep=a)
                 freeze_keep = functional_threshold is not None
                 # keep is provably untouched when freeze_keep=True (W_keep is the identity, fit
@@ -459,22 +483,35 @@ def consolidate_nodes(
                 W = distill_merge(a, b, loader, device, epochs=distill_epochs, freeze_keep=freeze_keep)
                 drift = (0.0 if freeze_keep
                          else float((_flat_theta(a.concept_module) - theta_before).norm().item()))
-                _merge_nodes(nodes, predictors, keep=a, drop=b, W_keep=W["keep"], W_drop=W["drop"])
-                post = {t: predictors[t].accuracy(tasks[t]["test"], device)
-                        for t in affected if t < len(predictors)}
+                still_read = _merge_nodes(nodes, predictors, keep=a, drop=b, W_keep=W["keep"],
+                                          W_drop=W["drop"], repoint_all_readers=merge_fixes)
+                post = _accs(gate_split)
                 deltas = {t: round(post[t] - base[t], 4) for t in post}
                 ok = all(post[t] >= base.get(t, 0.0) - merge_tolerance for t in post)
+                if merge_fixes:
+                    post_test = _accs("test")
+                    deltas_test = {t: round(post_test[t] - base_test[t], 4) for t in post_test}
+                else:
+                    deltas_test = deltas
                 audit_entry = {
                     "at_task": None, "kind": "merge", "node": a.task_id,
                     "readers": sorted(affected), "drift": drift, "rel_error": None,
-                    "reader_deltas_val": {}, "reader_deltas_test": {str(t): d for t, d in deltas.items()},
+                    "reader_deltas_val": ({str(t): d for t, d in deltas.items()} if merge_fixes else {}),
+                    "reader_deltas_test": {str(t): d for t, d in deltas_test.items()},
                     "tolerance": merge_tolerance,
                 }
+                # Keys that exist only when the fixes are on (or when the published path leaks),
+                # so a default-path op record is unchanged.
+                extra: Dict[str, object] = {}
+                if merge_fixes:
+                    extra = {"gate_split": "val", "backward_deltas_test": deltas_test}
+                if still_read:
+                    extra["drop_still_read_by"] = still_read
                 if ok:
                     ops.append({"op": "merge", "keep": a.task_id, "drop": b.task_id,
                                 "similarity": sim, "sim_kind": sim_kind, "distilled": True,
                                 "recon_loss": W["recon_loss"], "backward_deltas": deltas,
-                                **sim_extra})
+                                **sim_extra, **extra})
                     audit_entry["verdict"] = "kept"
                     reader_audit.append(audit_entry)
                     merged = True
@@ -487,7 +524,8 @@ def consolidate_nodes(
                     ops.append({"op": "merge_rejected", "keep": a.task_id, "drop": b.task_id,
                                 "similarity": sim, "sim_kind": sim_kind, "recon_loss": W["recon_loss"],
                                 "backward_deltas": deltas, "worst_delta": min(deltas.values()),
-                                "merge_tolerance": merge_tolerance, **sim_extra})
+                                "merge_tolerance": merge_tolerance, **sim_extra,
+                                **{k: v for k, v in extra.items() if k != "drop_still_read_by"}})
                     audit_entry["verdict"] = "rolled_back"
                     reader_audit.append(audit_entry)
             if merged:
@@ -620,13 +658,24 @@ def _repoint_with_adapters(models, adapters, keep, drop, W_keep, W_drop):
 
 
 def _merge_nodes(nodes: List[DAGNode], predictors: List[TaskPredictor], keep: DAGNode, drop: DAGNode,
-                 W_keep: Optional[nn.Module] = None, W_drop: Optional[nn.Module] = None):
+                 W_keep: Optional[nn.Module] = None, W_drop: Optional[nn.Module] = None,
+                 repoint_all_readers: bool = False) -> List[int]:
     """
     Merge `drop` into `keep`: re-point every child/predictor edge drop→keep (and keep→keep, whose
     function changed under distillation) installing the recovery adapters, then remove `drop`.
     Parent counts are preserved (no dedup), so a child that had BOTH keep and drop keeps two edges to
     keep with distinct adapters — exactly the two signals it was trained on.
+
+    The published merge re-points only `reuse` predictors. `search` and `update` predictors read
+    parents through exactly the same path (`TaskPredictor.logits`), so they keep `drop` in their
+    parent list, and `drop` — though removed from `nodes` and no longer counted — is still run at
+    inference (PR #2 review, finding 1). `repoint_all_readers=True` re-points them too.
+
+    Returns the predictor indices that STILL read `drop` after the re-point. It is empty with
+    `repoint_all_readers=True`; on the published path a non-empty list is the leak, which the
+    caller records on the op instead of letting `params_saved` claim the node was freed.
     """
+    reads_parents = ("reuse", "search", "update") if repoint_all_readers else ("reuse",)
     for c in nodes:
         if keep in c.parent_models or drop in c.parent_models:
             c.parent_models, adapters = _repoint_with_adapters(
@@ -634,7 +683,7 @@ def _merge_nodes(nodes: List[DAGNode], predictors: List[TaskPredictor], keep: DA
             c.parent_adapters = adapters if any(a is not None for a in adapters) else None
             c.concept_module.n_parents = len(c.parent_models)
     for pred in predictors:
-        if pred.kind == "reuse" and pred.parents and (keep in pred.parents or drop in pred.parents):
+        if pred.kind in reads_parents and pred.parents and (keep in pred.parents or drop in pred.parents):
             pred.parents, adapters = _repoint_with_adapters(
                 pred.parents, getattr(pred, "parent_adapters", None), keep, drop, W_keep, W_drop)
             pred.parent_adapters = adapters if any(a is not None for a in adapters) else None
@@ -648,6 +697,47 @@ def _merge_nodes(nodes: List[DAGNode], predictors: List[TaskPredictor], keep: DA
             elif pred.node is keep:
                 pred.node_adapter = _compose(pred.node_adapter, W_keep)
     nodes.remove(drop)
+    return [i for i, p in enumerate(predictors)
+            if p.kind != "grow" and p.parents and any(q is drop for q in p.parents)]
+
+
+def _full_param_count(nodes: List[DAGNode], predictors: List[Optional[TaskPredictor]]) -> int:
+    """Every parameter a prediction runs through, each counted once (PR #2 review, finding 5).
+
+    `param_curve` counts concept modules only; `param_curve_total` adds whole nodes (a root's
+    AttentionPool / backbone). Neither counts a task's head or composer — a ReuseComposer is ~34k
+    parameters at P=2, D=128, about half a root — nor the merge recovery adapters, which live in
+    plain-list `parent_adapters` attributes that `nn.Module.parameters()` cannot see. This adds all
+    of them, de-duplicated by tensor identity (a composer may hold the task head). It also counts
+    any node a predictor still reads but the published merge removed from `nodes` (finding 1), so
+    a leak shows up here instead of as a saving."""
+    seen: Set[int] = set()
+    total = 0
+
+    def add(m: Optional[nn.Module]):
+        nonlocal total
+        if m is None:
+            return
+        for p in m.parameters():
+            if id(p) not in seen:
+                seen.add(id(p))
+                total += p.numel()
+
+    for n in nodes:
+        add(n)
+        for a in (getattr(n, "parent_adapters", None) or []):
+            add(a)
+    for pr in predictors:
+        if pr is None:
+            continue
+        add(pr.head); add(pr.composer); add(pr.node_adapter)
+        for a in (getattr(pr, "parent_adapters", None) or []):
+            add(a)
+        if pr.kind == "grow":
+            add(pr.node)
+        for q in (pr.parents or []):
+            add(q)
+    return total
 
 
 def _repoint(models: List[DAGNode], keep: DAGNode, drop: DAGNode):
@@ -661,7 +751,8 @@ def _repoint(models: List[DAGNode], keep: DAGNode, drop: DAGNode):
 
 
 def make_accuracy_accept_fn(nodes: List[DAGNode], predictors: List[TaskPredictor],
-                            tasks: List[Dict], device: str, tolerance: float = 0.01):
+                            tasks: List[Dict], device: str, tolerance: float = 0.01,
+                            split: str = "test"):
     """
     Default gate: accept a merge iff no affected task's accuracy regresses by more than `tolerance`
     (the backward-interference / forgetting check that makes reduction safe).
@@ -669,9 +760,15 @@ def make_accuracy_accept_fn(nodes: List[DAGNode], predictors: List[TaskPredictor
     The trial applies the *full* structural re-point (drop→keep across every node and predictor that
     references drop, anywhere in the ancestry), measures affected tasks, then restores — so the check
     faithfully reflects what the real merge will do.
+
+    `split` is the loader the decision is measured on: "test" is the published behaviour (selecting
+    on test, PR #2 review finding 4); "val" is what `merge_fixes` passes.
     """
+    def _loader(t: int):
+        return tasks[t]["test"] if split == "test" else tasks[t].get("val", tasks[t]["test"])
+
     def accept(keep: DAGNode, drop: DAGNode, affected: Set[int]) -> bool:
-        base = {t: predictors[t].accuracy(tasks[t]["test"], device)
+        base = {t: predictors[t].accuracy(_loader(t), device)
                 for t in affected if t < len(predictors)}
         snap_nodes = {id(n): list(n.parent_models) for n in nodes}
         snap_preds = {id(p): list(p.parents) for p in predictors if p.parents}
@@ -681,7 +778,7 @@ def make_accuracy_accept_fn(nodes: List[DAGNode], predictors: List[TaskPredictor
         for p in predictors:
             if p.parents and drop in p.parents:
                 p.parents = _repoint(p.parents, keep, drop)
-        ok = all(predictors[t].accuracy(tasks[t]["test"], device) >= base.get(t, 0.0) - tolerance
+        ok = all(predictors[t].accuracy(_loader(t), device) >= base.get(t, 0.0) - tolerance
                  for t in affected if t < len(predictors))
         for n in nodes:
             if id(n) in snap_nodes:
@@ -718,6 +815,23 @@ class KanExpConfig(Exp3Config):
                                           # linear-CKA pre-filter (merge-detector separability).
                                           # Both are always RECORDED on every merge op record.
     merge_cka_threshold: float = 0.55     # linear CKA a pair must reach (merge_trigger == "cka")
+    merge_fixes:         bool  = False    # PR #2 review findings 1 + 4. True: (a) a merge re-points
+                                          # EVERY predictor that reads parents (search and update
+                                          # too, not only reuse), so the dropped node is actually
+                                          # freed instead of still being run by a search/update
+                                          # composer; (b) a merge is ACCEPTED on val accuracy (test
+                                          # is logged alongside), as truncation already is, instead
+                                          # of being selected on test. False = the published
+                                          # behaviour. True changes merge decisions and numerics
+                                          # wherever a merge is attempted, so it needs its own
+                                          # reference runs; a flagged run self-identifies.
+    full_param_count:    bool  = False    # PR #2 review finding 5. True adds `param_curve_full` /
+                                          # `params_full_final`: every parameter a prediction runs
+                                          # through — nodes, their merge adapters, and each task's
+                                          # head / composer / adapters — de-duplicated. The
+                                          # published `param_curve` counts concept modules only and
+                                          # leaves out the composers (a ReuseComposer is ~half a
+                                          # root). Reporting only; no decision reads it.
     enable_search:       bool  = False    # three-way reuse/search/grow gate (test-time-compute rung)
     eps_search:          float = 0.05     # min reducible-info fraction bounded search must add over reuse
     search_budget:       int   = 6        # trained candidates the Search level may spend
@@ -1214,6 +1328,7 @@ def run_exp3a_kan(
     decisions: List[dict] = []
     param_curve: List[int] = []
     param_curve_total: List[int] = []
+    param_curve_full: List[int] = []      # only filled (and only written) with cfg.full_param_count
     test_accs: List[float] = []
     # (Xraw, y) actually fed to each gated task's live decision, captured at decision time so
     # `_build_gate_dump` can dump the SAME rows/order instead of re-sampling post hoc (§6).
@@ -1711,11 +1826,14 @@ def run_exp3a_kan(
         # is the whole node: in token mode that adds each root's AttentionPool, which is the
         # honest parameter cost of the attention family. The two are equal in CLS feature mode.
         param_curve_total.append(sum(p.numel() for n in nodes for p in n.parameters()))
+        if cfg.full_param_count:
+            param_curve_full.append(_full_param_count(nodes, predictors))
         print(f"  task {t:2d}: decision={decisions[t]['decision']:5s}  acc={acc:.4f}  "
               f"nodes={len(nodes)}  params={param_curve[-1]}")
 
         if cfg.consolidate_every and (t + 1) % cfg.consolidate_every == 0 and len(nodes) > 2:
-            accept = make_accuracy_accept_fn(nodes, predictors, tasks, device, cfg.merge_tolerance)
+            accept = make_accuracy_accept_fn(nodes, predictors, tasks, device, cfg.merge_tolerance,
+                                     split=("val" if cfg.merge_fixes else "test"))
             summ = consolidate_nodes(nodes, predictors, tasks, device, accept_fn=accept,
                                      similarity_threshold=cfg.similarity_threshold,
                                      reader_tolerance=cfg.merge_tolerance,
@@ -1724,7 +1842,8 @@ def run_exp3a_kan(
                                      functional_threshold=(cfg.functional_threshold
                                                            if cfg.functional_redundancy else None),
                                      merge_trigger=cfg.merge_trigger,
-                                     merge_cka_threshold=cfg.merge_cka_threshold)
+                                     merge_cka_threshold=cfg.merge_cka_threshold,
+                                     merge_fixes=cfg.merge_fixes)
             print(f"  [consolidate @ task {t}] saved {summ['params_saved']} params, {summ['n_ops']} ops")
             summ["at_task"] = t
             summ["final"] = False
@@ -1754,7 +1873,8 @@ def run_exp3a_kan(
         _flush(device)
 
     # Final consolidation.
-    accept = make_accuracy_accept_fn(nodes, predictors, tasks, device, cfg.merge_tolerance)
+    accept = make_accuracy_accept_fn(nodes, predictors, tasks, device, cfg.merge_tolerance,
+                                     split=("val" if cfg.merge_fixes else "test"))
     consolidation = consolidate_nodes(nodes, predictors, tasks, device, accept_fn=accept,
                                       similarity_threshold=cfg.similarity_threshold,
                                       reader_tolerance=cfg.merge_tolerance,
@@ -1763,7 +1883,8 @@ def run_exp3a_kan(
                                       functional_threshold=(cfg.functional_threshold
                                                             if cfg.functional_redundancy else None),
                                       merge_trigger=cfg.merge_trigger,
-                                      merge_cka_threshold=cfg.merge_cka_threshold)
+                                      merge_cka_threshold=cfg.merge_cka_threshold,
+                                     merge_fixes=cfg.merge_fixes)
     consolidation["at_task"] = len(tasks) - 1
     consolidation["final"] = True
     for e in consolidation["reader_audit"]:
@@ -1819,6 +1940,13 @@ def run_exp3a_kan(
         # and break the whole-dict identity fixtures, which is exactly the property the flag exists
         # to preserve. A run WITHOUT this key is an unflagged (published-discipline) run.
         results["search_device_rng_fix"] = True
+    # Same rule for the PR #2 review flags: keys written only when set, so the default-path JSON
+    # (and its whole-dict identity fixtures) is unchanged.
+    if cfg.merge_fixes:
+        results["merge_fixes"] = True
+    if cfg.full_param_count:
+        results["param_curve_full"] = param_curve_full
+        results["params_full_final"] = _full_param_count(nodes, predictors)   # after final pass
     out_path = os.path.join(cfg.results_dir, "exp3a_kan_results.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)

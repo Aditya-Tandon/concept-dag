@@ -85,6 +85,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "numerics of every accelerator arm, --provisional off included, so it "
                              "needs its own reference runs (see the search-compose-device-reseed "
                              "pre-registration).")
+    parser.add_argument("--merge_fixes", action="store_true",
+                        help="[3a-kan/5ds-kan/ctrl] PR #2 review findings 1 + 4: a merge re-points "
+                             "search and update predictors too (so the dropped node is really freed), "
+                             "and a distilled or structural merge is ACCEPTED on val accuracy (test "
+                             "logged) instead of being selected on test. Off = published behaviour. "
+                             "Changes merge decisions wherever a merge is attempted, so it needs its "
+                             "own reference runs; a flagged run records merge_fixes: true.")
+    parser.add_argument("--full_param_count", action="store_true",
+                        help="[3a-kan/5ds-kan/ctrl] also report param_curve_full / params_full_final: "
+                             "every parameter a prediction runs through (nodes, merge adapters, each "
+                             "task's head and composer), not only concept modules. Reporting only.")
     parser.add_argument("--consolidate_every", type=int, default=0,
                         help="[3a-kan] run the consolidation (reduction) pass every K tasks (0 = only "
                              "at the end)")
@@ -440,6 +451,16 @@ def main():
             cache_dir   = args.cache_dir,
             eps_rel     = getattr(args, "eps_rel", 0.05),
             consolidate_every = getattr(args, "consolidate_every", 0),
+            # PR #2 review finding 9: 3a-kan used to drop every search flag on the floor, so
+            # `--exp 3a-kan --enable_search` silently ran the binary gate. Defaults are off, so
+            # the published 3a-kan path is unchanged.
+            enable_search = args.enable_search,
+            eps_search  = args.eps_search,
+            search_budget = args.search_budget,
+            search_skip = args.search_skip,
+            search_device_rng_fix = args.search_device_rng_fix,
+            merge_fixes = args.merge_fixes,
+            full_param_count = args.full_param_count,
             raw_grow_probe = args.raw_grow_probe,
             routing_batches = args.routing_batches,
             gate_cache_max = args.gate_cache_max,
@@ -516,6 +537,8 @@ def main():
             search_budget = args.search_budget,
             search_skip = args.search_skip,
             search_device_rng_fix = args.search_device_rng_fix,
+            merge_fixes = args.merge_fixes,
+            full_param_count = args.full_param_count,
             raw_grow_probe = args.raw_grow_probe,
             routing_batches = args.routing_batches,
             gate_cache_max = args.gate_cache_max,
@@ -591,6 +614,8 @@ def main():
             search_budget = args.search_budget,
             search_skip = args.search_skip,
             search_device_rng_fix = args.search_device_rng_fix,
+            merge_fixes = args.merge_fixes,
+            full_param_count = args.full_param_count,
             raw_grow_probe = args.raw_grow_probe,
             routing_batches = args.routing_batches,
             gate_cache_max = args.gate_cache_max,
