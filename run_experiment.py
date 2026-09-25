@@ -128,6 +128,20 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["smallcnn", "dinov2_vits14", "clip_vitb16", "resnet50", "resnet18"],
                         help="Feature extractor backbone. 'smallcnn' = original task-trained CNN. "
                              "Other options use a frozen SSL encoder + feature caching.")
+    parser.add_argument("--root_family", type=str, default="mlp_cls",
+                        choices=["mlp_cls", "attn_pool"],
+                        help="[5ds-kan/ctrl] DAG ROOT module family. 'mlp_cls' (default) = the "
+                             "published root: the encoder's CLS vector into a 2-layer MLP. "
+                             "'attn_pool' = learned-query attention pooling over the encoder's "
+                             "(1 + T) patch-token set, then the same MLP (module-family-ablation "
+                             "arm C). 'attn_pool' switches the whole data path to token mode: the "
+                             "feature cache stores (N, 1 + T, 384) fp16, the gate's raw-root grow "
+                             "probe and the oracle grow rung use the same family, and the update "
+                             "rung and --dump_gate_tensors are unavailable.")
+    parser.add_argument("--token_pool", type=int, default=2,
+                        help="[--root_family attn_pool] average-pool factor on DINOv2's 16x16 patch "
+                             "grid: 1 -> 256 tokens, 2 -> 64 (default, the ablation's best), 4 -> 16. "
+                             "Ignored unless the root family reads tokens.")
     parser.add_argument("--cache_dir", type=str, default=None,
                         help="Directory for cached SSL features (default: <data_root>/features_<backbone>). "
                              "Only used when --backbone != smallcnn.")
@@ -220,31 +234,61 @@ def main():
         device = args.device
     print(f"Using device: {device}")
 
+    # Token-mode preconditions, checked before anything expensive is built.
+    token_mode = (args.root_family == "attn_pool")
+    if token_mode:
+        if args.exp not in ("5ds-kan", "ctrl"):
+            raise SystemExit(
+                f"--root_family attn_pool is wired for --exp 5ds-kan and --exp ctrl only "
+                f"(got --exp {args.exp}); the other experiments still run the CLS-only root."
+            )
+        if not args.backbone.startswith("dinov2"):
+            raise SystemExit(
+                "--root_family attn_pool needs a patch-token encoder; only the DINOv2 backbones "
+                f"expose one (got --backbone {args.backbone})."
+            )
+        if args.enable_update:
+            raise SystemExit(
+                "--enable_update and --root_family attn_pool are incompatible: the update probe "
+                "packs the raw features into a flat 2-D tensor, which a token set has no form for."
+            )
+
     # ── Backbone / feature-cache setup ──────────────────────────────────────
-    def _prepare_tasks_with_backbone(raw_tasks, backbone: str, cache_dir, data_root):
+    def _prepare_tasks_with_backbone(raw_tasks, backbone: str, cache_dir, data_root,
+                                     tokens: bool = False, token_pool: int = 1):
         """
         If backbone != 'smallcnn', build the frozen encoder, cache features,
-        and return feature-tensor tasks + feature_dim.
-        If backbone == 'smallcnn', return raw_tasks unchanged + feature_dim=None.
+        and return feature-tensor tasks + feature_dim + n_tokens.
+        If backbone == 'smallcnn', return raw_tasks unchanged + (None, None).
+
+        `tokens=True` puts the whole path in TOKEN MODE: the encoder returns
+        (B, 1 + T, feature_dim) patch-token sequences average-pooled by `token_pool`, the
+        cache is written float16 into a `_tok{T}`-suffixed directory (so it can never collide
+        with the CLS-only cache) and the loaders yield token sets. `feature_dim` keeps its
+        meaning — the PER-TOKEN width, 384 for ViT-S/14 — and the sequence length is returned
+        separately as `n_tokens`.
         """
         if backbone == "smallcnn":
-            return raw_tasks, None
+            return raw_tasks, None, None
         from concept_dag.models.root_encoder import build_encoder
         from concept_dag.data.feature_cache import cache_features
         if cache_dir is None:
             cache_dir = os.path.join(data_root, f"features_{backbone}")
         print(f"\n[backbone] Building encoder: {backbone}")
-        encoder = build_encoder(backbone, device=device)
-        print(f"[backbone] Feature dim: {encoder.feature_dim}  |  Cache: {cache_dir}")
+        enc_kwargs = {"return_tokens": True, "token_pool": token_pool} if tokens else {}
+        encoder = build_encoder(backbone, device=device, **enc_kwargs)
+        n_tokens = getattr(encoder, "n_tokens", None) if tokens else None
+        print(f"[backbone] Feature dim: {encoder.feature_dim}  |  Cache: {cache_dir}"
+              + (f"  |  tokens: {n_tokens} (pool {token_pool})" if tokens else ""))
         tasks = cache_features(encoder, raw_tasks, cache_dir=cache_dir, device=device,
-                               seed=args.seed)
+                               seed=args.seed, tokens=tokens, token_pool=token_pool)
         del encoder  # free GPU memory before training starts
         import gc; gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
         elif device == "mps" and hasattr(torch, "mps"):
             torch.mps.empty_cache()  # not present on torch 2.0.0
-        return tasks, tasks[0]["feature_dim"]
+        return tasks, tasks[0]["feature_dim"], (tasks[0].get("n_tokens") if tokens else None)
 
     # Download mode
     if args.download:
@@ -323,7 +367,7 @@ def main():
             data_root=args.data_root, n_tasks=n_tasks,
             batch_size=args.batch_size, seed=args.seed,
         )
-        tasks, feature_dim = _prepare_tasks_with_backbone(
+        tasks, feature_dim, n_tokens = _prepare_tasks_with_backbone(
             raw_tasks, args.backbone, args.cache_dir, args.data_root)
         if feature_dim is not None:
             cfg.feature_dim = feature_dim
@@ -340,8 +384,9 @@ def main():
             batch_size=args.batch_size, max_per_task=args.max_per_task,
             download=bool(args.download), seed=args.seed,
         )
-        tasks, feature_dim = _prepare_tasks_with_backbone(
-            raw_tasks, backbone, args.cache_dir, args.data_root)
+        tasks, feature_dim, n_tokens = _prepare_tasks_with_backbone(
+            raw_tasks, backbone, args.cache_dir, args.data_root,
+            tokens=token_mode, token_pool=args.token_pool)
         force_grow_ids = ()
         if args.inject_dup:
             # Revisit the first dataset at the end of the stream; force-grow it (merge stress-test)
@@ -365,6 +410,8 @@ def main():
             backbone    = backbone,
             cache_dir   = args.cache_dir,
             feature_dim = feature_dim,
+            root_family = args.root_family,
+            n_tokens    = n_tokens,
             eps_rel     = getattr(args, "eps_rel", 0.05),
             consolidate_every = getattr(args, "consolidate_every", 0),
             force_grow_ids = force_grow_ids,
@@ -412,8 +459,9 @@ def main():
         # sharing a dir would silently serve each other's features.
         cache_dir = args.cache_dir or os.path.join(
             args.data_root, f"features_{backbone}_ctrl_{args.ctrl_stream}")
-        tasks, feature_dim = _prepare_tasks_with_backbone(
-            raw_tasks, backbone, cache_dir, args.data_root)
+        tasks, feature_dim, n_tokens = _prepare_tasks_with_backbone(
+            raw_tasks, backbone, cache_dir, args.data_root,
+            tokens=token_mode, token_pool=args.token_pool)
         cfg = KanExpConfig(
             data_root   = args.data_root,
             device      = device,
@@ -427,6 +475,8 @@ def main():
             backbone    = backbone,
             cache_dir   = cache_dir,
             feature_dim = feature_dim,
+            root_family = args.root_family,
+            n_tokens    = n_tokens,
             eps_rel     = getattr(args, "eps_rel", 0.05),
             consolidate_every = getattr(args, "consolidate_every", 0),
             enable_search = args.enable_search,
@@ -484,7 +534,7 @@ def main():
             data_root=args.data_root, n_tasks=n_tasks,
             batch_size=args.batch_size, seed=args.seed,
         )
-        tasks, feature_dim = _prepare_tasks_with_backbone(
+        tasks, feature_dim, n_tokens = _prepare_tasks_with_backbone(
             raw_tasks, args.backbone, args.cache_dir, args.data_root)
         if feature_dim is not None:
             cfg.feature_dim = feature_dim
@@ -521,7 +571,7 @@ def main():
             data_root=args.data_root, n_tasks=n_tasks,
             batch_size=args.batch_size, seed=args.seed,
         )
-        tasks, feature_dim = _prepare_tasks_with_backbone(
+        tasks, feature_dim, n_tokens = _prepare_tasks_with_backbone(
             raw_tasks, args.backbone, args.cache_dir, args.data_root)
         if feature_dim is not None:
             cfg.feature_dim = feature_dim

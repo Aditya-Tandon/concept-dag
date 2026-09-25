@@ -1465,6 +1465,20 @@ class _UpdateModel(nn.Module):
 
 
 def pack_update_input(parent_stack: torch.Tensor, raw_stack: torch.Tensor) -> torch.Tensor:
+    """Flatten the parent stack and concatenate the raw features into one (N, P*D + F) tensor.
+
+    Requires a 2-D ``raw_stack``. A token-root run hands the gate an (N, 1 + T, D) token SET, which
+    has no flat form the frozen ``ReuseComposer`` half of ``_UpdateModel`` can be sliced back out
+    of; supporting it means giving ``_UpdateModel`` its own token-aware copy of the parent root
+    (pool included) rather than just its ConceptModule. Refused explicitly instead of silently
+    reshaping something else.
+    """
+    if raw_stack.ndim != 2:
+        raise NotImplementedError(
+            "the update rung needs a 2-D raw feature matrix (N, F); got "
+            f"{tuple(raw_stack.shape)}. Token roots (root_family='attn_pool') are not supported "
+            "by update_probe — run the update rung under root_family='mlp_cls'."
+        )
     return torch.cat([parent_stack.flatten(1), raw_stack], dim=1)
 
 

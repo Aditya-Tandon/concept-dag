@@ -35,7 +35,12 @@ A vs B changes only the input vector; C/D are compared to C0, which differs from
 by the pooling rule; E is the substrate control, not a module comparison. No positional
 encoding is added anywhere: DINO's tokens already carry position.
 
-Nothing here is imported by the DAG/gate code path — this is a single-task ablation.
+Two of these families are now load-bearing in the DAG itself. `AttentionPool` is what a
+token-mode root `DAGNode` puts in front of its ConceptModule, and `AttnPoolRoot` is what the
+gate's raw-root grow probe builds when `root_family="attn_pool"` — the two are constructed
+identically and in the same order, which is what makes `L_grow` price the module the DAG
+would actually mint (`tests/test_attn_root_adoption.py` asserts the parity). The remaining
+families are still only the single-task ablation's.
 """
 
 from __future__ import annotations

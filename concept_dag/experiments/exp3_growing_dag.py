@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from ..modules.concept_module import ConceptModule
+from ..modules.token_roots import AttentionPool
 from ..models.baselines import SmallCNN, LinearHead
 from ..utils.metrics import accuracy, evaluate, safe_cross_entropy
 from ..data.loaders import make_split_cifar100
@@ -56,6 +57,11 @@ class Exp3Config:
     # Backbone ("smallcnn" | "dinov2_vits14" | "clip_vitb16" | "resnet50")
     backbone:        str   = "smallcnn"
     feature_dim:     Optional[int] = None    # auto-set from encoder if backbone != smallcnn
+    # Root module family: "mlp_cls" = the published root (CLS vector → MLP);
+    # "attn_pool" = learned-query attention pooling over the encoder's (1 + T) token set
+    # ([[module-family-ablation-result]] arm C). Token mode only, feature backbones only.
+    root_family:     str   = "mlp_cls"
+    n_tokens:        Optional[int] = None    # 1 + T sequence length in token mode
     cache_dir:       Optional[str] = None    # where to store cached features
     # DAG growth
     n_tasks:         int   = 20
@@ -114,20 +120,40 @@ class DAGNode(nn.Module):
         soft_pca_k:    int   = 8,
         use_cnn:       bool  = True,
         feature_dim:   Optional[int] = None,
+        root_family:   str   = "mlp_cls",
     ):
         super().__init__()
         self.task_id     = task_id
         self._is_root    = not parent_models
         self.use_cnn     = use_cnn
+        self.root_family = root_family
+
+        # Token-mode root: the node reads the encoder's (B, 1 + T, feature_dim) token set
+        # through a learned-query AttentionPool that emits `concept_dim`, and the
+        # ConceptModule below is unchanged except that its in_dim is now concept_dim.
+        # Everything downstream of the root — children, routing, TaskPredictor,
+        # consolidation, merge — sees the same `concept_dim` embedding it always did.
+        token_root = self._is_root and not use_cnn and root_family == "attn_pool"
+        if root_family not in ("mlp_cls", "attn_pool"):
+            raise ValueError(f"unknown root_family {root_family!r}; expected mlp_cls or attn_pool")
+        if root_family == "attn_pool" and self._is_root:
+            if use_cnn:
+                raise ValueError("root_family='attn_pool' needs a feature backbone (use_cnn=False)")
+            if not feature_dim:
+                raise ValueError("root_family='attn_pool' needs feature_dim (the per-token width)")
 
         # Resolve input dimension for this node
         if self._is_root:
-            in_dim = cnn_out_dim if use_cnn else (feature_dim or cnn_out_dim)
+            if token_root:
+                in_dim = concept_dim          # the pool's output, not the raw token width
+            else:
+                in_dim = cnn_out_dim if use_cnn else (feature_dim or cnn_out_dim)
         else:
             in_dim = concept_dim
 
         if self._is_root:
             self.cnn = SmallCNN(in_channels=3, out_dim=cnn_out_dim) if use_cnn else None
+            self.root_pool = AttentionPool(feature_dim, concept_dim) if token_root else None
             self.concept_module = ConceptModule(
                 module_id  = f"node_{task_id}",
                 in_dim     = in_dim,
@@ -140,6 +166,7 @@ class DAGNode(nn.Module):
         else:
             n_par = len(parent_models)
             self.cnn = None
+            self.root_pool = None
             self.parent_models = list(parent_models)   # plain list
             self.concept_module = ConceptModule(
                 module_id   = f"node_{task_id}",
@@ -156,12 +183,24 @@ class DAGNode(nn.Module):
     def is_root(self) -> bool:
         return self._is_root
 
+    @property
+    def token_mode(self) -> bool:
+        """True when this root pools a token set before the ConceptModule."""
+        return getattr(self, "root_pool", None) is not None
+
+    def _root_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Whatever this root hands its ConceptModule: SmallCNN output, pooled tokens, or x."""
+        if self.use_cnn:
+            return self.cnn(x)
+        if self.root_pool is not None:
+            return self.root_pool(x)
+        return x
+
     # -----------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.is_root:
-            feats = self.cnn(x) if self.use_cnn else x
-            return self.concept_module(feats)
+            return self.concept_module(self._root_features(x))
         # Child: collect frozen parent embeddings, then aggregate
         with torch.no_grad():
             parent_outs = [p(x) for p in self.parent_models]
@@ -216,7 +255,7 @@ class DAGNode(nn.Module):
           pass directly to concept_module. cnn_no_grad is ignored.
         """
         if not self.use_cnn:
-            return self.concept_module(x)
+            return self.concept_module(self._root_features(x))
         if cnn_no_grad:
             with torch.no_grad():
                 feats = self.cnn(x)
@@ -366,6 +405,8 @@ def train_node(
         node.concept_module.train()
         if node.is_root and node.cnn is not None:
             node.cnn.train()
+        if node.is_root and getattr(node, "root_pool", None) is not None:
+            node.root_pool.train()
         head.train()
 
         ep_loss, ep_acc, n = 0.0, 0.0, 0
@@ -395,6 +436,8 @@ def train_node(
     node.concept_module.eval()
     if node.is_root and node.cnn is not None:
         node.cnn.eval()
+    if node.is_root and getattr(node, "root_pool", None) is not None:
+        node.root_pool.eval()
     head.eval()
     node.concept_module.clear_activation_buffer()
     del opt, sched
@@ -551,6 +594,7 @@ def run_exp3a(cfg: Exp3Config, tasks: Optional[List[Dict]] = None) -> Dict:
             soft_pca_k    = cfg.soft_pca_k,
             use_cnn       = (cfg.backbone == "smallcnn"),
             feature_dim   = cfg.feature_dim,
+            root_family   = cfg.root_family,
         )
         head = LinearHead(cfg.concept_dim, task["n_classes"])
 
