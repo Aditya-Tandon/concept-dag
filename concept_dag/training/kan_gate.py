@@ -59,6 +59,7 @@ from ..modules.dag import ConceptDAG
 from ..modules.concept_module import ConceptModule
 from .evalue import decide as _evalue_decide
 from ..utils.metrics import safe_cross_entropy
+from ..utils.rng import fork_rng_all_devices
 
 _LOG2 = math.log(2.0)
 
@@ -802,6 +803,22 @@ def decide_reuse_vs_grow(
 # ---------------------------------------------------------------------------
 
 
+def _candidate_init_seed(base: Optional[int], index: int) -> int:
+    """The seed a Search candidate's initialisation is drawn under.
+
+    ``base is None`` reproduces the published behaviour exactly — the seed IS the candidate
+    *index*, so the candidate inits (and, on CUDA, every dropout mask drawn after the gate; see
+    :func:`search_compose`) are a function of the budget and the parent count alone, never of the
+    run's ``--seed``. Any other ``base`` mixes the run seed in: the multiplier is far larger than
+    any realistic ``budget`` so no two ``(base, index)`` pairs collide for bases one apart (which
+    consecutive tasks' bases are), and the modulus keeps the result inside ``torch.manual_seed``'s
+    range on every platform.
+    """
+    if base is None:
+        return index
+    return (int(base) * 100_003 + index) % (2 ** 31 - 1)
+
+
 def _enumerate_subsets(n_parents: int) -> List[Tuple[int, ...]]:
     """Non-empty parent subsets, singletons first then the full set (routing search space)."""
     singles = [(i,) for i in range(n_parents)]
@@ -817,6 +834,7 @@ def search_compose(
     select_on: str = "score",
     score_X: Optional[torch.Tensor] = None, score_y: Optional[torch.Tensor] = None,
     estimator_fn: Optional[Callable[[nn.Module, Callable], Tuple[float, dict]]] = None,
+    candidate_seed_base: Optional[int] = None,
 ):
     """Bounded search for the best composition of EXISTING concepts (the middle rung).
 
@@ -857,6 +875,29 @@ def search_compose(
     candidate's ``meta`` (``None`` when the trivial composition won, i.e. no candidate beat
     ``baseline_L``; the caller then reuses the reuse rung's meta, which is exactly what the trivial
     composition is).
+
+    ``candidate_seed_base`` — the run-level seed the per-candidate initialisation seeds are
+    derived from (:func:`_candidate_init_seed`), and the switch between two RNG disciplines:
+
+      * ``None`` (default, **published behaviour**) — each candidate is built inside
+        ``torch.random.fork_rng(devices=[])`` under ``torch.manual_seed(candidate_index)``. That
+        fork restores the CPU generator and nothing else, while ``torch.manual_seed`` fans out to
+        ``torch.cuda.manual_seed_all`` / ``torch.mps.manual_seed`` — so on an accelerator the
+        device generator is left at ``manual_seed(last candidate index)`` plus that candidate's own
+        training draws. The candidate index is not a function of the run seed, so after the first
+        gated task every later ``train_node``'s dropout-mask stream is **seed-independent**: the
+        run's multi-seed spread understates its own seed variance (declared as R3 in
+        [[provisional-growth-v2-validity-rerun-result]]; should-fix 3 of
+        [[provisional-growth-code-review]]). Kept as the default so every published reference stays
+        reproducible bit-for-bit until the re-baseline replaces it.
+      * an ``int`` — each candidate is built inside :func:`~concept_dag.utils.rng.fork_rng_all_devices`
+        (CPU **and** every device generator restored) under
+        ``_candidate_init_seed(candidate_seed_base, candidate_index)``. Candidates stay exactly
+        reproducible given the run seed, the device stream after the gate continues the run's own
+        stream, and two runs differing only in ``--seed`` differ downstream. This is the corrected
+        discipline; it changes the numerics of every accelerator run, including the ``off`` arm,
+        which is why it is opt-in and pre-registered
+        ([[search-compose-device-reseed]]).
 
     Return shape (unchanged paths are BYTE-IDENTICAL — same ``_held_out_codelength`` call, same
     comparison key, same trace — to before ``select_on``/``baseline_select_L`` existed):
@@ -917,8 +958,14 @@ def search_compose(
         # generator here (the pre-2026-09-02 behaviour) silently made every later split permutation
         # and initialisation in the run identical across --seed values, so multi-seed spreads
         # under-stated seed variance (see search-on-raw-probe-fixed-result, claim ledger).
-        with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(sd)
+        #
+        # `candidate_seed_base` picks the discipline (see the docstring): None = the published
+        # CPU-only fork with the candidate INDEX as the seed, which leaks the device generator and
+        # is seed-independent; an int = the device-covering fork with a seed derived from the run's.
+        fork = (torch.random.fork_rng(devices=[]) if candidate_seed_base is None
+                else fork_rng_all_devices())
+        with fork:
+            torch.manual_seed(_candidate_init_seed(candidate_seed_base, sd))
             model = SearchComposer(parent_dim=concept_dim, n_parents=n_parents,
                                    head=spec.make_head(concept_dim), rank=rank, subset=sub, skip=skip)
         if estimator_fn is None:
@@ -987,6 +1034,7 @@ def decide_reuse_search_grow(
     tie_rule: str = "none",
     tie_z: float = 1.0,
     tie_novelty: float = 0.1,
+    candidate_seed_base: Optional[int] = None,
 ) -> KanGateRecord:
     """
     Three-way escalation: **reuse → search → grow** on one MDL axis.
@@ -1071,6 +1119,12 @@ def decide_reuse_search_grow(
     reuse explains little of it, so a grow-favouring tie-break cannot be the organic-duplicate grow
     bias the raw-root probe was tested against), the decision becomes "grow".
 
+    ``candidate_seed_base`` is forwarded verbatim to :func:`search_compose` on every estimator
+    branch: ``None`` (default) keeps the published, seed-independent candidate seeding and its
+    CPU-only fork; an ``int`` derives the candidate seeds from it and forks the device generators
+    too. Pass the run's own seed to make the gate's downstream RNG stream seed-dependent — this
+    changes accelerator numerics on EVERY arm, ``off`` included.
+
     Decision (cheapest sufficient rung): grow if ``rel_grow > eps_grow``; else search if
     ``rel_search > eps_search``; else reuse. See [[test-time-compute-search-level]].
     """
@@ -1112,10 +1166,13 @@ def decide_reuse_search_grow(
         reuse_model = _new_reuse_model()
         out["L_reuse"] = _held_out_codelength(reuse_model, fwd, spec, Xtr, ytr, Xsel, ysel,
                                               n_epochs=n_epochs, lr=lr, device=device, score_X=Xsc, score_y=ysc)
+        # `candidate_seed_base` is the SAME on every crossfit fold, as the published candidate
+        # indices were — a fold offset would change more than the leak this threads out.
         out["L_search"], out["search_cfg"], out["trace"] = search_compose(
             Xtr, ytr, Xsel, ysel, spec, concept_dim=concept_dim, n_parents=n_parents,
             device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank,
-            skip=search_skip, baseline_L=out["L_reuse"], score_X=Xsc, score_y=ysc)
+            skip=search_skip, baseline_L=out["L_reuse"], score_X=Xsc, score_y=ysc,
+            candidate_seed_base=candidate_seed_base)
         grow_model = _new_grow_model()
         if use_raw:
             out["L_grow"] = _held_out_codelength(grow_model, fwd, spec, Rtr, ytr, Rsel, ysel,
@@ -1218,7 +1275,8 @@ def decide_reuse_search_grow(
         L_search, search_cfg, trace, meta_search = search_compose(
             X, y, X, y, spec, concept_dim=concept_dim, n_parents=n_parents,
             device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank,
-            skip=search_skip, baseline_L=L_reuse, estimator_fn=_estimator_fn)
+            skip=search_skip, baseline_L=L_reuse, estimator_fn=_estimator_fn,
+            candidate_seed_base=candidate_seed_base)
         if meta_search is None:      # trivial composition won ⇒ Search IS the reuse rung
             meta_search = meta_reuse
 
@@ -1302,7 +1360,8 @@ def decide_reuse_search_grow(
             Xtr, ytr, Xsel, ysel, spec, concept_dim=concept_dim, n_parents=n_parents,
             device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank,
             skip=search_skip, baseline_L=L_reuse, baseline_select_L=sel_reuse,
-            select_on="select", score_X=Xsc, score_y=ysc)
+            select_on="select", score_X=Xsc, score_y=ysc,
+            candidate_seed_base=candidate_seed_base)
         L_search, search_cfg, trace, sel_search, pe_search, L_search_score_argmin = search_out
         if pe_search is None:          # trivial composition won: Search IS reuse on SCORE
             pe_search = pe_reuse

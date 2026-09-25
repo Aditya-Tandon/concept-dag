@@ -75,6 +75,16 @@ def build_parser() -> argparse.ArgumentParser:
                              "rank-16 bottleneck is narrower than reuse and Search can never win.")
     parser.add_argument("--search_budget", type=int, default=6,
                         help="[search] trained candidates the Search level may spend")
+    parser.add_argument("--search_device_rng_fix", action="store_true",
+                        help="[search] derive the Search candidates' init seeds from --seed and fork "
+                             "the DEVICE RNG around each init. Without it (the published default) "
+                             "each candidate is seeded on its own INDEX inside a CPU-only fork, so "
+                             "on CUDA/MPS every dropout mask drawn after the first gated task is a "
+                             "function of the candidate index and NOT of --seed, and a multi-seed "
+                             "spread understates its own seed variance. Setting it changes the "
+                             "numerics of every accelerator arm, --provisional off included, so it "
+                             "needs its own reference runs (see the search-compose-device-reseed "
+                             "pre-registration).")
     parser.add_argument("--consolidate_every", type=int, default=0,
                         help="[3a-kan] run the consolidation (reduction) pass every K tasks (0 = only "
                              "at the end)")
@@ -505,6 +515,7 @@ def main():
             eps_search  = args.eps_search,
             search_budget = args.search_budget,
             search_skip = args.search_skip,
+            search_device_rng_fix = args.search_device_rng_fix,
             raw_grow_probe = args.raw_grow_probe,
             routing_batches = args.routing_batches,
             gate_cache_max = args.gate_cache_max,
@@ -579,6 +590,7 @@ def main():
             eps_search  = args.eps_search,
             search_budget = args.search_budget,
             search_skip = args.search_skip,
+            search_device_rng_fix = args.search_device_rng_fix,
             raw_grow_probe = args.raw_grow_probe,
             routing_batches = args.routing_batches,
             gate_cache_max = args.gate_cache_max,
