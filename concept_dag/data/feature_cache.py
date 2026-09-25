@@ -29,7 +29,19 @@ Cache layout
         task_{t}_val_labels.pt
         task_{t}_test_features.pt
         task_{t}_test_labels.pt
-        meta.json                    {encoder_name, feature_dim, n_tasks}
+        meta.json                    {encoder_name, feature_dim, n_tasks, seed,
+                                      tokens, n_tokens}
+
+Token caches (`tokens=True`)
+----------------------------
+With an encoder configured to return patch tokens (see `DINOv2Encoder(return_tokens=True,
+token_pool=P)`), the cached tensors are Tensor[N, 1 + T, D] — index 0 of the sequence is the
+CLS token, so a CLS-only view is just `features[:, 0]`. They are stored as **float16 on disk**
+(halving a 65-token ViT-S cache to ~2 kB/image) and returned as float32 in memory; the values
+handed to callers are the round-tripped ones, so an in-memory run and a cache-hit run see
+bit-identical inputs. The directory gets a `_tok{T}` suffix so a token cache can never collide
+with the CLS-only cache of the same encoder. `FeatureTensorDataset` returns the (1 + T, D)
+tensor as `x`, so every DataLoader-consuming code path is unchanged.
 """
 
 from __future__ import annotations
@@ -72,6 +84,8 @@ def cache_features(
     batch_size:  int  = 256,
     force_redo:  bool = False,
     seed:        Optional[int] = None,
+    tokens:      bool = False,
+    token_pool:  int  = 1,
 ) -> List[Dict]:
     """
     Extract and cache encoder features for all tasks.
@@ -83,12 +97,27 @@ def cache_features(
         device:     Device to run the encoder on.
         batch_size: Batch size for feature extraction (can be larger than training bs).
         force_redo: If True, ignore existing cache files and recompute.
+        tokens:     If True the encoder is expected to return (B, 1 + T, D) token
+                    sequences; the cache is written as float16, read back as float32,
+                    and `cache_dir` gains a `_tok{T}` suffix. The encoder must expose
+                    `n_tokens`. Default False = the CLS-only cache, unchanged.
+        token_pool: Recorded in meta for provenance only — the pooling itself is the
+                    encoder's job (`DINOv2Encoder(token_pool=...)`).
 
     Returns:
         List of task dicts with the same schema as raw_tasks, but DataLoaders
         now yield (feature_tensor, label) pairs — same interface, just faster.
     """
-    import pathlib
+    if tokens:
+        n_tokens = getattr(encoder, "n_tokens", None)
+        if not isinstance(n_tokens, int) or n_tokens < 2:
+            raise ValueError(
+                "cache_features(tokens=True) needs an encoder exposing n_tokens >= 2 "
+                f"(the 1 + T sequence length); got {n_tokens!r}."
+            )
+        cache_dir = f"{cache_dir}_tok{n_tokens - 1}"
+    else:
+        n_tokens = None
 
     os.makedirs(cache_dir, exist_ok=True)
     meta_path = os.path.join(cache_dir, "meta.json")
@@ -101,14 +130,21 @@ def cache_features(
     # serve stale features for the wrong classes.
     current_meta = {"encoder_name": encoder_name, "feature_dim": feature_dim,
                     "n_tasks": len(raw_tasks), "seed": seed}
+    if tokens:
+        current_meta.update({"tokens": True, "n_tokens": n_tokens,
+                             "token_pool": int(token_pool)})
     if not force_redo and os.path.exists(meta_path):
         with open(meta_path) as f:
             existing = json.load(f)
+        # `.get(..., default)` on the token keys keeps pre-token caches valid: an old
+        # meta with no "tokens" key reads as a CLS-only cache, which is what it is.
         if (existing.get("encoder_name") != encoder_name
                 or existing.get("n_tasks") != len(raw_tasks)
-                or existing.get("seed") != seed):
+                or existing.get("seed") != seed
+                or bool(existing.get("tokens", False)) != bool(tokens)
+                or existing.get("n_tokens", None) != n_tokens):
             print(f"[feature_cache] Cache meta mismatch "
-                  f"(encoder/n_tasks/seed) — recomputing.")
+                  f"(encoder/n_tasks/seed/tokens) — recomputing.")
             force_redo = True
     # Always (re)write meta so a mismatch-triggered recompute updates the on-disk
     # key. Otherwise the stale meta would keep mismatching and every subsequent
@@ -128,24 +164,11 @@ def cache_features(
             feat_path  = os.path.join(cache_dir, f"task_{t}_{split_name}_features.pt")
             label_path = os.path.join(cache_dir, f"task_{t}_{split_name}_labels.pt")
 
-            if not force_redo and os.path.exists(feat_path) and os.path.exists(label_path):
-                features = torch.load(feat_path, map_location="cpu", weights_only=True)
-                labels   = torch.load(label_path, map_location="cpu", weights_only=True)
-            else:
-                print(f"  [cache] task {t} / {split_name} ...", end=" ", flush=True)
-                all_feats, all_labels = [], []
-                # Use a fresh loader at the requested batch_size (larger = faster)
-                fast_loader = _make_fast_loader(loader.dataset, batch_size)
-                with torch.no_grad():
-                    for x, y in fast_loader:
-                        feats = encoder(x.to(device)).cpu()
-                        all_feats.append(feats)
-                        all_labels.append(y.cpu())
-                features = torch.cat(all_feats, dim=0)   # (N, D)
-                labels   = torch.cat(all_labels, dim=0)  # (N,)
-                torch.save(features, feat_path)
-                torch.save(labels,   label_path)
-                print(f"{len(features)} samples, shape {tuple(features.shape)}")
+            features, labels = _load_or_encode(
+                encoder, loader.dataset, feat_path, label_path,
+                device=device, batch_size=batch_size, force_redo=force_redo,
+                tokens=tokens, label=f"task {t} / {split_name}",
+            )
 
             ds = FeatureTensorDataset(features, labels)
             # Preserve original loader's shuffle setting
@@ -160,9 +183,78 @@ def cache_features(
         new_task["val"]   = loaders["val"]
         new_task["test"]  = loaders["test"]
         new_task["feature_dim"] = feature_dim
+        if tokens:
+            new_task["n_tokens"] = n_tokens
         new_tasks.append(new_task)
 
     return new_tasks
+
+
+def cache_split_features(
+    encoder,
+    dataset,
+    cache_dir:  str,
+    key:        str,
+    device:     str  = "cpu",
+    batch_size: int  = 256,
+    force_redo: bool = False,
+    tokens:     bool = False,
+):
+    """Cache ONE split's features and return them as (features, labels) tensors.
+
+    The single-split entry point behind `cache_features`, exposed for single-task
+    studies (e.g. the module-family ablation) that encode a whole dataset split once
+    and then index subsets out of it, rather than materialising a stream of task dicts.
+
+    Files are `<cache_dir>/<key>_features.pt` and `<cache_dir>/<key>_labels.pt`.
+    Returns float32 features (round-tripped through float16 on disk when `tokens=True`).
+    The caller owns `cache_dir` (including any `_tok{T}` suffix) and its meta.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    return _load_or_encode(
+        encoder, dataset,
+        os.path.join(cache_dir, f"{key}_features.pt"),
+        os.path.join(cache_dir, f"{key}_labels.pt"),
+        device=device, batch_size=batch_size, force_redo=force_redo,
+        tokens=tokens, label=key,
+    )
+
+
+def _load_or_encode(encoder, dataset, feat_path: str, label_path: str, *,
+                    device: str, batch_size: int, force_redo: bool,
+                    tokens: bool, label: str):
+    """Read a cached (features, labels) pair, or run the encoder over `dataset` and write it.
+
+    Token caches are stored float16 and returned float32; the freshly-computed tensor is
+    put through the same half() cast before being returned, so a cache-miss run and a
+    cache-hit run hand the caller bit-identical values.
+    """
+    if not force_redo and os.path.exists(feat_path) and os.path.exists(label_path):
+        features = torch.load(feat_path, map_location="cpu", weights_only=True)
+        labels   = torch.load(label_path, map_location="cpu", weights_only=True)
+    else:
+        print(f"  [cache] {label} ...", end=" ", flush=True)
+        all_feats, all_labels = [], []
+        # Use a fresh loader at the requested batch_size (larger = faster)
+        fast_loader = _make_fast_loader(dataset, batch_size)
+        with torch.no_grad():
+            for x, y in fast_loader:
+                feats = encoder(x.to(device)).cpu()
+                all_feats.append(feats.half() if tokens else feats)
+                all_labels.append(y.cpu())
+        features = torch.cat(all_feats, dim=0)   # (N, D) or (N, 1 + T, D) float16
+        labels   = torch.cat(all_labels, dim=0)  # (N,)
+        torch.save(features, feat_path)
+        torch.save(labels,   label_path)
+        print(f"{len(features)} samples, shape {tuple(features.shape)}")
+
+    if tokens:
+        if features.ndim != 3:
+            raise ValueError(
+                f"token cache {feat_path} has shape {tuple(features.shape)}; expected (N, 1 + T, D)."
+            )
+        features = features.float()
+    return features, labels
 
 
 def _make_fast_loader(dataset, batch_size: int) -> DataLoader:

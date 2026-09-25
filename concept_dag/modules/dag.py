@@ -296,6 +296,104 @@ class ConceptDAG(nn.Module):
         }
 
     # -----------------------------------------------------------------------
+    # Parameter accounting (for the CL parameter-budget accounting)
+    # -----------------------------------------------------------------------
+
+    def parameter_count(self, trainable_only: bool = False) -> int:
+        """Total parameters across all modules (the number the params-vs-tasks curve tracks)."""
+        return sum(
+            p.numel()
+            for p in self.parameters()
+            if (p.requires_grad or not trainable_only)
+        )
+
+    # -----------------------------------------------------------------------
+    # Reduction / consolidation surgery (Bayesian-model-reduction side)
+    # -----------------------------------------------------------------------
+
+    def descendants(self, module_ids: List[str]) -> Set[str]:
+        """All nodes reachable by following child edges from `module_ids` (exclusive of inputs)."""
+        visited: Set[str] = set()
+        queue = list(module_ids)
+        while queue:
+            node = queue.pop()
+            for cid in self._children.get(node, []):
+                if cid not in visited:
+                    visited.add(cid)
+                    queue.append(cid)
+        return visited
+
+    def affected_tasks(self, module_id: str) -> Set[str]:
+        """
+        Every node whose forward pass routes through `module_id` (itself + all descendants).
+        These are the tasks a merge/prune/truncation of `module_id` could disturb — the set the
+        backward-interference gate must re-evaluate before accepting a reduction.
+        """
+        return {module_id} | self.descendants([module_id])
+
+    def remove_module(self, module_id: str):
+        """
+        Delete a leaf concept (out_degree == 0) from the DAG. Refuses to remove a node that still
+        has children — re-point or merge them first. Reduction op (3): dead-concept prune.
+        """
+        if module_id not in self._modules_dict:
+            raise ValueError(f"Module '{module_id}' not in DAG.")
+        if self._children[module_id]:
+            raise ValueError(
+                f"Cannot remove '{module_id}': it still has children "
+                f"{self._children[module_id]}. Merge or re-point them first."
+            )
+        # Detach from parents' child lists.
+        for pid in self._parents[module_id]:
+            self._children[pid] = [c for c in self._children[pid] if c != module_id]
+        del self._modules_dict[module_id]
+        del self._parents[module_id]
+        del self._children[module_id]
+        self._insertion_order = [m for m in self._insertion_order if m != module_id]
+
+    def merge_modules(self, keep_id: str, drop_id: str):
+        """
+        Reduction op (2): merge redundant concept `drop_id` into `keep_id`.
+
+        Re-points every child of `drop_id` onto `keep_id`, then removes `drop_id`. The *functional*
+        merge (making `keep_id` reproduce both concepts' outputs, e.g. by distillation) is the
+        caller's responsibility — do it BEFORE calling this so the re-pointed children see
+        approximately unchanged parent activations. This method only performs the graph surgery and
+        enforces safety.
+
+        Safety: refuses to merge when one node is an ancestor of the other (that would create a
+        cycle and is never the redundancy case — redundant concepts are parallel, not stacked).
+        """
+        if keep_id not in self._modules_dict or drop_id not in self._modules_dict:
+            raise ValueError(f"Both modules must exist (keep={keep_id}, drop={drop_id}).")
+        if keep_id == drop_id:
+            raise ValueError("keep_id and drop_id are the same module.")
+        if keep_id in self.descendants([drop_id]) or drop_id in self.descendants([keep_id]):
+            raise ValueError(
+                f"Refusing merge: '{keep_id}' and '{drop_id}' are in an ancestor/descendant "
+                "relationship (would create a cycle). Only parallel/redundant concepts may merge."
+            )
+
+        for child in list(self._children[drop_id]):
+            # Re-point the child's parent list: drop_id -> keep_id (dedupe if keep is already a parent).
+            new_parents: List[str] = []
+            for pid in self._parents[child]:
+                repl = keep_id if pid == drop_id else pid
+                if repl not in new_parents:
+                    new_parents.append(repl)
+            self._parents[child] = new_parents
+            # Mirror into keep_id's children.
+            if child not in self._children[keep_id]:
+                self._children[keep_id].append(child)
+            # Keep the child module's declared n_parents consistent with its new parent count.
+            child_mod = self._modules_dict[child]
+            child_mod.n_parents = len(new_parents)
+
+        # drop_id now has no children; safe to remove.
+        self._children[drop_id] = []
+        self.remove_module(drop_id)
+
+    # -----------------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------------
 

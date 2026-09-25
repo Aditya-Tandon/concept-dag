@@ -1,0 +1,1626 @@
+"""
+Kan-gated growth — the reuse-vs-grow decision for the Concept DAG.
+
+Motivation
+----------
+The current protocol (`two_stage.stage2_train`) *always* mints a new ConceptModule per task, so
+parameters grow linearly with the number of tasks. The Kan gate replaces that unconditional growth
+with an information test:
+
+    Grow a new concept  iff  the task cannot be solved by *recomposing existing concepts* —
+    i.e. a new concept beats pure recombination by more than its own description cost.
+
+This is the categorical "Kan obstruction" (no morphism from existing concept types to the needed
+sufficient statistic) made operational as a **paired minimum-description-length (MDL)** test, plus an
+optional geometric check on concept subspaces.
+
+The arbitrary-task problem
+--------------------------
+A task is arbitrary: classification, regression, density estimation, ranking… each has its own
+natural loss, on its own scale. If the gate hardcoded "accuracy" it would break on non-classification
+tasks, and an absolute loss threshold is meaningless across tasks (a 100-class task floors near
+log2(100) bits/sample; a binary task near 1). We handle this with three moves:
+
+  1. **Common currency = bits (negative log-likelihood).** Every task is cast as a probabilistic
+     prediction and scored by its own code length in bits. The gate never sees "accuracy"; it sees
+     ``nll_bits(prediction, target)`` supplied by the task. This is Wang & Buehler's per-regime
+     description-length functional ``L_b`` and Finzi's two-part code, made literal.
+
+  2. **Paired, scale-free decisions.** The decision variable is a *difference on the same held-out
+     data* — ``L_reuse - L_grow`` — compared against the new module's description cost, and against a
+     *relative* floor ``eps_rel * L_reuse``. Because both code lengths are measured on the same task,
+     the task's intrinsic difficulty cancels; the threshold lives in the universal bit currency, so
+     it transfers across tasks unchanged.
+
+  3. **The description-length functional travels with the task, not the gate.** A task registers a
+     :class:`TaskSpec` (a head factory + an ``nll_bits`` function). Adding a new *kind* of task means
+     writing a TaskSpec, never editing this file. The gate logic is task-agnostic.
+
+A fourth, metric-free signal is available for free: concept **subspace geometry**
+(``ConceptDAG.principal_angle_similarity``) is representational and independent of any loss, so
+"is the needed structure already present" has a geometric component that needs no per-task metric.
+The gate can require *both* a geometric obstruction and a codelength obstruction (AND) for a robust,
+two-independent-signals decision.
+"""
+
+from __future__ import annotations
+
+import math
+import copy
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from ..modules.dag import ConceptDAG
+from ..modules.concept_module import ConceptModule
+from ..utils.metrics import safe_cross_entropy
+
+_LOG2 = math.log(2.0)
+
+
+# ---------------------------------------------------------------------------
+# TaskSpec — the per-task description-length functional (L_b)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TaskSpec:
+    """
+    A task-agnostic description-length functional.
+
+    Fields
+    ------
+    name:      Human-readable task name (for logging / provenance).
+    make_head: ``make_head(in_dim) -> nn.Module`` builds a head mapping a concept embedding of width
+               ``in_dim`` to the parameters of the task's output distribution.
+    nll_bits:  ``nll_bits(head_out, target) -> Tensor`` returns the per-sample negative log-likelihood
+               **in bits** (i.e. natural-log NLL divided by ln 2). This is the code length of the
+               target under the model — the only task-specific quantity the gate consumes.
+    """
+
+    name: str
+    make_head: Callable[[int], nn.Module]
+    nll_bits: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+def classification_task(n_classes: int, name: str = "classification") -> TaskSpec:
+    """Categorical target → cross-entropy code length in bits."""
+
+    def make_head(in_dim: int) -> nn.Module:
+        return nn.Linear(in_dim, n_classes)
+
+    def nll_bits(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # cross_entropy returns nats; convert to bits. Keep per-sample (reduction='none').
+        return safe_cross_entropy(logits, y, reduction="none") / _LOG2
+
+    return TaskSpec(name=name, make_head=make_head, nll_bits=nll_bits)
+
+
+def regression_task(dim: int = 1, name: str = "regression") -> TaskSpec:
+    """
+    Continuous target → Gaussian code length in bits, with a learned homoscedastic log-variance.
+    The head emits the mean; the log-variance is a free parameter of the head so the code length is
+    a proper (calibrated) NLL rather than a raw MSE.
+    """
+
+    class GaussHead(nn.Module):
+        def __init__(self, in_dim: int):
+            super().__init__()
+            self.mean = nn.Linear(in_dim, dim)
+            self.log_var = nn.Parameter(torch.zeros(dim))
+
+        def forward(self, z: torch.Tensor) -> torch.Tensor:
+            mu = self.mean(z)
+            log_var = self.log_var.expand_as(mu)
+            return torch.stack([mu, log_var], dim=-1)  # (B, dim, 2)
+
+    def make_head(in_dim: int) -> nn.Module:
+        return GaussHead(in_dim)
+
+    def nll_bits(out: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        mu, log_var = out[..., 0], out[..., 1]
+        if y.ndim == 1:
+            y = y.unsqueeze(-1)
+        # 0.5 * [ log(2π) + log_var + (y-μ)²/σ² ], summed over target dims, in nats → bits.
+        nats = 0.5 * (math.log(2 * math.pi) + log_var + (y - mu) ** 2 / log_var.exp())
+        return nats.sum(dim=-1) / _LOG2
+
+    return TaskSpec(name=name, make_head=make_head, nll_bits=nll_bits)
+
+
+# ---------------------------------------------------------------------------
+# Reuse composer — solve the task by recomposing EXISTING concepts only
+# ---------------------------------------------------------------------------
+
+
+class ReuseComposer(nn.Module):
+    """
+    The "search / recombination" model: a **linear recombination** of the (frozen) parent concept
+    embeddings, read out with the task head. It may freely mix and re-weight every dimension of every
+    existing concept (a full linear map over the concatenated parents) but has **no non-linearity and
+    no hidden layer** — it cannot mint a *new* concept representation. That is the precise reuse-vs-grow
+    contrast: if a linear readout of existing concepts already solves the task, there is no
+    obstruction; only a task needing genuinely new (non-linear) structure justifies growing a concept.
+    """
+
+    def __init__(self, parent_dim: int, n_parents: int, head: nn.Module):
+        super().__init__()
+        # Linear recombination of all parent features → a concept-width readout → head. No non-linearity.
+        self.proj = nn.Linear(max(n_parents, 1) * parent_dim, parent_dim)
+        self.head = head
+
+    def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
+        # parent_stack: (B, n_parents, D) → concat → linear → (B, D)
+        return self.head(self.proj(parent_stack.flatten(1)))
+
+
+class SearchComposer(nn.Module):
+    """
+    The **Search-level** model: a *low-rank non-linear* recombination of a chosen subset of the frozen
+    parent concepts. It is meant to be intermediate between :class:`ReuseComposer` (linear, no hidden
+    layer — retrieval) and a new :class:`ConceptModule` (a full new representation — discovery):
+
+      concat(selected parents) → Linear(·, r) → GELU → Linear(r, D) → head          (r ≪ D)
+
+    The bottleneck rank ``r`` keeps its capacity far below a concept, so a task it solves is solved by
+    *recombining* existing concepts with a little non-linear glue — spending test-time compute — not by
+    minting new structure. Searching over the parent ``subset`` is the routing axis of that compute.
+
+    ``skip`` — the nesting fix. The bottleneck above is narrower than ReuseComposer's *full-rank*
+    linear map (r=16 vs D=128), so the plain form is NOT a superset of reuse: it can and does score
+    WORSE in held-out bits than plain linear recombination, making ``rel_search`` negative and the
+    reuse→search→grow ladder non-monotone (measured: [[search-on-raw-probe-result]], rel_search in
+    [−0.107, +0.017] on every 5-Datasets task, Search never fires). With ``skip=True`` the composer
+    adds a full-rank linear path in parallel with the bottleneck:
+
+      out = Linear_full(concat) + Linear(r→D)(GELU(Linear(concat→r)))  → head
+
+    Zeroing the non-linear branch recovers ReuseComposer exactly, so ``L_search ≤ L_reuse`` now holds
+    by construction (up to optimisation noise) and ``rel_search ≥ 0`` is meaningful: it measures what
+    the non-linear glue adds *on top of* reuse, which is what the decision rule assumes.
+    """
+
+    def __init__(self, parent_dim: int, n_parents: int, head: nn.Module,
+                 rank: int = 16, subset: Optional[Tuple[int, ...]] = None,
+                 skip: bool = False):
+        super().__init__()
+        self.subset = tuple(range(n_parents)) if subset is None else tuple(subset)
+        in_dim = max(len(self.subset), 1) * parent_dim
+        self.enc = nn.Linear(in_dim, rank)
+        self.act = nn.GELU()
+        self.dec = nn.Linear(rank, parent_dim)
+        self.skip = nn.Linear(in_dim, parent_dim) if skip else None
+        if self.skip is not None:
+            # Start at the reuse solution: the non-linear branch contributes nothing until training
+            # finds a use for it, so search begins from reuse rather than racing it from scratch.
+            nn.init.zeros_(self.dec.weight)
+            nn.init.zeros_(self.dec.bias)
+        self.head = head
+
+    def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
+        sel = parent_stack[:, self.subset, :] if parent_stack.dim() == 3 else parent_stack
+        flat = sel.flatten(1)
+        z = self.dec(self.act(self.enc(flat)))
+        if self.skip is not None:
+            z = z + self.skip(flat)
+        return self.head(z)
+
+
+class _RootGrowModel(nn.Module):
+    """Grow probe in raw-root mode: a candidate root concept (n_parents=0) reading the raw encoder
+    features, exactly the view a grown root DAGNode has. Kept module-level so both deciders share it."""
+
+    def __init__(self, module: nn.Module, head: nn.Module):
+        super().__init__()
+        self.module = module
+        self.head = head
+
+    def forward(self, raw_x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.module(raw_x))
+
+
+class _GrowModel(nn.Module):
+    """Grow probe in legacy (parents-only) mode: a fresh child ConceptModule over the SAME frozen
+    parent stack the reuse rung sees. Module level so every decider (and every estimator branch)
+    builds the identical probe."""
+
+    def __init__(self, module: ConceptModule, head: nn.Module):
+        super().__init__()
+        self.module = module
+        self.head = head
+
+    def forward(self, parent_stack: torch.Tensor) -> torch.Tensor:
+        outs = [parent_stack[:, i, :] for i in range(parent_stack.shape[1])]
+        return self.head(self.module(x=None, parent_outputs=outs))
+
+
+class _NullModel(nn.Module):
+    """Marginal (input-independent) predictor: the head applied to a zero embedding. Sets the
+    ``reducible`` scale every rung fraction is normalised by."""
+
+    def __init__(self, head: nn.Module, concept_dim: int):
+        super().__init__()
+        self.head = head
+        self.concept_dim = concept_dim
+
+    def forward(self, xb: torch.Tensor) -> torch.Tensor:
+        return self.head(torch.zeros(xb.shape[0], self.concept_dim, device=xb.device))
+
+
+# ---------------------------------------------------------------------------
+# The gate record (slots into the vault's gate_verdict convention)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class KanGateRecord:
+    task_name: str
+    decision: str                 # "grow" | "reuse"
+    L_reuse_bits: float           # held-out code length per sample, reuse-only model
+    L_grow_bits: float            # held-out code length per sample, grow model
+    delta_bits_per_sample: float  # L_reuse - L_grow  (>0 ⇒ growing helps)
+    model_bits: float             # description cost of the extra parameters a new concept adds
+    n_samples: int
+    net_codelength_delta: float   # delta_bits_per_sample * N - model_bits  (>0 ⇒ MDL favours grow)
+    rel_improvement: float        # delta_bits_per_sample / L_reuse  (scale-free)
+    best_subspace_similarity: Optional[float]  # geometric signal in [0, top_k]; None if no parents
+    obstruction_geometric: Optional[bool]
+    obstruction_codelength: bool
+    reason: str
+    # --- Search level (three-way gate); None on the binary reuse-vs-grow path. ---
+    L_search_bits: Optional[float] = None       # held-out bits of the best bounded-search composition
+    rel_search: Optional[float] = None          # fraction of reducible info Search adds beyond reuse
+    rel_grow: Optional[float] = None            # fraction of reducible info grow adds beyond best search
+    search_meta: Optional[dict] = None          # winning search config {subset, rank} to rebuild it
+    search_trace: Optional[list] = None         # [(T, best L_search so far)] — the compute knee
+    # What the grow probe consumed: "parents" (legacy — capped by parent information, cannot certify
+    # obstructions on domains absent from parents) or "raw-root" (a real grown root's view: the raw
+    # encoder features; L_grow then estimates what a NEW root concept can actually achieve).
+    grow_probe_input: str = "parents"
+    # --- 2026-09-02 additions (all optional; None on paths that do not compute them) ---
+    L_null_bits: Optional[float] = None          # marginal (input-independent) code length
+    reducible_grow: Optional[float] = None       # L_null − L_grow  (published runs up to 2026-09-03
+                                                  # used this normaliser as the default; "best" is the
+                                                  # default now — validated equal decisions in
+                                                  # best-rung-denominator-stress-test /
+                                                  # gate-arms-multiseed-ctrl-result)
+    reducible_best: Optional[float] = None       # L_null − min(L_reuse, L_search, L_grow)
+    reducible_mode: Optional[str] = None         # which normaliser DECIDED: "grow" | "best"
+    rel_search_best: Optional[float] = None      # the fractions under the best-rung normaliser
+    rel_grow_best: Optional[float] = None
+    rel_improvement_best: Optional[float] = None
+    n_rungs_above_null: Optional[int] = None     # diagnostic: probes that scored worse than the null
+    estimator_meta: Optional[dict] = None        # single vs crossfit; per-fold bits and SEs
+    split_meta: Optional[dict] = None            # the (train, held-out) indices a follow-up probe reuses
+
+    def as_dict(self) -> dict:
+        return {k: getattr(self, k) for k in self.__dataclass_fields__}
+
+
+# ---------------------------------------------------------------------------
+# Internals: cache frozen parent embeddings; train a readout to convergence
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def _cache_parent_embeddings(
+    dag: ConceptDAG,
+    parent_ids: List[str],
+    loader: DataLoader,
+    device: str,
+    input_encoder: Optional[nn.Module],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run the frozen ancestor subgraph once; return (parent_stack (N, P, D), targets (N,...))."""
+    stacks, ys = [], []
+    for x, y in loader:
+        x = x.to(device)
+        if input_encoder is not None:
+            x = input_encoder(x)
+        _, emb = dag.forward(x, active_nodes=parent_ids, return_all_embeddings=True)
+        stacks.append(torch.stack([emb[pid] for pid in parent_ids], dim=1).cpu())  # (B, P, D)
+        ys.append(y.cpu())
+    return torch.cat(stacks, dim=0), torch.cat(ys, dim=0)
+
+
+def _held_out_codelength(
+    model: nn.Module,
+    forward: Callable[[nn.Module, torch.Tensor], torch.Tensor],
+    spec: TaskSpec,
+    train_X: torch.Tensor,
+    train_y: torch.Tensor,
+    val_X: torch.Tensor,
+    val_y: torch.Tensor,
+    n_epochs: int,
+    lr: float,
+    device: str,
+    batch_size: int = 128,
+    score_X: Optional[torch.Tensor] = None,
+    score_y: Optional[torch.Tensor] = None,
+    return_both: bool = False,
+) -> float:
+    """
+    Fit `model` on (train_X, train_y) minimising bit code length; return the **best** held-out
+    bits/sample seen during training (early stopping).
+
+    ``score_X/score_y`` (optional) — a set DISJOINT from ``val``: early stopping still selects the
+    epoch on ``val``, but the returned bits are measured on the score set at that epoch. This
+    removes the min-over-evaluations optimism of scoring on the selection set (the cross-fit
+    estimator of [[small-n-codelength-estimator-stress-test]]). Default None = published behaviour.
+
+    ``return_both`` (requires a score set) — instead of the single published scalar, return
+    ``(best_select_bits, score_bits_at_best_select, per_example_score_bits)``: the SELECT (val)
+    bits at the best-selection epoch, the SCORE bits at that same epoch (what the published path
+    already returns), and the per-example ``spec.nll_bits`` vector on the score set at that epoch
+    — the paired quantity the select-score estimator's standard errors are built from
+    ([[search-selection-optimism]]). Existing callers (``return_both=False``, the default) are
+    unaffected.
+
+    Early stopping is essential, not cosmetic: without it an over-parameterised grow-probe overfits
+    and its final val code length can exceed the reuse model's, masking a real obstruction. The
+    minimum held-out code length is the honest estimate of what each model class can achieve, so the
+    reuse-vs-grow comparison is between best-achievable code lengths, not arbitrary end-of-run ones.
+    """
+    if return_both and score_X is None:
+        raise ValueError("return_both=True requires a score set (score_X/score_y)")
+    model = model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    n = train_X.shape[0]
+    best_val = float("inf")
+    best_score = float("inf")
+    best_score_bits: Optional[torch.Tensor] = None
+    for _ in range(n_epochs):
+        model.train()
+        perm = torch.randperm(n)
+        for i in range(0, n, batch_size):
+            idx = perm[i : i + batch_size]
+            xb = train_X[idx].to(device)
+            yb = train_y[idx].to(device)
+            out = forward(model, xb)
+            loss = spec.nll_bits(out, yb).mean()  # bits/sample
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()
+        model.eval()
+        with torch.no_grad():
+            vout = forward(model, val_X.to(device))
+            val_bits = float(spec.nll_bits(vout, val_y.to(device)).mean().item())
+            if val_bits < best_val:
+                best_val = val_bits
+                if score_X is not None:
+                    sout = forward(model, score_X.to(device))
+                    per_example = spec.nll_bits(sout, score_y.to(device))
+                    best_score = float(per_example.mean().item())
+                    if return_both:
+                        best_score_bits = per_example.detach().cpu()
+    if return_both:
+        return best_val, best_score, best_score_bits
+    return best_val if score_X is None else best_score
+
+
+# ---------------------------------------------------------------------------
+# Prequential (online / description-length) code length — [[prequential-grow-probe]],
+# [[blier-ollivier-2018-description-length]]
+# ---------------------------------------------------------------------------
+
+
+def _blocks_from_order(order: torch.Tensor, n_blocks: int) -> List[torch.Tensor]:
+    """Split ``order`` (a permutation of the cache indices) into ``n_blocks`` near-equal CONTIGUOUS
+    chunks — the prequential coding schedule.
+
+    Contiguity in ``order`` is what makes the rungs *paired*: two rungs handed the same ``order``
+    see the identical block index sets, so their block curves differ only by model class, never by
+    which examples they were trained/scored on. The first ``N % B`` blocks get one extra element
+    (``numpy.array_split`` semantics). ``B`` is clamped to ``[2, N]`` — a single block has no
+    prediction step and would make the curve empty.
+    """
+    n = int(order.numel())
+    if n < 2:
+        raise ValueError(f"prequential coding needs at least 2 examples, got {n}")
+    B = max(2, min(int(n_blocks), n))
+    base, rem = divmod(n, B)
+    blocks, start = [], 0
+    for b in range(B):
+        size = base + (1 if b < rem else 0)
+        blocks.append(order[start : start + size])
+        start += size
+    return blocks
+
+
+def _fit_tail(curve: List[Tuple[int, float]], n_deploy: int, exponent: float) -> float:
+    """Extrapolate a prequential block curve to the DEPLOYED sample size.
+
+    Fits ``bits ≈ a + c · n_seen^(−exponent)`` by ordinary least squares in the two-function basis
+    ``{1, n^(−exponent)}`` (closed form, evaluated in float64) and returns the fit at
+    ``n_deploy``. Exponent ½ is the pre-registered default (Amari-style 1/√n learning curve of a
+    fixed-capacity predictor); {¼, ½, 1} are logged for sensitivity — see
+    [[prequential-grow-probe]].
+
+    Guards:
+      * fewer than 2 curve points → the last block's bits (nothing to extrapolate from);
+      * singular design (every ``n_seen`` identical, so the ``n^(−e)`` column has no variance) →
+        the last block's bits;
+      * the fit is CLAMPED to ``[min(bits) − 0.5, max(bits)]`` so a wild extrapolation cannot claim
+        more than half a bit beyond the best block actually observed, nor land above the worst.
+        Unclamped, a noisy 3–4 point curve can extrapolate arbitrarily far below zero and hand the
+        gate an unbounded ``reducible``. Note the floor is *relative*: on a nearly-solved task
+        (best block ≈ 0.1 bits) the clamped tail can still be slightly negative. It is an estimate
+        of a code length, not one — it enters the gate only through differences.
+
+    Bits are non-negative, so the tail is floored at 0 after the clamp above.
+    """
+    if not curve:
+        return float("nan")
+    bits = [float(b) for _, b in curve]
+    if len(curve) < 2:
+        return bits[-1]
+    e = float(exponent)
+    u = torch.tensor([float(n) ** (-e) for n, _ in curve], dtype=torch.float64)
+    b64 = torch.tensor(bits, dtype=torch.float64)
+    u_mean, b_mean = u.mean(), b64.mean()
+    du = u - u_mean
+    s_uu = float((du * du).sum())
+    # Scale-free singularity test: no spread in the regressor ⇒ {1, n^(−e)} is rank 1.
+    if s_uu <= 1e-24 * max(1.0, float((u * u).sum())):
+        return bits[-1]
+    c = float((du * (b64 - b_mean)).sum()) / s_uu
+    a = float(b_mean) - c * float(u_mean)
+    pred = a + c * float(n_deploy) ** (-e)
+    lo, hi = min(bits) - 0.5, max(bits)
+    tail = float(min(max(pred, lo), hi))
+    return max(tail, 0.0)
+
+
+def _prequential_codelength(
+    model: nn.Module,
+    forward: Callable[[nn.Module, torch.Tensor], torch.Tensor],
+    spec: TaskSpec,
+    X: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    n_blocks: int,
+    n_epochs: int,
+    lr: float,
+    device: str,
+    order: torch.Tensor,
+    n_classes_or_uniform_bits: float,
+    batch_size: int = 128,
+    tail_exponent: float = 0.5,
+    tail_exponents_logged: Tuple[float, ...] = (0.25, 0.5, 1.0),
+) -> dict:
+    """Code the task's own data ONLINE and report both MDL quantities the gate can decide on.
+
+    ``order`` (a permutation supplied by the caller — the SAME one for every rung of a task, so the
+    rungs are paired) is split into ``B`` contiguous blocks. Block 0 is coded at the uniform rate
+    (``n_classes_or_uniform_bits`` bits/sample: no model has seen anything yet). For ``b = 1..B−1``
+    the model is trained — WARM-STARTED, the same object keeps learning, so the whole curve costs
+    ≈2× one fit rather than B× — on the prefix ``blocks[:b]`` and then codes the not-yet-seen block
+    ``b``. There is no held-out set and no early stopping: every example is paid for exactly once,
+    as a prediction before it is trained on ([[blier-ollivier-2018-description-length]]).
+
+    Returns (all JSON-serialisable):
+      ``total``      strict prequential description length per sample — the honest MDL number,
+                     which CHARGES a data-hungry model class for its expensive early blocks;
+      ``curve``      ``[(n_seen_b, bits_b)]``, the learning curve measured on the task itself;
+      ``tail``       ``curve`` extrapolated to ``n_deploy = N`` via :func:`_fit_tail` — the bits the
+                     rung is expected to achieve once trained on ALL of the task's data, i.e. the
+                     regime the chosen rung is actually deployed in;
+      ``tail_by_exponent`` the same fit under each logged exponent (sensitivity, never decided on);
+      ``last_block``, ``n_deploy``, ``n_blocks``, ``tail_exponent``, ``uniform_bits``.
+
+    The model is left trained on ``blocks[:B−1]`` (everything but the last block).
+    """
+    blocks = _blocks_from_order(order, n_blocks)
+    B = len(blocks)
+    N = int(order.numel())
+    uniform_bits = float(n_classes_or_uniform_bits)
+
+    model = model.to(device)
+    curve: List[Tuple[int, float]] = []
+    weighted = uniform_bits * int(blocks[0].numel())  # block 0: coded before any training
+    for b in range(1, B):
+        prefix = torch.cat(blocks[:b])
+        m = int(prefix.numel())
+        # Warm start: the SAME model keeps its weights; only the optimiser state is refreshed for
+        # the enlarged prefix. Training matches _held_out_codelength exactly (AdamW, wd 1e-4,
+        # grad-clip 1.0) except that there is nothing to early-stop on.
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        for _ in range(n_epochs):
+            model.train()
+            perm = torch.randperm(m)
+            for i in range(0, m, batch_size):
+                idx = prefix[perm[i : i + batch_size]]
+                xb = X[idx].to(device)
+                yb = y[idx].to(device)
+                out = forward(model, xb)
+                loss = spec.nll_bits(out, yb).mean()  # bits/sample
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                opt.step()
+        model.eval()
+        with torch.no_grad():
+            bout = forward(model, X[blocks[b]].to(device))
+            bits_b = float(spec.nll_bits(bout, y[blocks[b]].to(device)).mean().item())
+        curve.append((m, bits_b))
+        weighted += bits_b * int(blocks[b].numel())
+
+    return {
+        "total": weighted / N,
+        "curve": curve,
+        "tail": _fit_tail(curve, N, tail_exponent),
+        "tail_by_exponent": {str(e): _fit_tail(curve, N, float(e)) for e in tail_exponents_logged},
+        "last_block": (curve[-1][1] if curve else uniform_bits),
+        "n_deploy": N,
+        "n_blocks": B,
+        "tail_exponent": float(tail_exponent),
+        "uniform_bits": uniform_bits,
+    }
+
+
+def _uniform_bits_for(y: torch.Tensor) -> float:
+    """Bits/sample of the uniform code that pays for the prequential first block.
+
+    Integer targets are classification labels: ``log2(n_classes)`` with ``n_classes`` read off the
+    cache (``max(y) + 1``). Continuous targets have no canonical uniform code, so the caller must
+    supply one explicitly (``preq_uniform_bits``) rather than have one invented here.
+    """
+    if y.is_floating_point() or y.is_complex():
+        raise ValueError(
+            "prequential coding needs the uniform first-block rate for a non-integer target; "
+            "pass preq_uniform_bits=<bits/sample> explicitly"
+        )
+    return math.log2(max(int(y.max().item()) + 1, 2))
+
+
+# ---------------------------------------------------------------------------
+# The gate
+# ---------------------------------------------------------------------------
+
+
+def reuse_vs_grow(
+    dag: ConceptDAG,
+    parent_ids: List[str],
+    new_module_factory: Callable[[], ConceptModule],
+    spec: TaskSpec,
+    loader: DataLoader,
+    query_subspace: Optional[torch.Tensor] = None,
+    *,
+    concept_dim: int,
+    device: str = "cpu",
+    input_encoder: Optional[nn.Module] = None,
+    n_epochs: int = 15,
+    lr: float = 1e-3,
+    val_fraction: float = 0.3,
+    eps_rel: float = 0.05,
+    sim_threshold: Optional[float] = None,
+    require_geometric: bool = False,
+    require_mdl: bool = False,
+    bits_per_param_fn: Optional[Callable[[int, int], float]] = None,
+) -> KanGateRecord:
+    """
+    Decide whether to GROW a new concept or REUSE existing ones for this task.
+
+    The decision is paired and scale-free (see module docstring):
+      * ``L_reuse`` = held-out code length (bits/sample) of the recombination-only model.
+      * ``L_grow``  = held-out code length of the model that adds a new ConceptModule.
+      * MDL obstruction: net code length falls, ``(L_reuse - L_grow) * N > model_bits``.
+      * Relative obstruction: ``(L_reuse - L_grow) / L_reuse > eps_rel`` — this is the term that makes
+        the threshold transfer across arbitrary tasks, since it is dimensionless.
+      * Optional geometric obstruction: no existing concept subspace aligns with the task probe
+        subspace above ``sim_threshold``.
+
+    GROW iff the codelength obstruction holds (and, if ``require_geometric``, the geometric one too).
+    With no parents (task 0, or nothing routable) growth is forced.
+
+    Returns a :class:`KanGateRecord` — log it as the task's gate artifact.
+    """
+    # --- No parents ⇒ nothing to reuse ⇒ growth is forced. ---
+    if not parent_ids:
+        return KanGateRecord(
+            task_name=spec.name, decision="grow",
+            L_reuse_bits=float("inf"), L_grow_bits=float("nan"),
+            delta_bits_per_sample=float("inf"), model_bits=0.0, n_samples=0,
+            net_codelength_delta=float("inf"), rel_improvement=float("inf"),
+            best_subspace_similarity=None, obstruction_geometric=None,
+            obstruction_codelength=True,
+            reason="no parents to recompose — growth forced (root concept).",
+        )
+
+    # --- Cache frozen parent embeddings; compute the geometric signal; delegate to the core. ---
+    X, y = _cache_parent_embeddings(dag, parent_ids, loader, device, input_encoder)
+    best_sim: Optional[float] = None
+    if query_subspace is not None:
+        sims = [
+            dag.principal_angle_similarity(query_subspace, mid)
+            for mid in dag.all_module_ids()
+            if dag.get_module(mid).get_concept_subspace() is not None
+        ]
+        if sims:
+            best_sim = max(sims)
+    return decide_reuse_vs_grow(
+        X, y, new_module_factory, spec,
+        concept_dim=concept_dim, n_parents=len(parent_ids), device=device,
+        n_epochs=n_epochs, lr=lr, val_fraction=val_fraction, eps_rel=eps_rel,
+        best_subspace_similarity=best_sim, sim_threshold=sim_threshold,
+        require_geometric=require_geometric, require_mdl=require_mdl,
+        bits_per_param_fn=bits_per_param_fn,
+    )
+
+
+def decide_reuse_vs_grow(
+    parent_stack: torch.Tensor,
+    targets: torch.Tensor,
+    new_module_factory: Callable[[], ConceptModule],
+    spec: TaskSpec,
+    *,
+    concept_dim: int,
+    n_parents: int,
+    device: str = "cpu",
+    n_epochs: int = 15,
+    lr: float = 1e-3,
+    val_fraction: float = 0.3,
+    eps_rel: float = 0.05,
+    best_subspace_similarity: Optional[float] = None,
+    sim_threshold: Optional[float] = None,
+    require_geometric: bool = False,
+    require_mdl: bool = False,
+    bits_per_param_fn: Optional[Callable[[int, int], float]] = None,
+    raw_stack: Optional[torch.Tensor] = None,
+    root_module_factory: Optional[Callable[[], nn.Module]] = None,
+    reducible_mode: str = "best",
+) -> KanGateRecord:
+    """
+    Backbone-agnostic reuse-vs-grow decision on a precomputed parent stack.
+
+    ``parent_stack`` is (N, n_parents, concept_dim) — the frozen parent concept embeddings — and
+    ``targets`` is (N, ...). This is the shared core used by both the ConceptDAG path
+    (:func:`reuse_vs_grow`) and the DAGNode experiment path, so the decision logic lives in exactly
+    one place. ``best_subspace_similarity`` is the (loss-free) geometric signal, if available.
+
+    ``raw_stack`` (N, feature_dim) + ``root_module_factory`` switch the grow probe to **raw-root
+    mode**: L_grow is measured by a probe with a real grown root's view — ``root_module_factory()``
+    (a ConceptModule with n_parents=0, capacity-matched to an actual root node) consuming the raw
+    encoder features. Without raw access the probe is bottlenecked through the very parents whose
+    inadequacy it is meant to certify, so obstructions on domains absent from the parents are
+    invisible (the 5-Datasets SVHN failure). Reuse and search stay parents-only by construction —
+    that asymmetry IS the reuse-vs-grow distinction: recombine what exists vs. mint new structure
+    from raw input. Held-out early-stopped bits remain the capacity charge (prequential-MDL style):
+    an over-capacity raw probe that only memorises does not lower held-out code length.
+    """
+    X, y = parent_stack, targets
+    n = X.shape[0]
+    n_val = max(1, int(round(val_fraction * n)))
+    perm = torch.randperm(n)
+    val_idx, tr_idx = perm[:n_val], perm[n_val:]
+    Xtr, ytr, Xval, yval = X[tr_idx], y[tr_idx], X[val_idx], y[val_idx]
+    use_raw = raw_stack is not None and root_module_factory is not None
+    if use_raw:
+        # Same split indices as the parent stack, so all code lengths share one held-out set.
+        Rtr, Rval = raw_stack[tr_idx], raw_stack[val_idx]
+
+    # --- Reuse-only model: linear recombination of frozen parents + task head. ---
+    reuse_model = ReuseComposer(parent_dim=concept_dim, n_parents=n_parents,
+                                head=spec.make_head(concept_dim))
+    L_reuse = _held_out_codelength(
+        reuse_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+        n_epochs=n_epochs, lr=lr, device=device,
+    )
+
+    # --- Grow model: what a NEW concept achieves. Raw-root mode probes a real grown root's view
+    # (raw encoder features, n_parents=0); legacy mode probes a child over the same parents. ---
+    if use_raw:
+        new_module = root_module_factory()
+        grow_head = spec.make_head(new_module.out_dim)
+        grow_model = _RootGrowModel(new_module, grow_head)
+        L_grow = _held_out_codelength(
+            grow_model, lambda m, xb: m(xb), spec, Rtr, ytr, Rval, yval,
+            n_epochs=n_epochs, lr=lr, device=device,
+        )
+    else:
+        new_module = new_module_factory()
+        grow_head = spec.make_head(new_module.out_dim)
+        grow_model = _GrowModel(new_module, grow_head)
+        L_grow = _held_out_codelength(
+            grow_model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+            n_epochs=n_epochs, lr=lr, device=device,
+        )
+
+    # --- Null (marginal) code length: best input-independent predictor. Sets the "reducible" scale. ---
+    L_null = _held_out_codelength(
+        _NullModel(spec.make_head(concept_dim), concept_dim), lambda m, xb: m(xb), spec,
+        Xtr, ytr, Xval, yval, n_epochs=max(n_epochs // 2, 10), lr=lr, device=device,
+    )
+
+    # --- Description cost of the EXTRA parameters growth introduces (grow − reuse). ---
+    k_extra = max(sum(p.numel() for p in grow_model.parameters())
+                  - sum(p.numel() for p in reuse_model.parameters()), 0)
+    if bits_per_param_fn is not None:
+        model_bits = bits_per_param_fn(k_extra, n)
+    else:
+        model_bits = 0.5 * k_extra * math.log2(max(n, 2))  # BIC-style two-part code cost
+
+    delta = L_reuse - L_grow                         # bits/sample the new concept saves
+    net = delta * n - model_bits                     # net code length change (bits)
+
+    # Primary decision: the fraction of *reducible* information (relative to the marginal L_null) that
+    # ONLY a new concept captures — grow's extra reduction over reuse, normalised by how much is
+    # reducible at all. This is scale-free (a fraction, transfers across arbitrary tasks) AND robust
+    # when reuse already nearly solves the task: there delta→0, so the fraction →0 and we reuse —
+    # unlike delta/L_reuse, which explodes as L_reuse→0. `rel` (the record field) now holds this
+    # residual fraction.
+    reducible_grow = max(L_null - L_grow, 1e-6)
+    reducible_best = max(L_null - min(L_reuse, L_grow), 1e-6)
+    rel_g, rel_b = delta / reducible_grow, delta / reducible_best
+    if reducible_mode == "grow":
+        reducible, rel = reducible_grow, rel_g
+    elif reducible_mode == "best":
+        reducible, rel = reducible_best, rel_b
+    else:
+        raise ValueError(f"unknown reducible_mode {reducible_mode!r}")
+    obstruction_code = rel > eps_rel
+    if require_mdl:
+        obstruction_code = obstruction_code and (net > 0.0)
+
+    obstruction_geom: Optional[bool] = None
+    if best_subspace_similarity is not None and sim_threshold is not None:
+        obstruction_geom = best_subspace_similarity < sim_threshold
+
+    if require_geometric and obstruction_geom is not None:
+        grow = obstruction_code and obstruction_geom
+    else:
+        grow = obstruction_code
+
+    probe_input = "raw-root" if use_raw else "parents"
+    reason = (
+        f"ΔL={delta:.4f} bits/sample (L_null={L_null:.3f} L_reuse={L_reuse:.3f} L_grow={L_grow:.3f}), "
+        f"residual_frac={rel:.3f} vs eps_rel={eps_rel}, grow_probe={probe_input}"
+        + (f", best_sim={best_subspace_similarity:.3f}" if best_subspace_similarity is not None else "")
+    )
+    return KanGateRecord(
+        task_name=spec.name, decision=("grow" if grow else "reuse"),
+        L_reuse_bits=L_reuse, L_grow_bits=L_grow,
+        delta_bits_per_sample=delta, model_bits=model_bits, n_samples=n,
+        net_codelength_delta=net, rel_improvement=rel,
+        best_subspace_similarity=best_subspace_similarity, obstruction_geometric=obstruction_geom,
+        obstruction_codelength=obstruction_code, reason=reason,
+        grow_probe_input=probe_input,
+        L_null_bits=L_null, reducible_grow=reducible_grow, reducible_best=reducible_best,
+        reducible_mode=reducible_mode, rel_improvement_best=rel_b,
+        n_rungs_above_null=int(sum(1 for L in (L_reuse, L_grow) if L > L_null)),
+        split_meta={"tr_idx": tr_idx.tolist(), "val_idx": val_idx.tolist()},
+    )
+
+
+# ---------------------------------------------------------------------------
+# The Search level — bounded test-time-compute search over existing concepts
+# ---------------------------------------------------------------------------
+
+
+def _enumerate_subsets(n_parents: int) -> List[Tuple[int, ...]]:
+    """Non-empty parent subsets, singletons first then the full set (routing search space)."""
+    singles = [(i,) for i in range(n_parents)]
+    full = [tuple(range(n_parents))] if n_parents > 1 else []
+    return singles + full
+
+
+def search_compose(
+    Xtr: torch.Tensor, ytr: torch.Tensor, Xval: torch.Tensor, yval: torch.Tensor,
+    spec: TaskSpec, *, concept_dim: int, n_parents: int, device: str,
+    n_epochs: int, lr: float, budget: int = 6, rank: int = 16, skip: bool = False,
+    baseline_L: Optional[float] = None, baseline_select_L: Optional[float] = None,
+    select_on: str = "score",
+    score_X: Optional[torch.Tensor] = None, score_y: Optional[torch.Tensor] = None,
+    estimator_fn: Optional[Callable[[nn.Module, Callable], Tuple[float, dict]]] = None,
+):
+    """Bounded search for the best composition of EXISTING concepts (the middle rung).
+
+    Spends up to ``budget`` trained candidates over the (parent-subset × restart) space, each a
+    :class:`SearchComposer`, and returns the best held-out code length, the winning config
+    ``{subset, rank}``, and the ``(T, best-L-so-far)`` trace. ``T`` (candidate count) is the reported
+    compute budget: L_search is monotone non-increasing in T, so its knee is the epiplexity signal for
+    how much structure is *compute-extractable* from existing concepts before growth is warranted.
+
+    ``baseline_L`` — pass ``L_reuse`` to seed the search with the **trivial composition**: plain
+    linear recombination is itself a composition of existing concepts, the one that spends no
+    test-time compute, so it belongs in the search space rather than racing it. Seeding makes
+    ``L_search ≤ L_reuse`` hold exactly (not merely at the optimum), so ``rel_search ≥ 0`` and the
+    reuse → search → grow ladder is monotone by construction. If the winning config comes back
+    ``{"trivial": True}`` the search found nothing better than reuse, and ``rel_search == 0``
+    correctly routes the decision to reuse. Without it, the rank-``r`` bottleneck can score WORSE
+    than full-rank linear reuse and Search can never win — measured in
+    [[search-on-raw-probe-result]] (rel_search ∈ [−0.107, +0.017], Search never fired).
+
+    ``select_on`` (only meaningful when a disjoint ``score_X/score_y`` is given and
+    ``estimator_fn`` is None) — which quantity picks the winner among the ``budget`` candidates:
+
+      * ``"score"`` (default, published behaviour) — the candidate with the lowest SCORE bits
+        wins. The winner is thus selected on the very set it is reported on — the candidate-
+        selection optimism [[search-selection-optimism]] measures.
+      * ``"select"`` — the candidate with the lowest SELECT (early-stop) bits wins; only the
+        WINNER's SCORE bits are read off and reported. ``baseline_select_L`` must then also be
+        given (the trivial composition's SELECT bits — mirrors ``baseline_L`` being its SCORE
+        bits): the trivial composition wins iff its SELECT bits are the lowest, in which case the
+        reported bits are ``baseline_L`` (its SCORE bits), exactly as the ``"score"`` path already
+        reports ``baseline_L`` when no candidate beats it.
+
+    ``estimator_fn`` — when given, ``estimator_fn(model, forward) -> (deciding_bits, meta)`` REPLACES
+    :func:`_held_out_codelength` for every candidate (the prequential estimator supplies its own
+    data and schedule, so ``Xtr/ytr/Xval/yval`` and the score set are then unused, and ``select_on``
+    does not apply). Candidates are selected by ``deciding_bits`` — the same quantity the other
+    rungs are compared on, so pairing survives — and the return grows a FOURTH element: the winning
+    candidate's ``meta`` (``None`` when the trivial composition won, i.e. no candidate beat
+    ``baseline_L``; the caller then reuses the reuse rung's meta, which is exactly what the trivial
+    composition is).
+
+    Return shape (unchanged paths are BYTE-IDENTICAL — same ``_held_out_codelength`` call, same
+    comparison key, same trace — to before ``select_on``/``baseline_select_L`` existed):
+      * no ``estimator_fn``, ``select_on="score"`` (the default, published behaviour, whether or
+        not a ``score_X`` is given — this is every existing caller) — the published 3-tuple
+        ``(L, cfg, trace)``, unchanged.
+      * ``estimator_fn`` given — the 4-tuple ``(L, cfg, trace, meta)`` above (``select_on`` does
+        not apply here).
+      * no ``estimator_fn``, ``select_on="select"`` AND a ``score_X`` given — the ONLY new path: a
+        6-tuple ``(L, cfg, trace, winner_select_bits, winner_per_example_score_bits,
+        score_argmin_L)``: the winner's SELECT bits and its per-example SCORE-set
+        ``spec.nll_bits`` vector (``baseline_select_L``/``None`` when the trivial composition won
+        and no per-candidate value is available for it — the caller then reuses the reuse rung's
+        own SELECT bits / per-example vector, exactly as ``baseline_L`` already stands in for the
+        trivial composition's reported bits), and ``score_argmin_L`` — the SCORE bits of whichever
+        candidate WOULD have won under ``select_on="score"``, computed for free from the same
+        per-candidate ``(sel_bits, L)`` pair every candidate already produces (no retraining): the
+        counterfactual the select-score estimator's ``search_selection_optimism`` is built from.
+        ``select_on="select"`` with no ``score_X`` falls back to the 3-tuple (there is nothing to
+        distinguish SELECT from SCORE without a disjoint score set).
+    """
+    if select_on not in ("score", "select"):
+        raise ValueError(f"unknown select_on {select_on!r} (expected 'score' or 'select')")
+    subsets = _enumerate_subsets(n_parents)
+    # Interleave: every subset once (seed 0), then extra restarts of each — best-first coverage.
+    candidates: List[Tuple[Tuple[int, ...], int]] = []
+    seed = 0
+    while len(candidates) < budget:
+        for sub in subsets:
+            candidates.append((sub, seed))
+            if len(candidates) >= budget:
+                break
+        seed += 1
+
+    # use_select is the ONLY branch that changes behaviour or return shape versus the published
+    # function: select_on="score" (default) always takes the `else` arms below, byte-identical to
+    # the pre-select_on code (same _held_out_codelength call, same comparison key, same 3-tuple).
+    use_select = select_on == "select" and score_X is not None and estimator_fn is None
+
+    best_L = float("inf") if baseline_L is None else float(baseline_L)
+    best_cfg = ({"subset": subsets[-1], "rank": rank, "skip": skip} if baseline_L is None
+                else {"subset": subsets[-1], "rank": rank, "skip": skip, "trivial": True})
+    best_key = (float(baseline_select_L) if (use_select and baseline_select_L is not None)
+                else best_L)
+    best_select_bits: Optional[float] = baseline_select_L if use_select else None
+    best_score_bits_vec: Optional[torch.Tensor] = None
+    # The score-argmin counterfactual: tracked in the SAME pass, from the SAME trained candidates
+    # (every candidate's SCORE bits ``L`` is already computed for the SELECT-argmin above), so it
+    # costs nothing extra and is directly comparable — same models, same data, same seeds.
+    score_argmin_L: float = float("inf") if baseline_L is None else float(baseline_L)
+    trace: List[Tuple[int, float]] = []
+    best_meta: Optional[dict] = None
+    # With a disjoint score set, candidates are SELECTED on (Xval) and the winner is REPORTED on
+    # the score set: baseline_L is then the reuse rung's *score* bits, and the selection value of
+    # the trivial composition is unknown, so the trivial composition wins ties on the score set.
+    for t, (sub, sd) in enumerate(candidates, start=1):
+        # Seed ONLY the candidate's initialisation, inside a forked RNG scope. Re-seeding the global
+        # generator here (the pre-2026-09-02 behaviour) silently made every later split permutation
+        # and initialisation in the run identical across --seed values, so multi-seed spreads
+        # under-stated seed variance (see search-on-raw-probe-fixed-result, claim ledger).
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(sd)
+            model = SearchComposer(parent_dim=concept_dim, n_parents=n_parents,
+                                   head=spec.make_head(concept_dim), rank=rank, subset=sub, skip=skip)
+        if estimator_fn is None:
+            if use_select:
+                sel_bits, L, per_example = _held_out_codelength(
+                    model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+                    n_epochs=n_epochs, lr=lr, device=device,
+                    score_X=score_X, score_y=score_y, return_both=True)
+                cand_key = sel_bits
+                if L < score_argmin_L:
+                    score_argmin_L = L
+            else:
+                L = _held_out_codelength(model, lambda m, xb: m(xb), spec, Xtr, ytr, Xval, yval,
+                                         n_epochs=n_epochs, lr=lr, device=device, score_X=score_X, score_y=score_y)
+                cand_key = L
+            meta = None
+        else:
+            L, meta = estimator_fn(model, lambda m, xb: m(xb))
+            cand_key = L
+        if cand_key < best_key:
+            best_key = cand_key
+            best_L, best_cfg = L, {"subset": sub, "rank": rank, "skip": skip}
+            best_meta = meta
+            if use_select:
+                best_select_bits = sel_bits
+                best_score_bits_vec = per_example
+        trace.append((t, best_L))
+    if estimator_fn is not None:
+        return best_L, best_cfg, trace, best_meta
+    if not use_select:
+        return best_L, best_cfg, trace
+    return best_L, best_cfg, trace, best_select_bits, best_score_bits_vec, score_argmin_L
+
+
+def decide_reuse_search_grow(
+    parent_stack: torch.Tensor,
+    targets: torch.Tensor,
+    new_module_factory: Callable[[], ConceptModule],
+    spec: TaskSpec,
+    *,
+    concept_dim: int,
+    n_parents: int,
+    device: str = "cpu",
+    n_epochs: int = 15,
+    lr: float = 1e-3,
+    val_fraction: float = 0.3,
+    eps_grow: float = 0.05,
+    eps_search: float = 0.05,
+    search_budget: int = 6,
+    search_rank: int = 16,
+    search_skip: bool = False,
+    bits_per_param_fn: Optional[Callable[[int, int], float]] = None,
+    raw_stack: Optional[torch.Tensor] = None,
+    root_module_factory: Optional[Callable[[], nn.Module]] = None,
+    reducible_mode: str = "best",
+    estimator: str = "single",
+    n_splits: int = 5,
+    split_generator: Optional[torch.Generator] = None,
+    preq_blocks: int = 5,
+    preq_decide: str = "tail",
+    preq_exponent: float = 0.5,
+    preq_uniform_bits: Optional[float] = None,
+    ss_fracs: Tuple[float, float, float] = (0.65, 0.15, 0.20),
+    tie_rule: str = "none",
+    tie_z: float = 1.0,
+    tie_novelty: float = 0.1,
+) -> KanGateRecord:
+    """
+    Three-way escalation: **reuse → search → grow** on one MDL axis.
+
+    With ``raw_stack`` + ``root_module_factory`` the grow probe runs in raw-root mode (see
+    :func:`decide_reuse_vs_grow`): reuse and search stay parents-only, grow probes a real root's
+    view of the raw encoder features. The ladder then reads: grow only when even bounded search
+    over existing concepts leaves a residual that a raw-input concept closes.
+
+    All four probes (null, reuse, search, grow) are fit on the SAME split(s) so their code lengths
+    are directly comparable. Residual fractions:
+
+      * ``rel_search = (L_reuse  − L_search) / reducible`` — what bounded search adds beyond reuse
+      * ``rel_grow   = (L_search − L_grow)   / reducible`` — what a NEW concept adds beyond search
+
+    ``reducible_mode`` picks the normaliser that DECIDES (both are always recorded):
+      * ``"best"`` (default): ``L_null − min(L_reuse, L_search, L_grow)``. Every |slice| ≤ 1
+        whenever all rungs beat the null; additivity is lost when grow is not the best rung.
+      * ``"grow"``: ``L_null − L_grow`` — the normaliser published runs up to 2026-09-03 used as
+        the default. The slices telescope to exactly 1 but are unbounded when grow is not the best
+        rung (CTrL SVHN@400: rel_search +0.53 for a 0.12-bit gain) — see
+        [[best-rung-denominator-stress-test]]. Switching the default to "best" was validated to
+        give equal decisions in best-rung-denominator-stress-test and
+        gate-arms-multiseed-ctrl-result; ``"grow"`` stays reachable via ``reducible_mode="grow"``.
+
+    ``estimator`` picks how the held-out code lengths are measured — [[small-n-codelength-estimator-stress-test]]:
+      * ``"single"`` (published default): one random ``val_fraction`` split; each probe's bits are the
+        minimum over epoch-end evaluations on that split (an optimistic selection that is LARGER for
+        Search, which also takes the minimum over ``search_budget`` candidates).
+      * ``"crossfit"``: ``n_splits`` folds; within each fold the probes early-stop / the search selects
+        on an inner 20 % *selection* split and are SCORED on the held-out fold, so selection and
+        scoring never share examples; every rung is scored on the same folds (paired); the reported
+        bits are the fold means and ``estimator_meta`` carries per-fold values and the across-fold
+        SE of each rung difference.
+      * ``"prequential"``: no held-out set at all. The cache is ordered ONCE (``order``, shared by
+        every rung, so the rungs stay paired), split into ``preq_blocks`` contiguous blocks, and
+        each rung is coded online — train on the prefix, pay for the next block
+        ([[blier-ollivier-2018-description-length]], [[prequential-grow-probe]]). ``preq_decide``
+        picks which of the two resulting quantities DECIDES (both are always recorded):
+
+          - **"total"** — the strict description length: block 0 at the uniform rate plus every
+            block's bits, per sample. This is the MDL number, and it deliberately charges a rung
+            for its expensive early blocks: a data-hungry class pays for being data-hungry.
+          - **"tail"** (default) — the block curve ``bits(n_seen)`` extrapolated to ``n_deploy = N``
+            by ``a + c·n^(−preq_exponent)`` (:func:`_fit_tail`). This estimates the bits the rung
+            reaches once trained on ALL n.
+
+        They differ exactly where the gate was previously biased. Every held-out estimator trains
+        the grow rung on a FRACTION of the task (70 % single / 64 % crossfit) but deploys the grown
+        root on all of it, and grow is the rung whose code length falls fastest with n — so the
+        gate compared an under-trained grow probe against saturated linear rungs and chose Search
+        at a regret ([[gate-arms-multiseed-ctrl-result]]). ``tail`` scores every rung in the regime
+        it is deployed in and removes that training-fraction bias; ``total`` keeps the small-n
+        penalty (it is the right MDL quantity, not the right *deployment* quantity) and is
+        pre-registered as the companion arm predicted NOT to fix the regret. ``preq_exponent`` (½ by
+        default) is a sensitivity knob: ``estimator_meta`` logs the tail under {¼, ½, 1} for every
+        rung so the decision can be recomputed offline under any of them.
+      * ``"select-score"`` — [[search-selection-optimism]] (H5): ONE permutation, three DISJOINT
+        sets sized by ``ss_fracs`` (train / SELECT / SCORE, default 65/15/20 %). Every rung
+        early-stops on SELECT and is reported on SCORE (paired: all four rungs share the same three
+        sets). Unlike ``"single"``/``"crossfit"`` (where, with a score set, the Search rung's
+        best-of-``search_budget`` candidate is picked by the very SCORE bits it is then reported
+        on — the asymmetry H5 measures, since no other rung has a "pick the best of several" step),
+        here the Search candidate is chosen on SELECT (``search_compose(..., select_on="select")``)
+        and only the winner's SCORE bits are reported, removing that asymmetry. ``estimator_meta``
+        additionally carries per-rung SELECT/SCORE bits, ``search_select_bits``,
+        ``search_early_stop_optimism`` (SELECT bits − SCORE bits of the SELECT-chosen winner — the
+        early-stopping optimism every rung has), ``search_score_bits_selected_on_score`` and
+        ``search_selection_optimism``/``search_selection_optimism_abs`` (the SAME candidate set's
+        counterfactual score-argmin bits, and how much lower they read — the H5a asymmetry, live,
+        measured for free from the one search_compose pass), the three paired standard errors of
+        the SCORE-bit differences between rungs, ``se_split_proxy`` (the per-example SD the search-
+        vs-grow SE was built from), ``novelty`` (how much of the task reuse already explains),
+        ``tie_counterfactual`` (whether the tie rule would fire at z ∈ {0.5, 1, 2}, recorded
+        regardless of ``tie_rule``), and — only when ``tie_rule="grow"`` — a ``"tie"`` dict.
+
+    ``tie_rule`` (only consumed by ``estimator="select-score"``) — ``"none"`` (default, no effect)
+    or ``"grow"``: a free standard error from the SCORE-set paired differences lets the gate declare
+    a **tie** rather than force a decision variance cannot support. After the normal decision, if it
+    is not already "grow" and ``|L_search - L_grow| <= tie_z * se_search_minus_grow`` (the deciding
+    difference sits within ``tie_z`` SEs of zero) AND ``novelty < tie_novelty`` (the task is novel —
+    reuse explains little of it, so a grow-favouring tie-break cannot be the organic-duplicate grow
+    bias the raw-root probe was tested against), the decision becomes "grow".
+
+    Decision (cheapest sufficient rung): grow if ``rel_grow > eps_grow``; else search if
+    ``rel_search > eps_search``; else reuse. See [[test-time-compute-search-level]].
+    """
+    X, y = parent_stack, targets
+    n = X.shape[0]
+    use_raw = raw_stack is not None and root_module_factory is not None
+    gen = split_generator
+
+    # --- Rung model factories. One definition per rung, shared by every estimator branch, called in
+    # the published order (reuse → search → grow → null) so the global-RNG consumption — and hence
+    # the "single"/"crossfit" numbers — is byte-identical to the pre-prequential code. ---
+    def _new_reuse_model() -> nn.Module:
+        return ReuseComposer(parent_dim=concept_dim, n_parents=n_parents, head=spec.make_head(concept_dim))
+
+    def _new_grow_model() -> nn.Module:
+        """Raw-root mode probes a real grown root's view (raw features, n_parents=0); legacy mode
+        probes a child over the same frozen parents. The probe reads ``grow_source`` below."""
+        if use_raw:
+            new_module = root_module_factory()
+            return _RootGrowModel(new_module, spec.make_head(new_module.out_dim))
+        new_module = new_module_factory()
+        return _GrowModel(new_module, spec.make_head(new_module.out_dim))
+
+    def _new_null_model() -> nn.Module:
+        return _NullModel(spec.make_head(concept_dim), concept_dim)
+
+    grow_source = raw_stack if use_raw else X   # the tensor the grow probe consumes
+    fwd = lambda m, xb: m(xb)                   # noqa: E731 — every rung is a plain callable module
+
+    def _fit_rungs(tr, sel, sc):
+        """Fit null/reuse/search/grow on one (train, select, score) index triple. ``sc`` may be None
+        (single estimator: select == score, i.e. the published min-over-epochs behaviour)."""
+        Xtr, ytr, Xsel, ysel = X[tr], y[tr], X[sel], y[sel]
+        Xsc, ysc = (X[sc], y[sc]) if sc is not None else (None, None)
+        if use_raw:
+            Rtr, Rsel = raw_stack[tr], raw_stack[sel]
+            Rsc = raw_stack[sc] if sc is not None else None
+        out = {}
+        reuse_model = _new_reuse_model()
+        out["L_reuse"] = _held_out_codelength(reuse_model, fwd, spec, Xtr, ytr, Xsel, ysel,
+                                              n_epochs=n_epochs, lr=lr, device=device, score_X=Xsc, score_y=ysc)
+        out["L_search"], out["search_cfg"], out["trace"] = search_compose(
+            Xtr, ytr, Xsel, ysel, spec, concept_dim=concept_dim, n_parents=n_parents,
+            device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank,
+            skip=search_skip, baseline_L=out["L_reuse"], score_X=Xsc, score_y=ysc)
+        grow_model = _new_grow_model()
+        if use_raw:
+            out["L_grow"] = _held_out_codelength(grow_model, fwd, spec, Rtr, ytr, Rsel, ysel,
+                                                 n_epochs=n_epochs, lr=lr, device=device, score_X=Rsc, score_y=ysc)
+        else:
+            out["L_grow"] = _held_out_codelength(grow_model, fwd, spec, Xtr, ytr, Xsel, ysel,
+                                                 n_epochs=n_epochs, lr=lr, device=device, score_X=Xsc, score_y=ysc)
+        out["L_null"] = _held_out_codelength(_new_null_model(), fwd, spec,
+                                             Xtr, ytr, Xsel, ysel, n_epochs=max(n_epochs // 2, 10), lr=lr,
+                                             device=device, score_X=Xsc, score_y=ysc)
+        out["k_extra"] = max(sum(p.numel() for p in grow_model.parameters())
+                             - sum(p.numel() for p in reuse_model.parameters()), 0)
+        return out
+
+    if estimator == "single":
+        n_val = max(1, int(round(val_fraction * n)))
+        perm = torch.randperm(n, generator=gen)
+        val_idx, tr_idx = perm[:n_val], perm[n_val:]
+        r = _fit_rungs(tr_idx, val_idx, None)
+        L_reuse, L_search, L_grow, L_null = r["L_reuse"], r["L_search"], r["L_grow"], r["L_null"]
+        search_cfg, trace, k_extra = r["search_cfg"], r["trace"], r["k_extra"]
+        est_meta = {"estimator": "single", "n_train": int(len(tr_idx)), "n_select": int(n_val),
+                    "n_score": int(n_val)}
+        split_meta = {"tr_idx": tr_idx.tolist(), "val_idx": val_idx.tolist()}
+    elif estimator == "crossfit":
+        K = max(2, int(n_splits))
+        perm = torch.randperm(n, generator=gen)
+        folds = [perm[k::K] for k in range(K)]
+        per = []
+        fold_sel_idx = []
+        for k in range(K):
+            sc = folds[k]
+            rest = torch.cat([folds[j] for j in range(K) if j != k])
+            # rest = folds[0] ++ folds[1] ++ ... in fixed ascending order, so a positional prefix
+            # sel = rest[:n_sel] would be (almost) entirely fold 0's examples for every k != 0 —
+            # shuffle rest before slicing so each fold's selection subset is an independent draw.
+            # Reuse the caller's split_generator across folds (deterministic given its seed) when
+            # provided; otherwise fall back to a fresh per-fold generator so folds don't collide.
+            fold_gen = gen if gen is not None else torch.Generator().manual_seed(k)
+            rest = rest[torch.randperm(len(rest), generator=fold_gen)]
+            n_sel = max(1, int(round(0.2 * len(rest))))
+            sel, tr = rest[:n_sel], rest[n_sel:]
+            fold_sel_idx.append(sel)
+            per.append(_fit_rungs(tr, sel, sc))
+        def _mean(key): return float(sum(p[key] for p in per) / K)
+        def _se(a, b):
+            d = [p[a] - p[b] for p in per]
+            m = sum(d) / K
+            return float((sum((x - m) ** 2 for x in d) / (K * max(K - 1, 1))) ** 0.5)
+        L_reuse, L_search, L_grow, L_null = _mean("L_reuse"), _mean("L_search"), _mean("L_grow"), _mean("L_null")
+        # Winning search config: the fold whose L_search is closest to the fold mean (a representative
+        # composition, not the luckiest one); "trivial" if the trivial composition won a majority.
+        n_triv = sum(1 for p in per if p["search_cfg"].get("trivial"))
+        rep = min(range(K), key=lambda k: abs(per[k]["L_search"] - L_search))
+        search_cfg = dict(per[rep]["search_cfg"])
+        if n_triv * 2 > K:
+            search_cfg["trivial"] = True
+        elif "trivial" in search_cfg:
+            del search_cfg["trivial"]
+        trace = per[rep]["trace"]; k_extra = per[rep]["k_extra"]
+        est_meta = {"estimator": "crossfit", "n_splits": K,
+                    "n_train": int(n - len(folds[0]) - max(1, int(round(0.2 * (n - len(folds[0])))))),
+                    "n_select": int(max(1, int(round(0.2 * (n - len(folds[0])))))), "n_score": int(len(folds[0])),
+                    "folds": [{**{k2: (p[k2] if not isinstance(p[k2], (list, dict)) else None)
+                                  for k2 in ("L_null", "L_reuse", "L_search", "L_grow")},
+                               "sel_idx": fold_sel_idx[i].tolist(),
+                               "score_idx": folds[i].tolist()}
+                              for i, p in enumerate(per)],
+                    "se_reuse_minus_search": _se("L_reuse", "L_search"),
+                    "se_search_minus_grow": _se("L_search", "L_grow"),
+                    "se_reuse_minus_grow": _se("L_reuse", "L_grow"),
+                    "n_trivial_folds": n_triv}
+        # The update probe / any follow-up that needs ONE split uses fold 0's (train ∪ select, score).
+        sc0 = folds[0]; rest0 = torch.cat([folds[j] for j in range(1, K)])
+        split_meta = {"tr_idx": rest0.tolist(), "val_idx": sc0.tolist()}
+    elif estimator == "prequential":
+        if preq_decide not in ("tail", "total"):
+            raise ValueError(f"unknown preq_decide {preq_decide!r} (expected 'tail' or 'total')")
+        # ONE order for the whole call: every rung codes the identical blocks in the identical
+        # sequence, so their curves are paired and their difference is model class, not luck.
+        order = torch.randperm(n, generator=gen)
+        uniform_bits = (float(preq_uniform_bits) if preq_uniform_bits is not None
+                        else _uniform_bits_for(y))
+
+        def _code(model, forward, data):
+            return _prequential_codelength(model, forward, spec, data, y, n_blocks=preq_blocks,
+                                           n_epochs=n_epochs, lr=lr, device=device, order=order,
+                                           n_classes_or_uniform_bits=uniform_bits,
+                                           tail_exponent=preq_exponent)
+
+        # Same rung order as _fit_rungs (reuse → search → grow → null), same factories.
+        reuse_model = _new_reuse_model()
+        meta_reuse = _code(reuse_model, fwd, X)
+        L_reuse = meta_reuse[preq_decide]
+
+        def _estimator_fn(model, forward):
+            m = _code(model, forward, X)
+            return m[preq_decide], m
+
+        L_search, search_cfg, trace, meta_search = search_compose(
+            X, y, X, y, spec, concept_dim=concept_dim, n_parents=n_parents,
+            device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank,
+            skip=search_skip, baseline_L=L_reuse, estimator_fn=_estimator_fn)
+        if meta_search is None:      # trivial composition won ⇒ Search IS the reuse rung
+            meta_search = meta_reuse
+
+        grow_model = _new_grow_model()
+        meta_grow = _code(grow_model, fwd, grow_source)
+        L_grow = meta_grow[preq_decide]
+
+        # The null is a fixed marginal predictor; half the epochs suffice, as on the other branches.
+        meta_null = _prequential_codelength(_new_null_model(), fwd, spec, X, y, n_blocks=preq_blocks,
+                                            n_epochs=max(n_epochs // 2, 10), lr=lr, device=device,
+                                            order=order, n_classes_or_uniform_bits=uniform_bits,
+                                            tail_exponent=preq_exponent)
+        L_null = meta_null[preq_decide]
+
+        k_extra = max(sum(p.numel() for p in grow_model.parameters())
+                      - sum(p.numel() for p in reuse_model.parameters()), 0)
+        rungs = {"null": meta_null, "reuse": meta_reuse, "search": meta_search, "grow": meta_grow}
+        est_meta = {"estimator": "prequential", "n_blocks": int(meta_reuse["n_blocks"]),
+                    "decide": preq_decide, "exponent": float(preq_exponent), "n_train": int(n),
+                    "uniform_bits": uniform_bits, "rungs": rungs,
+                    # The deciding bits each rung WOULD have under the other rule, so the whole
+                    # decision can be recomputed offline under either (the P1/P2 arm comparison).
+                    "alt": {rule: {k: v[rule] for k, v in rungs.items()} for rule in ("tail", "total")}}
+        last = _blocks_from_order(order, preq_blocks)[-1]
+        n_last = int(last.numel())
+        # A follow-up probe (e.g. update_probe) needs ONE split: the prefix every rung was last
+        # trained on vs the final block it was scored on.
+        split_meta = {"tr_idx": order[: n - n_last].tolist(), "val_idx": order[n - n_last :].tolist()}
+    elif estimator == "select-score":
+        if tie_rule not in ("none", "grow"):
+            raise ValueError(f"unknown tie_rule {tie_rule!r} (expected 'none' or 'grow')")
+        if len(ss_fracs) != 3:
+            raise ValueError(f"ss_fracs must be a (train, select, score) triple, got {ss_fracs!r}")
+        fr_tr, fr_sel, fr_sc = ss_fracs
+        if not (fr_tr > 0 and fr_sel > 0 and fr_sc > 0):
+            raise ValueError(
+                f"ss_fracs must be three POSITIVE fractions (train, select, score), got {ss_fracs!r}")
+        if abs((fr_tr + fr_sel + fr_sc) - 1.0) > 1e-6:
+            raise ValueError(
+                f"ss_fracs must sum to 1 (within 1e-6); got {ss_fracs!r} summing to "
+                f"{fr_tr + fr_sel + fr_sc}")
+        # SCORE and SELECT are fixed-size prefixes of ONE permutation; train gets everything else
+        # (desk_fraction.py's split order), so the three sets are disjoint and exactly cover N.
+        # No silent floor to size-1 here: an ss_fracs/n combination that would starve (or, via a
+        # bad fr_tr, invert) a set is a caller error, not a value to paper over deep inside the
+        # training loop.
+        n_score = int(round(fr_sc * n))
+        n_select = int(round(fr_sel * n))
+        n_train_expected = n - n_score - n_select
+        if n_score < 1 or n_select < 1 or n_train_expected < 1:
+            raise ValueError(
+                f"ss_fracs={ss_fracs!r} at n={n} produces an empty set "
+                f"(n_train={n_train_expected}, n_select={n_select}, n_score={n_score}); "
+                f"every set from ss_fracs must have size >= 1 — use larger fractions or more data")
+        # fr_tr is not just decorative: the resulting train size must actually track it (the
+        # rounding of the other two sets can move it by at most 1 each).
+        assert abs(n_train_expected - round(fr_tr * n)) <= 2, (
+            f"train set size {n_train_expected} does not track ss_fracs train fraction {fr_tr} "
+            f"(expected ~{round(fr_tr * n)} at n={n}); ss_fracs={ss_fracs!r}")
+        perm = torch.randperm(n, generator=gen)
+        sc_idx = perm[:n_score]
+        sel_idx = perm[n_score : n_score + n_select]
+        tr_idx = perm[n_score + n_select :]
+        n_train = int(tr_idx.numel())
+        assert n_train == n_train_expected
+
+        Xtr, ytr, Xsel, ysel = X[tr_idx], y[tr_idx], X[sel_idx], y[sel_idx]
+        Xsc, ysc = X[sc_idx], y[sc_idx]
+        if use_raw:
+            Rtr, Rsel, Rsc = raw_stack[tr_idx], raw_stack[sel_idx], raw_stack[sc_idx]
+
+        # Every rung reuses the SAME model factories as the other estimator branches (no
+        # duplicated model code); only the fitting call (return_both=True, so each rung's own
+        # per-example SCORE bits are available for the paired SEs below) differs.
+        reuse_model = _new_reuse_model()
+        sel_reuse, L_reuse, pe_reuse = _held_out_codelength(
+            reuse_model, fwd, spec, Xtr, ytr, Xsel, ysel, n_epochs=n_epochs, lr=lr, device=device,
+            score_X=Xsc, score_y=ysc, return_both=True)
+
+        search_out = search_compose(
+            Xtr, ytr, Xsel, ysel, spec, concept_dim=concept_dim, n_parents=n_parents,
+            device=device, n_epochs=n_epochs, lr=lr, budget=search_budget, rank=search_rank,
+            skip=search_skip, baseline_L=L_reuse, baseline_select_L=sel_reuse,
+            select_on="select", score_X=Xsc, score_y=ysc)
+        L_search, search_cfg, trace, sel_search, pe_search, L_search_score_argmin = search_out
+        if pe_search is None:          # trivial composition won: Search IS reuse on SCORE
+            pe_search = pe_reuse
+        if sel_search is None:
+            sel_search = sel_reuse
+
+        grow_model = _new_grow_model()
+        if use_raw:
+            sel_grow, L_grow, pe_grow = _held_out_codelength(
+                grow_model, fwd, spec, Rtr, ytr, Rsel, ysel, n_epochs=n_epochs, lr=lr, device=device,
+                score_X=Rsc, score_y=ysc, return_both=True)
+        else:
+            sel_grow, L_grow, pe_grow = _held_out_codelength(
+                grow_model, fwd, spec, Xtr, ytr, Xsel, ysel, n_epochs=n_epochs, lr=lr, device=device,
+                score_X=Xsc, score_y=ysc, return_both=True)
+
+        null_model = _new_null_model()
+        sel_null, L_null, pe_null = _held_out_codelength(
+            null_model, fwd, spec, Xtr, ytr, Xsel, ysel, n_epochs=max(n_epochs // 2, 10), lr=lr,
+            device=device, score_X=Xsc, score_y=ysc, return_both=True)
+
+        k_extra = max(sum(p.numel() for p in grow_model.parameters())
+                      - sum(p.numel() for p in reuse_model.parameters()), 0)
+
+        def _paired_se(a: torch.Tensor, b: torch.Tensor) -> float:
+            """sd(a - b) / sqrt(n_score); 0.0 (not NaN) below 2 paired examples."""
+            d = (a - b).double()
+            m = int(d.numel())
+            if m < 2:
+                return 0.0
+            mean = d.mean()
+            var = ((d - mean) ** 2).sum() / (m - 1)
+            return float(torch.sqrt(var / m).item())
+
+        se_search_minus_grow = _paired_se(pe_search, pe_grow)
+        se_reuse_minus_grow = _paired_se(pe_reuse, pe_grow)
+        se_reuse_minus_search = _paired_se(pe_reuse, pe_search)
+        novelty = (L_null - L_reuse) / max(L_null, 1e-6)
+
+        # search_selection_optimism: how much lower Search's SCORE bits would read if its winning
+        # candidate were instead chosen BY the SCORE bits it is reported on (the pre-2026-09-03
+        # asymmetry) — <= 0 by construction, since the score-argmin can only find an L at least as
+        # low as the select-argmin's L among the identical candidate set.
+        search_selection_optimism = L_search_score_argmin - L_search
+
+        est_meta = {
+            "estimator": "select-score", "n_train": n_train, "n_select": n_select,
+            "n_score": n_score,
+            "select_bits": {"null": sel_null, "reuse": sel_reuse, "search": sel_search,
+                            "grow": sel_grow},
+            "score_bits": {"null": L_null, "reuse": L_reuse, "search": L_search, "grow": L_grow},
+            "search_select_bits": sel_search,
+            "search_early_stop_optimism": sel_search - L_search,
+            "search_score_bits_selected_on_score": L_search_score_argmin,
+            "search_selection_optimism": search_selection_optimism,
+            "search_selection_optimism_abs": abs(search_selection_optimism),
+            "se_search_minus_grow": se_search_minus_grow,
+            "se_reuse_minus_grow": se_reuse_minus_grow,
+            "se_reuse_minus_search": se_reuse_minus_search,
+            "novelty": novelty,
+        }
+        split_meta = {"tr_idx": torch.cat([tr_idx, sel_idx]).tolist(), "val_idx": sc_idx.tolist()}
+    else:
+        raise ValueError(f"unknown estimator {estimator!r}")
+
+    reducible_grow = max(L_null - L_grow, 1e-6)
+    reducible_best = max(L_null - min(L_reuse, L_search, L_grow), 1e-6)
+    n_above_null = int(sum(1 for L in (L_reuse, L_search, L_grow) if L > L_null))
+    rel_search_g, rel_grow_g = (L_reuse - L_search) / reducible_grow, (L_search - L_grow) / reducible_grow
+    rel_search_b, rel_grow_b = (L_reuse - L_search) / reducible_best, (L_search - L_grow) / reducible_best
+    if reducible_mode == "grow":
+        reducible, rel_search, rel_grow = reducible_grow, rel_search_g, rel_grow_g
+    elif reducible_mode == "best":
+        reducible, rel_search, rel_grow = reducible_best, rel_search_b, rel_grow_b
+    else:
+        raise ValueError(f"unknown reducible_mode {reducible_mode!r}")
+
+    model_bits = (bits_per_param_fn(k_extra, n) if bits_per_param_fn is not None
+                  else 0.5 * k_extra * math.log2(max(n, 2)))
+
+    if rel_grow > eps_grow:
+        decision = "grow"
+    elif rel_search > eps_search:
+        decision = "search"
+    else:
+        decision = "reuse"
+
+    # Tie rule (select-score only; spec 1c/H5b) — a free SE from the paired SCORE-set differences
+    # lets the gate declare a tie rather than force a decision variance cannot support, resolved
+    # toward grow ONLY on a novel task (guards against re-introducing a grow-heavy prior).
+    if estimator == "select-score":
+        se = est_meta["se_search_minus_grow"]
+        novelty = est_meta["novelty"]
+        margin = L_search - L_grow
+        pre_tie_grow = (decision == "grow")   # the decision BEFORE any tie adjustment, for every z
+
+        def _tie_fires(z: float) -> bool:
+            return (not pre_tie_grow) and abs(margin) <= float(z) * se and novelty < tie_novelty
+
+        # Recorded for EVERY tie_rule (including "none"): what the tie rule would have done at
+        # each of a few canonical z's, so the firing rate can be recomputed offline without
+        # re-running the gate at each z ([[search-selection-optimism]] S2).
+        est_meta["tie_counterfactual"] = {str(z): bool(_tie_fires(z)) for z in (0.5, 1.0, 2.0)}
+        # The per-example SD the SE was built from (se = sd/sqrt(n_score)), so the desk's own
+        # per-unit SD measurement can be compared directly against the live ladder's.
+        est_meta["se_split_proxy"] = se * math.sqrt(max(est_meta["n_score"], 1))
+
+        if tie_rule == "grow":
+            fires = _tie_fires(tie_z)
+            est_meta["tie"] = {"fired": bool(fires), "margin": float(margin), "se": float(se),
+                               "novelty": float(novelty)}
+            if fires:
+                decision = "grow"
+
+    probe_input = "raw-root" if use_raw else "parents"
+    reason = (f"L_null={L_null:.3f} L_reuse={L_reuse:.3f} L_search={L_search:.3f} L_grow={L_grow:.3f} | "
+              f"rel_search={rel_search:.3f} (eps {eps_search}) rel_grow={rel_grow:.3f} (eps {eps_grow}) "
+              f"[{reducible_mode}-denominator; best: {rel_search_b:.3f}/{rel_grow_b:.3f}; {estimator}] "
+              f"→ {decision}; search_subset={search_cfg['subset']}; grow_probe={probe_input}")
+    if estimator == "select-score" and "tie" in est_meta:
+        tie = est_meta["tie"]
+        reason += (f"; tie_rule={tie_rule} fired={tie['fired']} margin={tie['margin']:.4f} "
+                  f"se={tie['se']:.4f} novelty={tie['novelty']:.3f}")
+    return KanGateRecord(
+        task_name=spec.name, decision=decision,
+        L_reuse_bits=L_reuse, L_grow_bits=L_grow,
+        delta_bits_per_sample=(L_reuse - L_grow), model_bits=model_bits, n_samples=n,
+        net_codelength_delta=(L_reuse - L_grow) * n - model_bits,
+        rel_improvement=(L_reuse - L_grow) / reducible,   # keep the binary field for back-compat/logging
+        best_subspace_similarity=None, obstruction_geometric=None,
+        obstruction_codelength=(rel_grow > eps_grow), reason=reason,
+        L_search_bits=L_search, rel_search=rel_search, rel_grow=rel_grow,
+        search_meta=search_cfg, search_trace=trace,
+        grow_probe_input=probe_input,
+        L_null_bits=L_null, reducible_grow=reducible_grow, reducible_best=reducible_best,
+        reducible_mode=reducible_mode, rel_search_best=rel_search_b, rel_grow_best=rel_grow_b,
+        n_rungs_above_null=n_above_null, estimator_meta=est_meta, split_meta=split_meta,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The Update rung — refine an EXISTING concept on the new task, backward-safety gated
+# ---------------------------------------------------------------------------
+
+
+class _UpdateModel(nn.Module):
+    """Frozen-reuse composer over the parent stack, except that parent ``p_idx`` is replaced by a
+    trainable COPY of its ConceptModule re-read from the raw features. Input is the packed tensor
+    ``[parent_stack.flatten(1) | raw]`` so it batches like every other probe."""
+
+    def __init__(self, module_copy: nn.Module, p_idx: int, n_parents: int, concept_dim: int,
+                 raw_dim: int, head: nn.Module):
+        super().__init__()
+        self.module, self.p_idx, self.P, self.D, self.F = module_copy, p_idx, n_parents, concept_dim, raw_dim
+        self.composer = ReuseComposer(parent_dim=concept_dim, n_parents=n_parents, head=head)
+
+    def forward(self, packed: torch.Tensor) -> torch.Tensor:
+        stack = packed[:, : self.P * self.D].view(-1, self.P, self.D)
+        raw = packed[:, self.P * self.D:]
+        emb = self.module(raw)
+        parts = [stack[:, i, :] if i != self.p_idx else emb for i in range(self.P)]
+        return self.composer(torch.stack(parts, dim=1))
+
+
+def pack_update_input(parent_stack: torch.Tensor, raw_stack: torch.Tensor) -> torch.Tensor:
+    return torch.cat([parent_stack.flatten(1), raw_stack], dim=1)
+
+
+def update_probe(
+    parent_stack: torch.Tensor, raw_stack: torch.Tensor, targets: torch.Tensor,
+    parent_module: nn.Module, p_idx: int, spec: TaskSpec, *,
+    concept_dim: int, n_parents: int, tr_idx, val_idx, device: str = "cpu",
+    n_epochs: int = 15, update_lr: float = 1e-4, composer_lr: float = 1e-3,
+) -> Tuple[float, nn.Module]:
+    """Held-out bits of the **update** candidate on the ladder's own split — the reuse composer with
+    parent ``p_idx`` fine-tuned (a deep copy; the DAG is untouched) — plus the copy at its
+    best-selection epoch. Comparable one-to-one with ``L_reuse`` from the same split.
+
+    Only ROOT parents in feature mode can be updated this way (the copy re-reads the raw encoder
+    features); a child parent would need its own ancestors' stack. ``update_lr`` (default 1e-4) is
+    the fine-tune rate for the copied concept; the composer/head train at ``composer_lr``.
+    See [[reuse-with-update-arm-stress-test]].
+    """
+    import copy as _copy
+    tr_idx = torch.as_tensor(tr_idx); val_idx = torch.as_tensor(val_idx)
+    packed = pack_update_input(parent_stack, raw_stack)
+    module_copy = _copy.deepcopy(parent_module)
+    for p in module_copy.parameters():
+        p.requires_grad_(True)
+    if hasattr(module_copy, "_frozen"):
+        module_copy._frozen = False
+    model = _UpdateModel(module_copy, p_idx, n_parents, concept_dim, raw_stack.shape[1],
+                         spec.make_head(concept_dim)).to(device)
+    groups = [{"params": list(module_copy.parameters()), "lr": update_lr},
+              {"params": list(model.composer.parameters()), "lr": composer_lr}]
+    opt = torch.optim.AdamW(groups, weight_decay=1e-4)
+    Xtr, ytr, Xval, yval = packed[tr_idx], targets[tr_idx], packed[val_idx], targets[val_idx]
+    n = Xtr.shape[0]; best = float("inf"); best_state = None
+    for _ in range(n_epochs):
+        model.train()
+        perm = torch.randperm(n)
+        for i in range(0, n, 128):
+            idx = perm[i: i + 128]
+            loss = spec.nll_bits(model(Xtr[idx].to(device)), ytr[idx].to(device)).mean()
+            opt.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0); opt.step()
+        model.eval()
+        with torch.no_grad():
+            vb = float(spec.nll_bits(model(Xval.to(device)), yval.to(device)).mean().item())
+        if vb < best:
+            best = vb
+            best_state = {k: v.detach().clone() for k, v in module_copy.state_dict().items()}
+    module_copy.load_state_dict(best_state)
+    module_copy.eval()
+    return best, module_copy
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator — one call to add a task under the Kan gate
+# ---------------------------------------------------------------------------
+
+
+def _fit_full(model, forward, spec, X, y, n_epochs, lr, device, batch_size=128):
+    """Train `model` to convergence on all of (X, y) minimising bit code length (final fit)."""
+    model = model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    n = X.shape[0]
+    for _ in range(n_epochs):
+        model.train()
+        perm = torch.randperm(n)
+        for i in range(0, n, batch_size):
+            idx = perm[i : i + batch_size]
+            out = forward(model, X[idx].to(device))
+            loss = spec.nll_bits(out, y[idx].to(device)).mean()
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()
+    return model
+
+
+def kan_gated_grow(
+    dag: ConceptDAG,
+    new_module_id: str,
+    parent_ids: List[str],
+    new_module_factory: Callable[[], ConceptModule],
+    spec: TaskSpec,
+    loader: DataLoader,
+    *,
+    concept_dim: int,
+    query_subspace: Optional[torch.Tensor] = None,
+    device: str = "cpu",
+    input_encoder: Optional[nn.Module] = None,
+    subspace_top_k: int = 8,
+    final_epochs: int = 60,
+    lr: float = 1e-3,
+    gate_kwargs: Optional[dict] = None,
+) -> dict:
+    """
+    Add a task to the DAG under the Kan gate — the single entry point for the gated architecture.
+
+    Runs :func:`reuse_vs_grow`, then:
+      * **grow**  → train a new ConceptModule (task-agnostic code-length loss from ``spec``), add it,
+        cache its concept subspace, freeze it, and train a task head. A new concept node is created.
+      * **reuse** → train a :class:`ReuseComposer` (recombination of existing frozen concepts) + head.
+        **No DAG node is added** — the task is solved by existing concepts. This is the branch that
+        keeps parameter growth ∝ genuine novelty rather than ∝ tasks.
+
+    Returns a dict: ``{decision, record, parent_ids, solver | module_id, head}``. The caller stores
+    the returned solver/head as this task's predictor for evaluation. (Wiring the reuse-task predictor
+    into the experiment's eval bookkeeping is the remaining integration step; the DAG-node path is
+    already compatible with the existing evaluator.)
+    """
+    gate_kwargs = gate_kwargs or {}
+    record = reuse_vs_grow(
+        dag, parent_ids, new_module_factory, spec, loader,
+        query_subspace=query_subspace, concept_dim=concept_dim,
+        device=device, input_encoder=input_encoder, **gate_kwargs,
+    )
+
+    # Cache parent embeddings + targets once for the final fit (frozen ancestors).
+    if parent_ids:
+        X, y = _cache_parent_embeddings(dag, parent_ids, loader, device, input_encoder)
+
+    if record.decision == "reuse":
+        head = spec.make_head(concept_dim)
+        solver = ReuseComposer(parent_dim=concept_dim, n_parents=len(parent_ids), head=head)
+        _fit_full(solver, lambda m, xb: m(xb), spec, X, y, final_epochs, lr, device)
+        return {"decision": "reuse", "record": record, "parent_ids": parent_ids,
+                "solver": solver, "head": head, "module_id": None}
+
+    # --- grow ---
+    module = new_module_factory()
+    head = spec.make_head(module.out_dim)
+
+    class _GrowModel(nn.Module):
+        def __init__(self, m, h):
+            super().__init__()
+            self.module, self.head = m, h
+
+        def forward(self, parent_stack):
+            outs = [parent_stack[:, i, :] for i in range(parent_stack.shape[1])]
+            return self.head(self.module(x=None, parent_outputs=outs))
+
+    if parent_ids:
+        gm = _GrowModel(module, head)
+        _fit_full(gm, lambda m, xb: m(xb), spec, X, y, final_epochs, lr, device)
+    # else: a true root (no parents) — caller trains it against raw inputs via the existing
+    # stage-2 path; here we still register the (untrained-on-parents) module for topology.
+
+    dag.add_module(new_module_id, module, parents=parent_ids)
+    dag.freeze_except([new_module_id])
+    # Cache concept subspace for future routing, then freeze.
+    if parent_ids:
+        module.clear_activation_buffer()
+        module._collecting_subspace = True
+        with torch.no_grad():
+            outs = [X[:, i, :].to(device) for i in range(X.shape[1])]
+            module(x=None, parent_outputs=outs)
+        module._collecting_subspace = False
+        module.compute_concept_subspace(top_k=subspace_top_k)
+    module.freeze()
+    return {"decision": "grow", "record": record, "parent_ids": parent_ids,
+            "module_id": new_module_id, "head": head, "solver": None}

@@ -29,12 +29,55 @@ import argparse
 import torch
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Concept DAG experiment runner")
     parser.add_argument("--exp",      type=str,   default="1a",
-                        choices=["1a", "1b", "2a", "2b", "3a", "3b",
+                        choices=["1a", "1b", "2a", "2b", "3a", "3a-kan", "5ds-kan", "ctrl", "3b",
                                  "4", "4f", "5a", "5b", "5", "6", "plot"],
-                        help="Which experiment to run")
+                        help="Which experiment to run ('3a-kan' = Kan-gated growth + consolidation)")
+    parser.add_argument("--eps_rel", type=float, default=0.05,
+                        help="[3a-kan] reuse-vs-grow threshold: min fraction of reducible info a new "
+                             "concept must capture beyond reuse to justify growing")
+    parser.add_argument("--datasets", type=str, nargs="+", default=None,
+                        help="[5ds-kan] heterogeneous stream datasets (subset/order of "
+                             "mnist fashion kmnist svhn cifar10; default = all five)")
+    parser.add_argument("--max_per_task", type=int, default=None,
+                        help="[5ds-kan] cap train examples/task for light laptop runs (None = full)")
+    parser.add_argument("--ctrl_stream", type=str, default="s_minus",
+                        choices=["s_minus", "s_plus", "s_in", "s_out", "s_pl"],
+                        help="[ctrl] which CTrL-style stream to run (see loaders.make_ctrl_stream)")
+    parser.add_argument("--ctrl_first", type=str, default="mnist",
+                        help="[ctrl] the revisited first task's dataset")
+    parser.add_argument("--ctrl_middles", type=str, nargs="+", default=None,
+                        help="[ctrl] middle (distractor) datasets; default = the other four")
+    parser.add_argument("--ctrl_n_large", type=int, default=4000,
+                        help="[ctrl] train samples for the data-rich tasks")
+    parser.add_argument("--ctrl_n_small", type=int, default=400,
+                        help="[ctrl] train samples for the data-poor tasks")
+    parser.add_argument("--raw_grow_probe", action="store_true",
+                        help="[5ds-kan/3a-kan] gate's grow probe sees the raw encoder features (a real "
+                             "grown root's view) instead of only frozen parent outputs; organic grows "
+                             "then mint ROOT nodes. Feature-backbone mode only (ignored for smallcnn).")
+    parser.add_argument("--dup_organic", action="store_true",
+                        help="[5ds-kan] with --inject_dup, let the gate decide the duplicate organically "
+                             "instead of force-growing it (grow-heavy-bias check: the dup should reuse)")
+    parser.add_argument("--inject_dup", action="store_true",
+                        help="[5ds-kan] append a force-grown duplicate of the first task to stress "
+                             "the consolidation/merge path (creates a deliberately redundant concept)")
+    parser.add_argument("--enable_search", action="store_true",
+                        help="[5ds-kan/3a-kan] three-way reuse/search/grow gate: bounded test-time-compute "
+                             "search over existing concepts before growing a new one")
+    parser.add_argument("--eps_search", type=float, default=0.05,
+                        help="[search] min reducible-info fraction bounded search must add over reuse")
+    parser.add_argument("--search_skip", action="store_true",
+                        help="[5ds-kan/3a-kan/ctrl] give the Search composer a full-rank linear skip so "
+                             "it nests reuse (L_search <= L_reuse by construction). Without it the "
+                             "rank-16 bottleneck is narrower than reuse and Search can never win.")
+    parser.add_argument("--search_budget", type=int, default=6,
+                        help="[search] trained candidates the Search level may spend")
+    parser.add_argument("--consolidate_every", type=int, default=0,
+                        help="[3a-kan] run the consolidation (reduction) pass every K tasks (0 = only "
+                             "at the end)")
     parser.add_argument("--device",   type=str,   default="auto",
                         help="Device: 'cpu', 'cuda', 'mps', or 'auto'")
     parser.add_argument("--epochs",   type=int,   default=30,
@@ -82,7 +125,7 @@ def main():
                              "Use 'cross_attention' to test the task-0 backbone confound.")
     # SSL backbone arguments (DINO swap)
     parser.add_argument("--backbone", type=str, default="smallcnn",
-                        choices=["smallcnn", "dinov2_vits14", "clip_vitb16", "resnet50"],
+                        choices=["smallcnn", "dinov2_vits14", "clip_vitb16", "resnet50", "resnet18"],
                         help="Feature extractor backbone. 'smallcnn' = original task-trained CNN. "
                              "Other options use a frozen SSL encoder + feature caching.")
     parser.add_argument("--cache_dir", type=str, default=None,
@@ -101,7 +144,69 @@ def main():
                         help="Path to exp3a_results.json baseline for AA comparison in exp6")
     parser.add_argument("--no_perturbation",     action="store_true",
                         help="Skip the exp3b-style perturbation test inside exp6")
-    args = parser.parse_args()
+    # Gate-estimator / denominator / update-arm arguments
+    parser.add_argument("--reducible", type=str, default="best", choices=["grow", "best"],
+                        help="[5ds-kan/3a-kan/ctrl] which reducible-info normaliser DECIDES "
+                             "reuse-vs-grow (both are always recorded). Published runs up to "
+                             "2026-09-03 used 'grow'; 'best' is the default now (validated equal "
+                             "decisions in best-rung-denominator-stress-test / "
+                             "gate-arms-multiseed-ctrl-result)")
+    parser.add_argument("--gate_cache_max", type=int, default=16384,
+                        help="[5ds-kan/3a-kan/ctrl] samples the GATE's probe cache sees (0 = "
+                             "unlimited / full task). Separate from --routing_batches, which still "
+                             "caps route_for_task / compute_concept_subspace.")
+    parser.add_argument("--gate_estimator", type=str, default="single",
+                        choices=["single", "crossfit", "prequential", "select-score"],
+                        help="[5ds-kan/3a-kan/ctrl] codelength estimator for the gate")
+    parser.add_argument("--gate_splits", type=int, default=5,
+                        help="[5ds-kan/3a-kan/ctrl] folds for the crossfit gate estimator")
+    parser.add_argument("--preq_blocks", type=int, default=5,
+                        help="[5ds-kan/3a-kan/ctrl] prequential block count B "
+                             "(gate_estimator == prequential)")
+    parser.add_argument("--preq_decide", type=str, default="tail", choices=["tail", "total"],
+                        help="[5ds-kan/3a-kan/ctrl] which prequential quantity DECIDES "
+                             "(gate_estimator == prequential)")
+    parser.add_argument("--preq_exponent", type=float, default=0.5,
+                        help="[5ds-kan/3a-kan/ctrl] tail power-law exponent "
+                             "(gate_estimator == prequential)")
+    parser.add_argument("--tie_rule", type=str, default="none", choices=["none", "grow"],
+                        help="[5ds-kan/3a-kan/ctrl] select-score tie rule: 'grow' resolves a "
+                             "variance-limited search-vs-grow tie to grow on a novel task "
+                             "(gate_estimator == select-score)")
+    parser.add_argument("--tie_z", type=float, default=1.0,
+                        help="[5ds-kan/3a-kan/ctrl] tie band width in SEs of the paired SCORE-bit "
+                             "difference (gate_estimator == select-score, tie_rule == grow)")
+    parser.add_argument("--tie_novelty", type=float, default=0.1,
+                        help="[5ds-kan/3a-kan/ctrl] novelty guard threshold — (L_null-L_reuse)/L_null "
+                             "must be below this for the tie rule to fire "
+                             "(gate_estimator == select-score, tie_rule == grow)")
+    parser.add_argument("--oracle_rungs", action="store_true",
+                        help="[5ds-kan/3a-kan/ctrl] after the decision, also train the other "
+                             "rungs' predictors and record test accuracy")
+    parser.add_argument("--dump_gate_tensors", action="store_true",
+                        help="[5ds-kan/3a-kan/ctrl] write gate_dump.pt (feature mode only)")
+    parser.add_argument("--enable_update", action="store_true",
+                        help="[5ds-kan/3a-kan/ctrl] enable the update rung (refinement placement)")
+    parser.add_argument("--update_lr", type=float, default=1e-4,
+                        help="[update] learning rate for the update probe")
+    parser.add_argument("--eps_update", type=float, default=0.1,
+                        help="[update] min relative improvement (L_reuse - L_update)/L_reuse "
+                             "the update probe must exceed to be eligible for selection")
+    parser.add_argument("--update_tolerance", type=float, default=0.01,
+                        help="[update] backward-safety tolerance on earlier tasks' VAL accuracy")
+    parser.add_argument("--routing_batches", type=int, default=20,
+                        help="[5ds-kan/3a-kan/ctrl] batches used to compute a node's routing subspace")
+    parser.add_argument("--ctrl_val_frac", type=float, default=0.1,
+                        help="[ctrl] fraction of n_train drawn as held-out val images per task, "
+                             "in addition to the n_train training images")
+    parser.add_argument("--ctrl_n_test", type=int, default=None,
+                        help="[ctrl] test images per task (None = max(500, n_train // 4); an int "
+                             "uses min(ctrl_n_test, len(test_full)))")
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     # Resolve device
     if args.device == "auto":
@@ -137,8 +242,8 @@ def main():
         import gc; gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
-        elif device == "mps":
-            torch.mps.empty_cache()
+        elif device == "mps" and hasattr(torch, "mps"):
+            torch.mps.empty_cache()  # not present on torch 2.0.0
         return tasks, tasks[0]["feature_dim"]
 
     # Download mode
@@ -177,6 +282,187 @@ def main():
             batch_size=args.batch_size,
         )
         run_exp2a(cfg)
+
+    elif args.exp == "3a-kan":
+        from concept_dag.experiments.kan_exp import KanExpConfig, run_exp3a_kan
+        from concept_dag.data.loaders import make_split_cifar100
+        n_tasks = args.n_tasks if args.n_tasks is not None else 20
+        cfg = KanExpConfig(
+            data_root   = args.data_root,
+            device      = device,
+            root_epochs = args.epochs,
+            child_epochs= args.epochs,
+            results_dir = f"{args.out_dir}/exp3_kan",
+            seed        = args.seed,
+            batch_size  = args.batch_size,
+            n_tasks     = n_tasks,
+            backbone    = args.backbone,
+            cache_dir   = args.cache_dir,
+            eps_rel     = getattr(args, "eps_rel", 0.05),
+            consolidate_every = getattr(args, "consolidate_every", 0),
+            raw_grow_probe = args.raw_grow_probe,
+            routing_batches = args.routing_batches,
+            gate_cache_max = args.gate_cache_max,
+            reducible_mode = args.reducible,
+            gate_estimator = args.gate_estimator,
+            gate_splits = args.gate_splits,
+            preq_blocks = args.preq_blocks,
+            preq_decide = args.preq_decide,
+            preq_exponent = args.preq_exponent,
+            tie_rule    = args.tie_rule,
+            tie_z       = args.tie_z,
+            tie_novelty = args.tie_novelty,
+            oracle_rungs = args.oracle_rungs,
+            dump_gate_tensors = args.dump_gate_tensors,
+            enable_update = args.enable_update,
+            update_lr = args.update_lr,
+            eps_update = args.eps_update,
+            update_tolerance = args.update_tolerance,
+        )
+        raw_tasks = make_split_cifar100(
+            data_root=args.data_root, n_tasks=n_tasks,
+            batch_size=args.batch_size, seed=args.seed,
+        )
+        tasks, feature_dim = _prepare_tasks_with_backbone(
+            raw_tasks, args.backbone, args.cache_dir, args.data_root)
+        if feature_dim is not None:
+            cfg.feature_dim = feature_dim
+        run_exp3a_kan(cfg, tasks=tasks)
+
+    elif args.exp == "5ds-kan":
+        # Heterogeneous "5-Datasets" stream on a frozen backbone — stresses the grow path
+        # (genuinely different domains) and, with --inject_dup, the merge path.
+        from concept_dag.experiments.kan_exp import KanExpConfig, run_exp3a_kan
+        from concept_dag.data.loaders import make_five_datasets, inject_duplicates
+        backbone = args.backbone if args.backbone != "smallcnn" else "resnet18"
+        raw_tasks = make_five_datasets(
+            data_root=args.data_root, datasets_list=args.datasets,
+            batch_size=args.batch_size, max_per_task=args.max_per_task,
+            download=bool(args.download), seed=args.seed,
+        )
+        tasks, feature_dim = _prepare_tasks_with_backbone(
+            raw_tasks, backbone, args.cache_dir, args.data_root)
+        force_grow_ids = ()
+        if args.inject_dup:
+            # Revisit the first dataset at the end of the stream; force-grow it (merge stress-test)
+            # unless --dup_organic, where the gate decides — the grow-heavy-bias check: a raw-root
+            # grow probe must still REUSE on a task whose concept already exists.
+            tasks, dup_positions = inject_duplicates(tasks, dup_after={0: len(tasks) - 1})
+            if not args.dup_organic:
+                force_grow_ids = tuple(dup_positions)
+            print(f"[5ds-kan] injected duplicate(s) at stream positions {dup_positions} "
+                  f"({'gate decides organically (bias check)' if args.dup_organic else 'force-grown to stress merge'})")
+        cfg = KanExpConfig(
+            data_root   = args.data_root,
+            device      = device,
+            root_epochs = args.epochs,
+            child_epochs= args.epochs,
+            results_dir = f"{args.out_dir}/exp5ds_kan",
+            seed        = args.seed,
+            batch_size  = args.batch_size,
+            n_tasks     = len(tasks),
+            n_parents   = 2,
+            backbone    = backbone,
+            cache_dir   = args.cache_dir,
+            feature_dim = feature_dim,
+            eps_rel     = getattr(args, "eps_rel", 0.05),
+            consolidate_every = getattr(args, "consolidate_every", 0),
+            force_grow_ids = force_grow_ids,
+            enable_search = args.enable_search,
+            eps_search  = args.eps_search,
+            search_budget = args.search_budget,
+            search_skip = args.search_skip,
+            raw_grow_probe = args.raw_grow_probe,
+            routing_batches = args.routing_batches,
+            gate_cache_max = args.gate_cache_max,
+            reducible_mode = args.reducible,
+            gate_estimator = args.gate_estimator,
+            gate_splits = args.gate_splits,
+            preq_blocks = args.preq_blocks,
+            preq_decide = args.preq_decide,
+            preq_exponent = args.preq_exponent,
+            tie_rule    = args.tie_rule,
+            tie_z       = args.tie_z,
+            tie_novelty = args.tie_novelty,
+            oracle_rungs = args.oracle_rungs,
+            dump_gate_tensors = args.dump_gate_tensors,
+            enable_update = args.enable_update,
+            update_lr = args.update_lr,
+            eps_update = args.eps_update,
+            update_tolerance = args.update_tolerance,
+        )
+        run_exp3a_kan(cfg, tasks=tasks)
+
+    elif args.exp == "ctrl":
+        # CTrL-style streams (Veniat 2021): controlled similarity + revisits with ground-truth
+        # relations — the axis 5-Datasets cannot give (there, every domain is novel, so the
+        # right gate grows everywhere; here reuse must WIN on s_minus/s_out revisits).
+        from concept_dag.experiments.kan_exp import KanExpConfig, run_exp3a_kan
+        from concept_dag.data.loaders import make_ctrl_stream
+        backbone = args.backbone if args.backbone != "smallcnn" else "resnet18"
+        raw_tasks = make_ctrl_stream(
+            args.ctrl_stream, data_root=args.data_root, first_dataset=args.ctrl_first,
+            middle_datasets=args.ctrl_middles,
+            n_large=args.ctrl_n_large, n_small=args.ctrl_n_small,
+            batch_size=args.batch_size, download=bool(args.download), seed=args.seed,
+            val_frac=args.ctrl_val_frac, n_test=args.ctrl_n_test,
+        )
+        ground_truth = [t.get("ctrl") for t in raw_tasks]
+        # Stream identity in the cache path: task files are keyed by position, so two streams
+        # sharing a dir would silently serve each other's features.
+        cache_dir = args.cache_dir or os.path.join(
+            args.data_root, f"features_{backbone}_ctrl_{args.ctrl_stream}")
+        tasks, feature_dim = _prepare_tasks_with_backbone(
+            raw_tasks, backbone, cache_dir, args.data_root)
+        cfg = KanExpConfig(
+            data_root   = args.data_root,
+            device      = device,
+            root_epochs = args.epochs,
+            child_epochs= args.epochs,
+            results_dir = f"{args.out_dir}/exp_ctrl_{args.ctrl_stream}",
+            seed        = args.seed,
+            batch_size  = args.batch_size,
+            n_tasks     = len(tasks),
+            n_parents   = 2,
+            backbone    = backbone,
+            cache_dir   = cache_dir,
+            feature_dim = feature_dim,
+            eps_rel     = getattr(args, "eps_rel", 0.05),
+            consolidate_every = getattr(args, "consolidate_every", 0),
+            enable_search = args.enable_search,
+            eps_search  = args.eps_search,
+            search_budget = args.search_budget,
+            search_skip = args.search_skip,
+            raw_grow_probe = args.raw_grow_probe,
+            routing_batches = args.routing_batches,
+            gate_cache_max = args.gate_cache_max,
+            reducible_mode = args.reducible,
+            gate_estimator = args.gate_estimator,
+            gate_splits = args.gate_splits,
+            preq_blocks = args.preq_blocks,
+            preq_decide = args.preq_decide,
+            preq_exponent = args.preq_exponent,
+            tie_rule    = args.tie_rule,
+            tie_z       = args.tie_z,
+            tie_novelty = args.tie_novelty,
+            oracle_rungs = args.oracle_rungs,
+            dump_gate_tensors = args.dump_gate_tensors,
+            enable_update = args.enable_update,
+            update_lr = args.update_lr,
+            eps_update = args.eps_update,
+            update_tolerance = args.update_tolerance,
+        )
+        results = run_exp3a_kan(cfg, tasks=tasks)
+        # Score decisions against the pre-registered ground truth and persist alongside.
+        results["ctrl_stream"] = args.ctrl_stream
+        results["ctrl_ground_truth"] = ground_truth
+        results["ctrl_val_frac"] = args.ctrl_val_frac
+        results["ctrl_n_test"] = args.ctrl_n_test
+        import json
+        out_path = os.path.join(cfg.results_dir, "exp3a_kan_results.json")
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"[ctrl] ground-truth relations appended to {out_path}")
 
     elif args.exp in ("3a", "3b"):
         from concept_dag.experiments.exp3_growing_dag import Exp3Config, run_exp3a, run_exp3b
@@ -276,7 +562,7 @@ def main():
             if args.aggregation is not None:
                 cfg.aggregation = args.aggregation
                 print(f"[exp 4f] aggregation override: {cfg.aggregation}")
-            import json, os
+            import json  # os already imported at module scope
             result = run_forced_hub_causal(cfg, tasks)
             os.makedirs(cfg.results_dir, exist_ok=True)
             agg_tag = f"_{cfg.aggregation}" if args.aggregation is not None else ""

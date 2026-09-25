@@ -29,6 +29,23 @@ def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
     return (preds == targets).float().mean().item()
 
 
+def safe_cross_entropy(logits: torch.Tensor, target: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+    """
+    Cross-entropy that avoids the torch-2.0.0 MPS bug: F.cross_entropy / F.nll_loss segfault
+    (Bus error) on MPS. On MPS, compute it manually via log_softmax + gather (both MPS-safe);
+    elsewhere defer to the fast fused kernel.
+    """
+    if logits.device.type == "mps":
+        logp = torch.log_softmax(logits, dim=-1)
+        nll = -logp.gather(1, target.long().unsqueeze(1)).squeeze(1)
+        if reduction == "mean":
+            return nll.mean()
+        if reduction == "sum":
+            return nll.sum()
+        return nll
+    return nn.functional.cross_entropy(logits, target, reduction=reduction)
+
+
 @torch.no_grad()
 def evaluate(
     model_fn,          # callable: (x: Tensor) → logits: Tensor

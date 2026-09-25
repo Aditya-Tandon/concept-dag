@@ -1,0 +1,259 @@
+{
+  "average_accuracy": 0.5423,
+  "test_accs": [
+    0.758,
+    0.44,
+    0.452,
+    0.53,
+    0.56,
+    0.454,
+    0.53,
+    0.506,
+    0.444,
+    0.578,
+    0.61,
+    0.426,
+    0.61,
+    0.514,
+    0.664,
+    0.494,
+    0.62,
+    0.458,
+    0.574,
+    0.624
+  ],
+  "n_grow": 2,
+  "n_reuse": 18,
+  "reuse_rate": 0.9,
+  "param_curve": [
+    49664,
+    49664,
+    49664,
+    49664,
+    49664,
+    49664,
+    49664,
+    49664,
+    49664,
+    49664,
+    49664,
+    49664,
+    49664,
+    49664,
+    49664,
+    85376,
+    85376,
+    85376,
+    85376,
+    85376
+  ],
+  "params_final_pre_consolidation": 85376,
+  "consolidation": {
+    "params_before": 85376,
+    "params_after": 85376,
+    "params_saved": 0,
+    "n_ops": 0,
+    "ops": []
+  },
+  "decisions": [
+    {
+      "task": 0,
+      "decision": "grow",
+      "reason": "root"
+    },
+    {
+      "task": 1,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.02649150099912107,
+      "L_reuse_bits": 1.9254807233810425,
+      "L_grow_bits": 1.9357280731201172
+    },
+    {
+      "task": 2,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -2.9822175432041734e-05,
+      "L_reuse_bits": 1.8994965553283691,
+      "L_grow_bits": 1.8995091915130615
+    },
+    {
+      "task": 3,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.10537079259400922,
+      "L_reuse_bits": 1.9709440469741821,
+      "L_grow_bits": 2.004572629928589
+    },
+    {
+      "task": 4,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.037274757550108936,
+      "L_reuse_bits": 1.712881088256836,
+      "L_grow_bits": 1.7348726987838745
+    },
+    {
+      "task": 5,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.04336984303504134,
+      "L_reuse_bits": 1.8803222179412842,
+      "L_grow_bits": 1.8987417221069336
+    },
+    {
+      "task": 6,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": 0.031222957923067073,
+      "L_reuse_bits": 1.8664137125015259,
+      "L_grow_bits": 1.8517335653305054
+    },
+    {
+      "task": 7,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": 0.017178386290243857,
+      "L_reuse_bits": 1.9064745903015137,
+      "L_grow_bits": 1.8992161750793457
+    },
+    {
+      "task": 8,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.050253264586658214,
+      "L_reuse_bits": 1.8565552234649658,
+      "L_grow_bits": 1.87900972366333
+    },
+    {
+      "task": 9,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.035044659821360714,
+      "L_reuse_bits": 1.5541359186172485,
+      "L_grow_bits": 1.5802463293075562
+    },
+    {
+      "task": 10,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": 0.005678588387688221,
+      "L_reuse_bits": 1.6548991203308105,
+      "L_grow_bits": 1.6510800123214722
+    },
+    {
+      "task": 11,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.2136048043221039,
+      "L_reuse_bits": 1.945281744003296,
+      "L_grow_bits": 2.0114362239837646
+    },
+    {
+      "task": 12,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.05021055178756654,
+      "L_reuse_bits": 1.505671739578247,
+      "L_grow_bits": 1.5447787046432495
+    },
+    {
+      "task": 13,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.11572100936907792,
+      "L_reuse_bits": 1.942069172859192,
+      "L_grow_bits": 1.9815382957458496
+    },
+    {
+      "task": 14,
+      "decision": "reuse",
+      "parents": [
+        0
+      ],
+      "rel_improvement": -0.10186529690334514,
+      "L_reuse_bits": 1.6625444889068604,
+      "L_grow_bits": 1.723726511001587
+    },
+    {
+      "task": 15,
+      "decision": "grow",
+      "parents": [
+        0
+      ],
+      "rel_improvement": 0.060906341914403216,
+      "L_reuse_bits": 1.9032857418060303,
+      "L_grow_bits": 1.8762232065200806
+    },
+    {
+      "task": 16,
+      "decision": "reuse",
+      "parents": [
+        0,
+        1
+      ],
+      "rel_improvement": -0.09869668703812198,
+      "L_reuse_bits": 1.6352896690368652,
+      "L_grow_bits": 1.6971627473831177
+    },
+    {
+      "task": 17,
+      "decision": "reuse",
+      "parents": [
+        1,
+        0
+      ],
+      "rel_improvement": -0.11077616433471044,
+      "L_reuse_bits": 1.9014948606491089,
+      "L_grow_bits": 1.943413257598877
+    },
+    {
+      "task": 18,
+      "decision": "reuse",
+      "parents": [
+        0,
+        1
+      ],
+      "rel_improvement": -0.043350068261655404,
+      "L_reuse_bits": 1.6081430912017822,
+      "L_grow_bits": 1.637826919555664
+    },
+    {
+      "task": 19,
+      "decision": "reuse",
+      "parents": [
+        1,
+        0
+      ],
+      "rel_improvement": -6.156439197110632e-05,
+      "L_reuse_bits": 1.7364922761917114,
+      "L_grow_bits": 1.7365282773971558
+    }
+  ]
+}
