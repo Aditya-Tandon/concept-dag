@@ -15,3 +15,8 @@ Anthropic_Fellows_Application_Draft.md
 
 # Kan run artifacts
 results_kan/*.log
+
+# Internal planning docs (*.docx is already ignored above)
+PLAN.md
+WRITEUP_NOTES.md
+DINO_SWAP_PLAN.md
